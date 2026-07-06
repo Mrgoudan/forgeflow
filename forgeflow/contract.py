@@ -195,6 +195,38 @@ def _ctx_pack(env, task, spec):
     return env.pack.params if env.pack else {}
 
 
+@context_provider("notes")
+def _ctx_notes(env, task, spec):
+    """Declared files injected as context: {basename: content}. Paths were
+    pack-templated at load; runtime placeholders resolve against the
+    payload. A missing file is a loud failure, never silently skipped —
+    the step's prompt_sha pins exactly what was injected."""
+    from .util import template as _template
+    out = {}
+    for f in spec.get("files", ()):
+        f = _template(f, {"payload": task.get("payload") or {}})
+        p = Path(f)
+        if not p.is_file():
+            raise RuntimeError("notes context: file %s does not exist" % p)
+        out[p.name] = p.read_text(errors="replace")
+    return out
+
+
+def _check_notes_spec(spec, pack):
+    files = spec.get("files")
+    if not files or not isinstance(files, list):
+        return "notes context needs a non-empty 'files' list"
+    for f in files:
+        if not isinstance(f, str):
+            return "notes files must be strings, got %r" % (f,)
+        if "{" not in f and not Path(f).is_file():
+            return "notes file %s does not exist (fail-loud at load)" % f
+    return None
+
+
+_ctx_notes.check_spec = _check_notes_spec
+
+
 @dataclass
 class ExecEnv:
     conn: "object"

@@ -168,6 +168,15 @@ def load_workflow_file(path, pack=None) -> Workflow:
             if cname not in CONTEXT_PROVIDERS:
                 _die(swhere, "context '%s' has no registered provider (known: %s)"
                      % (cname, sorted(CONTEXT_PROVIDERS)))
+            try:
+                spec = template(spec, load_map, partial=True)
+            except KeyError as e:
+                _die(swhere, "context '%s' spec templating failed: %s" % (cname, e))
+            check = getattr(CONTEXT_PROVIDERS[cname], "check_spec", None)
+            if check:
+                err = check(spec, pack)
+                if err:
+                    _die(swhere, "context '%s': %s" % (cname, err))
             context.append((cname, spec))
 
         # params: templated against the pack now, required set enforced

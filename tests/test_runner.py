@@ -189,5 +189,125 @@ class AgentWorkflowTest(unittest.TestCase):
             engine.Engine(self.dir / "ff2", pack=config.load_pack(self.pack_dir))
 
 
+DUO_YAML = """\
+workflow: agentduo
+steps:
+  - name: plan
+    block: agent.run
+    llm: triage
+    schema: verdict
+    timeout_s: 60
+    context:
+      - payload
+      - notes: { files: ["{paths.docs}/one.md", "{paths.docs}/two.md"] }
+    outcomes:
+      FIXED: candidate
+      NOOP: done
+      agent_limit: failed
+      agent_invalid: failed
+      agent_backend: failed
+      timeout: failed
+
+  - name: candidate
+    block: agent.run
+    llm: fix
+    schema: verdict
+    timeout_s: 60
+    context: [payload]
+    outcomes:
+      FIXED: done
+      NOOP: done
+      agent_limit: failed
+      agent_invalid: failed
+      agent_backend: failed
+      timeout: failed
+"""
+
+
+class PerStepLlmAndNotesTest(unittest.TestCase):
+    """Each step picks its own llm binding (pack maps role -> backend+model),
+    and 'notes' context injects declared files into the prompt, pinned."""
+
+    def setUp(self):
+        self.dir = tmpdir()
+        cli_dir = self.dir / "cli"
+        cli_dir.mkdir()
+        self.cli_dir = cli_dir
+        self.cli = cli_dir / "fake_agent_cli.py"
+        shutil.copy(str(Path(__file__).parent / "fake_agent_cli.py"), str(self.cli))
+        self.cli.chmod(0o755)
+        (cli_dir / "mode").write_text("good")
+        docs = self.dir / "docs"
+        docs.mkdir()
+        (docs / "one.md").write_text("NOTE-ONE-CONTENT\n")
+        (docs / "two.md").write_text("NOTE-TWO-CONTENT\n")
+        pack = self.dir / "pack"
+        (pack / "workflows").mkdir(parents=True)
+        (pack / "prompts").mkdir()
+        (pack / "schemas").mkdir()
+        (pack / "workflows" / "duo.yaml").write_text(DUO_YAML)
+        (pack / "prompts" / "fix.md").write_text("You fix things.\n")
+        (pack / "prompts" / "triage.md").write_text("You triage things.\n")
+        (pack / "schemas" / "verdict.yaml").write_text(
+            "type: object\nrequired: [verdict]\n"
+            "properties:\n  verdict: { enum: [FIXED, NOOP] }\n")
+        (pack / "project.yaml").write_text(
+            "name: duo\n"
+            "paths: { docs: %s }\n"
+            "workflows: [workflows]\n"
+            "prompts: { fix: prompts/fix.md, triage: prompts/triage.md }\n"
+            "schemas: { verdict: schemas/verdict.yaml }\n"
+            "agents:\n"
+            "  fix:    { backend: claude-cli, cli: %s, model: model-strong }\n"
+            "  triage: { backend: claude-cli, cli: %s, model: model-cheap }\n"
+            % (docs, self.cli, self.cli))
+        self.pack_dir = pack
+
+    def test_each_step_uses_its_own_binding(self):
+        from forgeflow import config, engine
+        eng = engine.Engine(self.dir / "ff", pack=config.load_pack(self.pack_dir))
+        queue.enqueue(eng.conn, "agentduo", {"x": 1})
+        self.assertEqual(eng.run_until_idle(), 1)
+        task = eng.conn.execute("SELECT * FROM tasks").fetchone()
+        self.assertEqual(task["state"], "done")
+        # two runs rows, each pinned to its OWN step's model
+        runs = eng.conn.execute("SELECT model FROM runs ORDER BY id").fetchall()
+        self.assertEqual([r["model"] for r in runs],
+                         ["model-cheap", "model-strong"])
+        # ... and the CLI really received the right --model per call
+        argv1 = (self.cli_dir / "argv.1").read_text()
+        argv2 = (self.cli_dir / "argv.2").read_text()
+        self.assertIn("--model\nmodel-cheap", argv1)
+        self.assertIn("--model\nmodel-strong", argv2)
+
+    def test_notes_files_injected_into_prompt(self):
+        from forgeflow import config, engine
+        eng = engine.Engine(self.dir / "ff", pack=config.load_pack(self.pack_dir))
+        queue.enqueue(eng.conn, "agentduo", {"x": 1})
+        eng.run_until_idle()
+        prompt1 = (self.cli_dir / "stdin.1").read_text()
+        self.assertIn("## context: notes", prompt1)
+        self.assertIn("NOTE-ONE-CONTENT", prompt1)
+        self.assertIn("NOTE-TWO-CONTENT", prompt1)
+        # step 2 declared only payload — no notes leak across steps
+        prompt2 = (self.cli_dir / "stdin.2").read_text()
+        self.assertNotIn("NOTE-ONE-CONTENT", prompt2)
+
+    def test_loader_rejects_missing_notes_file(self):
+        wf = self.pack_dir / "workflows" / "duo.yaml"
+        wf.write_text(DUO_YAML.replace("two.md", "ghost.md"))
+        from forgeflow import config, engine
+        with self.assertRaisesRegex(SystemExit, "ghost.md does not exist"):
+            engine.Engine(self.dir / "ff2", pack=config.load_pack(self.pack_dir))
+
+    def test_loader_rejects_empty_notes_spec(self):
+        wf = self.pack_dir / "workflows" / "duo.yaml"
+        wf.write_text(DUO_YAML.replace(
+            '{ files: ["{paths.docs}/one.md", "{paths.docs}/two.md"] }', "{}"))
+        from forgeflow import config, engine
+        with self.assertRaisesRegex(SystemExit, "non-empty 'files' list"):
+            engine.Engine(self.dir / "ff2", pack=config.load_pack(self.pack_dir))
+
+
 if __name__ == "__main__":
     unittest.main()
