@@ -43,14 +43,15 @@ class Pack:
     agents: dict = field(default_factory=dict)    # llm binding -> backend cfg
     prompts: dict = field(default_factory=dict)   # kind -> abs path (str)
     schemas: dict = field(default_factory=dict)   # name -> parsed schema dict
+    models: dict = field(default_factory=dict)    # name -> {path, sha256, params}
     workspace_root: Path = None
     idle_interval_s: int = 15
     unpark_interval_s: int = 600
 
 
 _PACK_KEYS = {"name", "paths", "params", "workflows", "tools", "agents",
-              "prompts", "schemas", "workspace_root", "idle_interval_s",
-              "unpark_interval_s"}
+              "prompts", "schemas", "models", "workspace_root",
+              "idle_interval_s", "unpark_interval_s"}
 
 
 def load_pack(pack_dir) -> Pack:
@@ -135,6 +136,27 @@ def load_pack(pack_dir) -> Pack:
         with open(p) as f:
             schemas[sname] = yaml.safe_load(f)
 
+    # models: pinned weights, verified at startup like tools
+    from .util import sha256_file
+    models = {}
+    for mname, spec in (doc.get("models") or {}).items():
+        spec = spec or {}
+        if "path" not in spec or "sha256" not in spec:
+            _fail("models.%s: needs 'path' and 'sha256' (weights are pinned)"
+                  % mname)
+        mp = Path(str(spec["path"])).expanduser()
+        if not mp.is_absolute():
+            mp = pack_dir / mp
+        if not mp.is_file():
+            _fail("models.%s -> %s does not exist" % (mname, mp))
+        actual = sha256_file(mp)
+        if actual != spec["sha256"]:
+            _fail("models.%s: sha256 mismatch (file %s, declared %s) — "
+                  "weights drifted, refuse to start"
+                  % (mname, actual, spec["sha256"]))
+        models[mname] = {"path": str(mp), "sha256": spec["sha256"],
+                         "params": spec.get("params") or {}}
+
     agents = doc.get("agents") or {}
     for aname, acfg in agents.items():
         if not isinstance(acfg, dict) or "backend" not in acfg:
@@ -149,7 +171,7 @@ def load_pack(pack_dir) -> Pack:
         name=name, root=pack_dir, rev=_git_rev(pack_dir), paths=paths,
         params=params, workflow_dirs=tuple(workflow_dirs), tools=tools,
         tool_versions=tool_versions, agents=agents, prompts=prompts,
-        schemas=schemas, workspace_root=workspace_root,
+        schemas=schemas, models=models, workspace_root=workspace_root,
         idle_interval_s=int(doc.get("idle_interval_s", 15)),
         unpark_interval_s=int(doc.get("unpark_interval_s", 600)),
     )

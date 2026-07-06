@@ -361,6 +361,59 @@ def agent_run(ctx, task, prev):
     return verdict["verdict"], verdict
 
 
+# ------------------------------------------------------- local-model blocks
+
+def _load_pack_model(ctx, name):
+    from . import localmodel
+    pack = ctx.get("_pack")
+    if pack is None or name not in getattr(pack, "models", {}):
+        raise RuntimeError("model '%s' not declared in pack models section" % name)
+    spec = pack.models[name]
+    return localmodel.load_model(spec["path"], expected_sha=spec["sha256"])
+
+
+@block("model.embed", "local", {"ok"},
+       accepts_context={"payload", "pack"}, required_params={"model", "text"})
+def model_embed(ctx, task, prev):
+    """Deterministic embedding from pinned weights. If an 'object' param
+    names a code object, the vector is staged into the embeddings table
+    (keyed by object + model_sha) at the step boundary. The vector is a
+    claim for retrieval/dedup — never evidence."""
+    from . import localmodel
+    weights, model_sha = _load_pack_model(ctx, ctx["model"])
+    text = _tpl(ctx, task, prev, ctx["text"])
+    vec = localmodel.embed(text, weights)
+    result = {"model_sha": model_sha, "dim": weights["dim"],
+              "nonzero": any(x != 0.0 for x in vec)}
+    obj = ctx.get("object")
+    if obj:
+        obj = _tpl(ctx, task, prev, obj)
+        result["_staged"] = [{"op": "store_embedding",
+                              "repo": obj["repo"], "path": obj["path"],
+                              "symbol": obj.get("symbol"),
+                              "sha": obj.get("sha", "unpinned"),
+                              "model_sha": model_sha,
+                              "dim": weights["dim"], "vector": vec}]
+    else:
+        result["vector"] = vec
+    return "ok", result
+
+
+@block("model.classify", "local", {"ok"},
+       accepts_context={"payload", "pack"}, required_params={"model", "text"})
+def model_classify(ctx, task, prev):
+    """Nearest-centroid label from pinned weights. Single 'ok' outcome BY
+    DESIGN: the label is a claim in the result (a triage prior, a routing
+    hint for prompt assembly) — a workflow cannot dispatch on it, so a
+    local model can never gate a transition."""
+    from . import localmodel
+    weights, model_sha = _load_pack_model(ctx, ctx["model"])
+    text = _tpl(ctx, task, prev, ctx["text"])
+    label, score, margin = localmodel.classify(text, weights)
+    return "ok", {"label": label, "score": round(score, 6),
+                  "margin": round(margin, 6), "model_sha": model_sha}
+
+
 # ------------------------------------------------------------ state blocks
 
 @block("db.upsert_finding", "state", {"ok"},

@@ -172,6 +172,15 @@ CREATE TABLE IF NOT EXISTS readings (              -- what an agent learned, pin
     created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS embeddings (           -- local-model vectors, pinned
+    object_id     INTEGER NOT NULL REFERENCES code_objects(id),
+    model_sha     TEXT NOT NULL,         -- weights fingerprint; new weights = new rows
+    dim           INTEGER NOT NULL,
+    vector        TEXT NOT NULL,         -- JSON float array
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (object_id, model_sha)
+);
+
 CREATE TABLE IF NOT EXISTS coverage (              -- hunt ledger: where we have looked
     object_id     INTEGER NOT NULL REFERENCES code_objects(id),
     workflow      TEXT NOT NULL,

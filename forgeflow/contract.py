@@ -364,6 +364,24 @@ def _apply_staged(env, ops):
         elif kind == "emit_event":
             out["event_id"] = dbmod.emit_event(
                 env.conn, op["name"], op["payload"], env.subscriptions)
+        elif kind == "store_embedding":
+            row = env.conn.execute(
+                "SELECT id FROM code_objects WHERE repo=? AND path=?"
+                " AND symbol IS ?", (op["repo"], op["path"], op["symbol"])).fetchone()
+            if row:
+                obj_id = row["id"]
+            else:
+                obj_id = env.conn.execute(
+                    "INSERT INTO code_objects(repo, path, symbol, kind,"
+                    " first_seen_sha, last_seen_sha) VALUES (?,?,?,?,?,?)",
+                    (op["repo"], op["path"], op["symbol"],
+                     "function" if op["symbol"] else "file",
+                     op["sha"], op["sha"])).lastrowid
+            env.conn.execute(
+                "INSERT OR REPLACE INTO embeddings(object_id, model_sha, dim,"
+                " vector) VALUES (?,?,?,?)",
+                (obj_id, op["model_sha"], op["dim"], json.dumps(op["vector"])))
+            out["object_id"] = obj_id
         else:
             raise RuntimeError("unknown staged op %r" % kind)
     return out
