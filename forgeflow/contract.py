@@ -225,7 +225,11 @@ def execute(env: ExecEnv, workflow: Workflow, task: dict) -> str:
             outcome, result = rows[current]["outcome"], rows[current]["result"]
             replayed.add(current)
         else:
-            stale_rowid = rows[current]["rowid"] if current in rows else None
+            # revisit (retry edge): the step's own committed row is replaced
+            # by the re-execution; the rest of the path stays authoritative —
+            # a later crash replays recorded outcomes wherever the walk
+            # reaches them, which is deterministic and lands on this frontier.
+            revisit = current in rows
             try:
                 outcome, result, wall_ms = _run_block(env, step, task, prev)
             except subprocess.TimeoutExpired:
@@ -250,14 +254,10 @@ def execute(env: ExecEnv, workflow: Workflow, task: dict) -> str:
             # persist the boundary: staged rows + step row + dispatch effect,
             # one transaction — only after COMMIT does anything else happen.
             with tx(conn, immediate=True):
-                if stale_rowid is not None:
+                if revisit:
                     conn.execute(
                         "DELETE FROM task_steps WHERE task_id=? AND attempt=?"
-                        " AND rowid>=?", (task_id, attempt, stale_rowid))
-                    for name in [n for n, r in rows.items()
-                                 if r["rowid"] >= stale_rowid]:
-                        rows.pop(name)
-                        replayed.discard(name)
+                        " AND step=?", (task_id, attempt, current))
                 staged = result.pop("_staged", None)
                 if staged:
                     result.update(_apply_staged(env, staged))

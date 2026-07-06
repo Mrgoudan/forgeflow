@@ -114,13 +114,21 @@ def atomic_write(path, data) -> None:
 _TEMPLATE_RE = re.compile(r"\{([a-zA-Z0-9_.]+)\}")
 
 
-def template(value, mapping: dict):
+def template(value, mapping: dict, partial: bool = False):
     """Recursively substitute '{name}' / '{dotted.name}' placeholders in
     strings inside value using mapping. Unknown names are a loud error —
-    a template that silently survives is a config bug waiting downstream."""
+    a template that silently survives is a config bug waiting downstream.
+    partial=True instead leaves placeholders whose ROOT key is absent from
+    mapping untouched (load-time pass resolving {paths.*} while runtime
+    placeholders like {payload.*} survive for the block to resolve)."""
     if isinstance(value, str):
+        class _Keep(Exception):
+            pass
+
         def resolve(key):
             cur = mapping
+            if partial and key.split(".")[0] not in mapping:
+                raise _Keep()
             for part in key.split("."):
                 if isinstance(cur, dict) and part in cur:
                     cur = cur[part]
@@ -129,12 +137,21 @@ def template(value, mapping: dict):
             return cur
         full = _TEMPLATE_RE.fullmatch(value)
         if full:  # whole-string placeholder keeps its native type (ints, lists)
-            return resolve(full.group(1))
-        return _TEMPLATE_RE.sub(lambda m: str(resolve(m.group(1))), value)
+            try:
+                return resolve(full.group(1))
+            except _Keep:
+                return value
+
+        def sub(m):
+            try:
+                return str(resolve(m.group(1)))
+            except _Keep:
+                return m.group(0)
+        return _TEMPLATE_RE.sub(sub, value)
     if isinstance(value, dict):
-        return {k: template(v, mapping) for k, v in value.items()}
+        return {k: template(v, mapping, partial) for k, v in value.items()}
     if isinstance(value, list):
-        return [template(v, mapping) for v in value]
+        return [template(v, mapping, partial) for v in value]
     return value
 
 

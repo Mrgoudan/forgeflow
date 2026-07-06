@@ -1,0 +1,47 @@
+# Demo: the identity test for the engine. Four stdlib blocks, one YAML —
+# scan a tree for a marker, reproduce it deterministically, file a finding,
+# transition it. No domain knowledge anywhere.
+workflow: filebug
+consumes: [demo.scan_requested]
+emits: [finding.triaged]
+
+steps:
+  - name: scan
+    block: scan.grep_rules
+    timeout_s: 60
+    params:
+      repo: "{paths.repo}"
+      rules:
+        - { id: planted-marker, pattern: "PLANTED_BUG" }
+    outcomes: { ok: reproduce, timeout: failed }
+
+  - name: reproduce
+    block: oracle.reproduce
+    timeout_s: 60
+    params:
+      cmd: ["sh", "repro.sh"]
+      cwd: "{paths.repo}"
+      expect:
+        exit_code: 0
+        output_file: "{paths.repo}/out.txt"
+        expected_file: "{paths.repo}/expected.txt"
+    outcomes: { confirmed: file, refuted: done, timeout: failed }
+
+  - name: file
+    block: db.upsert_finding
+    timeout_s: 10
+    params:
+      key: "demo-{payload.key}"
+      title: "planted marker in demo repo"
+      source: filebug
+      repo: "{paths.repo}"
+    outcomes: { ok: record }
+
+  - name: record
+    block: db.transition
+    timeout_s: 10
+    params:
+      finding_id: "{prev.finding_id}"
+      to_state: triaged
+      event: "evidence:repro_confirmed"
+    outcomes: { ok: done }

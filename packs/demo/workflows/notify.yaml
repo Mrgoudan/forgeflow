@@ -1,0 +1,13 @@
+# Demo: workflow interaction happens ONLY via events. This workflow knows
+# nothing about filebug — it consumes finding.triaged, wherever it came from.
+workflow: notify
+consumes: [finding.triaged]
+emits: []
+
+steps:
+  - name: announce
+    block: shell.run
+    timeout_s: 30
+    params:
+      cmd: ["touch", "{paths.outbox}/notified-{payload.finding_id}"]
+    outcomes: { ok: done, nonzero: failed, mismatch: failed, timeout: failed }

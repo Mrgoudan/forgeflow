@@ -256,7 +256,7 @@ def scan_grep_rules(ctx, task, prev):
     repo = _tpl(ctx, task, prev, ctx["repo"])
     candidates = []
     for rule in ctx["rules"]:
-        args = ["grep", "-rnE", rule["pattern"], "."]
+        args = ["grep", "-rnEI", "--exclude-dir=.git", rule["pattern"], "."]
         for g in rule.get("include", ()):
             args.insert(1, "--include=%s" % g)
         code, out, err = _run(ctx, args, "rule-%s" % rule["id"], deadline, cwd=repo)
@@ -265,9 +265,11 @@ def scan_grep_rules(ctx, task, prev):
                 "scan.grep_rules: rule '%s' failed (exit %d) — broken pattern?"
                 % (rule["id"], code))
         if code == 0:
-            for line in Path(out).read_text().splitlines():
+            for line in Path(out).read_text(errors="replace").splitlines():
                 path, _, rest = line.partition(":")
                 lineno, _, text = rest.partition(":")
+                if not lineno.isdigit():
+                    continue  # non-match diagnostics, never candidates
                 candidates.append({"rule": rule["id"], "path": path.lstrip("./"),
                                    "line": int(lineno), "text": text[:400]})
     return "ok", {"candidates": candidates, "count": len(candidates)}

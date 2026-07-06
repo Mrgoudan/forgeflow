@@ -1,0 +1,20 @@
+# Demo pack — copy to project.yaml and fill machine-local paths.
+# project.yaml is gitignored; this example is the documentation.
+#
+# A pack is the ONLY machine/project-specific thing in the system. The
+# engine verifies everything referenced here at startup and refuses to
+# start on any missing path or tool (fail-loud, no fallbacks).
+name: demo
+
+paths:                      # every entry must exist at load time
+  repo: /absolute/path/to/target/repo
+  outbox: /absolute/path/to/outbox
+
+workflows:                  # dirs of workflow YAML defs
+  - workflows
+
+tools:                      # verified at startup, never installed
+  git: { path: git, version_cmd: ["--version"] }
+
+idle_interval_s: 15
+unpark_interval_s: 600

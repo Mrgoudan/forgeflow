@@ -278,9 +278,14 @@ def emit_event(conn, name: str, payload: dict, subscriptions=None) -> int:
         event_id = cur.lastrowid
         task_payload = dict(payload)
         task_payload["event"] = name
+        finding_id = payload.get("finding_id")
+        if finding_id is not None:
+            row = conn.execute("SELECT 1 FROM findings WHERE id=?",
+                               (finding_id,)).fetchone()
+            if row is None:  # payload key, not a proven row — don't link
+                finding_id = None
         for kind in subscriptions.get(name, ()):
-            queue.enqueue(conn, kind, task_payload,
-                          finding_id=payload.get("finding_id"))
+            queue.enqueue(conn, kind, task_payload, finding_id=finding_id)
         return event_id
 
 
