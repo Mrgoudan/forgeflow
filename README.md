@@ -335,4 +335,5 @@ python3 -m unittest discover -s tests    # 92 tests, stdlib only
 
 Deep-dive contracts in [docs/](docs/): `ENGINE.md` (runtime semantics),
 `EXECUTION.md` (totality rules), `WORKFLOWS.md` (YAML format), `DATA.md`
-(what lives where on disk).
+(what lives where on disk). These four are the engine's law; design docs
+for systems BUILT on the engine live with their packs, not here.
