@@ -85,9 +85,11 @@ def load_pack(pack_dir) -> Pack:
             _fail("paths.%s -> %s does not exist" % (key, p))
         paths[key] = str(p.resolve())
 
-    # params: free-form, but any {paths.x} template must resolve
+    # params: free-form; {paths.x} resolves NOW (and must), while runtime
+    # placeholders ({payload.*} in URL templates etc.) survive for blocks
     try:
-        params = template(doc.get("params") or {}, {"paths": paths})
+        params = template(doc.get("params") or {}, {"paths": paths},
+                          partial=True)
     except KeyError as e:
         _fail("params templating: %s" % e)
 
@@ -245,6 +247,8 @@ def load_secrets(path=None) -> dict:
     a file that is readable by group/other. Missing file = no secrets (fine
     for local-only packs). Secrets reach subprocesses via env vars only —
     never argv, never pack files, never logs."""
+    if path is None:
+        path = os.environ.get("FORGEFLOW_SECRETS")   # tests / odd deployments
     path = Path(path) if path else Path.home() / ".config" / "forgeflow" / "secrets.env"
     if not path.exists():
         return {}
