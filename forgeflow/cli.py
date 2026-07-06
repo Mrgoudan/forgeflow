@@ -109,6 +109,85 @@ def cmd_unpark(args):
     return 0
 
 
+def cmd_trace(args):
+    """The full story of one task, straight from the db: what event created
+    it, every step boundary, every model run, what it emitted, and which
+    tasks those emissions created. Reads only — safe next to a daemon."""
+    import json as _json
+
+    from pathlib import Path
+
+    from .util import payload_hash
+    conn = db.connect(Path(args.root) / "state" / "forgeflow.db")
+    task = conn.execute("SELECT * FROM tasks WHERE id=?",
+                        (args.task_id,)).fetchone()
+    if task is None:
+        print("no task %d" % args.task_id)
+        return 1
+    payload = _json.loads(task["payload"])
+    print("task %d  kind=%s  state=%s  attempts=%d%s"
+          % (task["id"], task["kind"], task["state"], task["attempts"],
+             "  error_class=%s" % task["error_class"] if task["error_class"] else ""))
+    print("  payload: %s" % _json.dumps(payload, sort_keys=True))
+
+    # origin: a task enqueued via the event bus carries its event name
+    ev_name = payload.get("event")
+    if ev_name:
+        from .util import canonical_json
+        ev_payload = {k: v for k, v in payload.items() if k != "event"}
+        ev = conn.execute(
+            "SELECT * FROM events WHERE name=? AND payload=? ORDER BY id LIMIT 1",
+            (ev_name, canonical_json(ev_payload))).fetchone()
+        if ev:
+            print("  created by event %d: %s  at %s" % (ev["id"], ev["name"], ev["at"]))
+
+    emitted = []
+    print("steps:")
+    for s in conn.execute(
+            "SELECT * FROM task_steps WHERE task_id=? ORDER BY rowid",
+            (task["id"],)):
+        result = _json.loads(s["result"] or "{}")
+        brief = _json.dumps(result, sort_keys=True)
+        if len(brief) > 100:
+            brief = brief[:100] + "..."
+        print("  a%d %-14s -> %-14s %5sms  %s"
+              % (s["attempt"], s["step"], s["outcome"], s["wall_ms"], brief))
+        if "event_id" in result:
+            emitted.append(("event", result["event_id"]))
+        if "transition_id" in result:
+            emitted.append(("transition", result["transition_id"]))
+
+    for r in conn.execute("SELECT * FROM runs WHERE task_id=?", (task["id"],)):
+        print("run %d: model=%s exit=%s verdict=%s prompt_sha=%s..."
+              % (r["id"], r["model"], r["exit_code"], r["verdict"],
+                 r["prompt_sha"][:12]))
+
+    for kind, ref in emitted:
+        if kind == "transition":
+            t = conn.execute("SELECT * FROM transitions WHERE id=?", (ref,)).fetchone()
+            if t:
+                print("transition %d: finding %d %s -> %s (%s)"
+                      % (t["id"], t["finding_id"], t["from_state"],
+                         t["to_state"], t["event"]))
+            ev = conn.execute(
+                "SELECT * FROM events WHERE payload LIKE ? ORDER BY id LIMIT 1",
+                ('%%"transition_id":%d%%' % ref,)).fetchone()
+        else:
+            ev = conn.execute("SELECT * FROM events WHERE id=?", (ref,)).fetchone()
+        if not ev:
+            continue
+        print("emitted event %d: %s  %s" % (ev["id"], ev["name"], ev["payload"]))
+        # follow-on tasks: reconstruct the exact enqueue identity
+        child_payload = _json.loads(ev["payload"])
+        child_payload["event"] = ev["name"]
+        h = payload_hash(child_payload)
+        for child in conn.execute(
+                "SELECT id, kind, state FROM tasks WHERE payload_hash=?", (h,)):
+            print("  -> task %d  kind=%s  state=%s   (trace %d to continue)"
+                  % (child["id"], child["kind"], child["state"], child["id"]))
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="forgeflow", description=__doc__.split("\n")[0])
     p.add_argument("--root", default=".",
@@ -132,10 +211,13 @@ def main(argv=None):
     pu = sub.add_parser("unpark", help="parked -> pending (all, or one id)")
     pu.add_argument("task_id", nargs="?", type=int, default=None)
 
+    pt = sub.add_parser("trace", help="one task's full story from the db")
+    pt.add_argument("task_id", type=int)
+
     args = p.parse_args(argv)
     return {"validate": cmd_validate, "run": cmd_run, "once": cmd_once,
             "emit": cmd_emit, "status": cmd_status,
-            "unpark": cmd_unpark}[args.cmd](args)
+            "unpark": cmd_unpark, "trace": cmd_trace}[args.cmd](args)
 
 
 if __name__ == "__main__":

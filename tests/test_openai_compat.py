@@ -23,11 +23,20 @@ class FakeLLMServer:
     def __init__(self):
         self.requests = []
         self.mode = "good"
+        self.health = {"model": "emb-model", "dim": 3,
+                       "weights_sha256": "abc123"}
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *a):
                 pass
+
+            def do_GET(self):     # health endpoint for model pinning
+                data = json.dumps(outer.health).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(data)
 
             def do_POST(self):
                 body = json.loads(self.rfile.read(
@@ -157,6 +166,32 @@ class OpenAICompatTest(unittest.TestCase):
         self.assertEqual(emb["dim"], 3)
         self.assertEqual(json.loads(emb["vector"]), [0.1, 0.2, 0.3])
         self.assertTrue(self.server.requests[-1]["path"].endswith("/embeddings"))
+
+    def test_api_model_health_pinning(self):
+        pack_dir = self.dir / "pack3"
+        pack_dir.mkdir()
+        cfg = ("name: p\nmodels:\n"
+               "  bertish:\n"
+               "    base_url: %s\n"
+               "    model: emb-model\n"
+               "    health_url: %s/\n"
+               "    expect: { model: emb-model, weights_sha256: %s }\n")
+        # matching pin loads fine
+        (pack_dir / "project.yaml").write_text(
+            cfg % (self.server.base_url, self.server.base_url, "abc123"))
+        pack = config.load_pack(pack_dir)
+        self.assertIn("bertish", pack.models)
+        # drifted weights refuse to start
+        (pack_dir / "project.yaml").write_text(
+            cfg % (self.server.base_url, self.server.base_url, "OTHER"))
+        with self.assertRaisesRegex(SystemExit, "drifted"):
+            config.load_pack(pack_dir)
+        # unreachable health endpoint refuses to start
+        (pack_dir / "project.yaml").write_text(
+            "name: p\nmodels:\n  bertish: { base_url: http://127.0.0.1:1/v1,"
+            " model: m, expect: { model: m } }\n")
+        with self.assertRaisesRegex(SystemExit, "health check"):
+            config.load_pack(pack_dir)
 
     def test_api_model_config_requires_model(self):
         pack_dir = self.dir / "pack2"

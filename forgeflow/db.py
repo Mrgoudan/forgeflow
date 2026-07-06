@@ -324,8 +324,11 @@ def record_transition(conn, finding_id: int, to_state: str, event: str,
             (finding_id, from_state, to_state, event,
              json.dumps(evidence) if evidence is not None else None, run_id))
         transition_id = cur.lastrowid
+        # 'via' = the machine event that caused the transition; the key is
+        # NOT named 'event' because emit_event reserves that for the event
+        # name when building subscriber task payloads.
         emit_event(conn, "finding." + to_state,
                    {"finding_id": finding_id, "transition_id": transition_id,
-                    "from_state": from_state, "event": event},
+                    "from_state": from_state, "via": event},
                    subscriptions)
         return transition_id

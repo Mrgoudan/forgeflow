@@ -87,6 +87,30 @@ class CliTest(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr.decode())
         self.assertIn("executed 1 task(s)", out.stdout.decode())
 
+    def test_trace_walks_the_whole_story(self):
+        self._cli("emit", "demo.scan_requested",
+                  "--data", json.dumps({"key": "tr-1"}), "--drive")
+        out = self._cli("trace", "1")
+        self.assertEqual(out.returncode, 0, out.stderr.decode())
+        text = out.stdout.decode()
+        self.assertIn("task 1  kind=filebug  state=done", text)
+        self.assertIn("created by event 1: demo.scan_requested", text)
+        for step in ("scan", "reproduce", "file", "record"):
+            self.assertIn(step, text)
+        self.assertIn("transition 1: finding 1 found -> triaged", text)
+        self.assertIn("emitted event", text)
+        self.assertIn("kind=notify", text)          # the follow-on task
+        # and the child's own trace links back
+        out2 = self._cli("trace", "2")
+        self.assertIn("kind=notify", out2.stdout.decode())
+        self.assertIn("created by event", out2.stdout.decode())
+
+    def test_trace_missing_task(self):
+        self._cli("validate")     # creates the db
+        out = self._cli("trace", "99")
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("no task 99", out.stdout.decode())
+
 
 if __name__ == "__main__":
     unittest.main()

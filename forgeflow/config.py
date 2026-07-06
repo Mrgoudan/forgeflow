@@ -172,6 +172,25 @@ def load_pack(pack_dir) -> Pack:
         elif "base_url" in spec:
             if "model" not in spec:
                 _fail("models.%s: api-backed model needs 'model'" % mname)
+            # optional startup pin: GET health_url and require the declared
+            # fields to match — catches "different weights behind the same
+            # port", the api-model analogue of the sha256 check above.
+            if spec.get("expect"):
+                health_url = spec.get("health_url") or str(spec["base_url"])
+                try:
+                    import json as _json
+                    import urllib.request
+                    with urllib.request.urlopen(health_url, timeout=10) as r:
+                        health = _json.loads(r.read().decode("utf-8"))
+                except Exception as e:
+                    _fail("models.%s: health check %s failed: %s"
+                          % (mname, health_url, e))
+                for key, want in spec["expect"].items():
+                    got = health.get(key)
+                    if got != want:
+                        _fail("models.%s: health %s=%r, expected %r — "
+                              "the serving model drifted, refuse to start"
+                              % (mname, key, got, want))
             models[mname] = {"base_url": str(spec["base_url"]),
                              "model": str(spec["model"]),
                              "api_key_ref": spec.get("api_key_ref"),
