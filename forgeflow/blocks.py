@@ -351,9 +351,10 @@ def evidence_suite(ctx, task, prev):
 
 @block("agent.run", "llm",
        {"agent_limit", "agent_invalid", "agent_backend", "timeout"},
-       accepts_context={"payload", "pack", "lessons", "readings", "chains",
-                        "notes", "diff", "finding", "retrieval", "history",
-                        "patterns"})
+       # "*" = open context: an agent step may declare ANY context whose
+       # provider is registered (packs add providers without engine edits).
+       # The loader still requires every declared name to resolve.
+       accepts_context={"*"})
 def agent_run(ctx, task, prev):
     """THE llm block — delegates to runner.run_agent(), the only path to
     any model. The step's schema enums extend this block's outcome set at
@@ -382,7 +383,10 @@ def agent_run(ctx, task, prev):
     except runner.RunnerError as e:
         outcome = ("agent_invalid" if e.error_class == "agent_invalid_output"
                    else e.error_class)
-        return outcome, {"error": str(e)}
+        return outcome, {"error": str(e), "path": cwd}
+    # thread the worktree path through so a later step keeps its cwd
+    if cwd:
+        verdict.setdefault("path", cwd)
     return verdict["verdict"], verdict
 
 

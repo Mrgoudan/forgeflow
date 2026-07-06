@@ -100,6 +100,41 @@ steps:
         with self.assertRaisesRegex(SystemExit, "context 'pack' not accepted"):
             loader.load_workflow_file(p)
 
+    def test_open_context_block_accepts_any_registered_provider(self):
+        # agent.run declares accepts_context={"*"}: any registered provider
+        # is allowed (packs add providers without editing the engine), but
+        # an unregistered name is still refused.
+        pack = fake_pack(agents={"fix": {}})
+        pack.prompts = {"fix": "/tmp/x"}
+        pack.schemas = {"v": {"properties": {"verdict": {"enum": ["OK"]}}}}
+        p = self._write("w.yaml", """\
+workflow: w
+steps:
+  - name: a
+    block: agent.run
+    llm: fix
+    schema: v
+    timeout_s: 10
+    context: [pack]
+    outcomes: { OK: done, agent_limit: failed, agent_invalid: failed,
+                agent_backend: failed, timeout: failed }
+""")
+        loader.load_workflow_file(p, pack=pack)  # 'pack' is registered -> OK
+        p2 = self._write("w2.yaml", """\
+workflow: w
+steps:
+  - name: a
+    block: agent.run
+    llm: fix
+    schema: v
+    timeout_s: 10
+    context: [no_such_provider]
+    outcomes: { OK: done, agent_limit: failed, agent_invalid: failed,
+                agent_backend: failed, timeout: failed }
+""")
+        with self.assertRaisesRegex(SystemExit, "no registered provider"):
+            loader.load_workflow_file(p2, pack=pack)
+
     def test_context_without_provider_refused(self):
         p = self._write("w.yaml", """\
 workflow: w

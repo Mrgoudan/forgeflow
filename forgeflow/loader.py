@@ -162,7 +162,7 @@ def load_workflow_file(path, pack=None) -> Workflow:
                 spec = spec or {}
             else:
                 _die(swhere, "malformed context entry %r" % entry)
-            if cname not in blk.accepts_context:
+            if "*" not in blk.accepts_context and cname not in blk.accepts_context:
                 _die(swhere, "context '%s' not accepted by block '%s' (accepts: %s)"
                      % (cname, blk.name, sorted(blk.accepts_context) or "nothing"))
             if cname not in CONTEXT_PROVIDERS:
