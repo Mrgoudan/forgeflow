@@ -1,0 +1,19 @@
+# Crash-resume proof workflow: 'first' has a counted side effect, 'slow'
+# blocks while a flag file exists. Kill -9 mid-'slow', restart, and the
+# engine must resume at 'slow' WITHOUT re-running 'first'.
+workflow: resume_demo
+consumes: [resume.requested]
+emits: []
+
+steps:
+  - name: first
+    block: shell.run
+    timeout_s: 60
+    params: { cmd: ["sh", "count.sh"], cwd: "{paths.repo}" }
+    outcomes: { ok: slow, nonzero: failed, mismatch: failed, timeout: failed }
+
+  - name: slow
+    block: shell.run
+    timeout_s: 300
+    params: { cmd: ["sh", "slow.sh"], cwd: "{paths.repo}" }
+    outcomes: { ok: done, nonzero: failed, mismatch: failed, timeout: failed }

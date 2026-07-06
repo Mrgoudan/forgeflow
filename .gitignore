@@ -1,10 +1,11 @@
 # --- data zones (see docs/DATA.md): only the platform is tracked here ---
-vault/
-state/
-data/
-workspaces/
-legacy/
-logs/
+# anchored to repo root: a nested tests/data/ etc. is NOT a data zone
+/vault/
+/state/
+/data/
+/workspaces/
+/legacy/
+/logs/
 
 # machine-local config
 packs/*/project.yaml
