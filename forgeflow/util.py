@@ -119,16 +119,18 @@ def template(value, mapping: dict):
     strings inside value using mapping. Unknown names are a loud error —
     a template that silently survives is a config bug waiting downstream."""
     if isinstance(value, str):
-        def sub(m):
-            key = m.group(1)
+        def resolve(key):
             cur = mapping
             for part in key.split("."):
                 if isinstance(cur, dict) and part in cur:
                     cur = cur[part]
                 else:
                     raise KeyError("unresolved template '{%s}' in %r" % (key, value))
-            return str(cur)
-        return _TEMPLATE_RE.sub(sub, value)
+            return cur
+        full = _TEMPLATE_RE.fullmatch(value)
+        if full:  # whole-string placeholder keeps its native type (ints, lists)
+            return resolve(full.group(1))
+        return _TEMPLATE_RE.sub(lambda m: str(resolve(m.group(1))), value)
     if isinstance(value, dict):
         return {k: template(v, mapping) for k, v in value.items()}
     if isinstance(value, list):
