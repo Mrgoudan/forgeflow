@@ -227,12 +227,28 @@ Three pieces in the pack, then one step in the workflow.
 ```yaml
 # project.yaml
 agents:                             # role -> which backend/model (per machine)
-  fix: { backend: claude-cli, model: your-model-id }
+  fix:    { backend: claude-cli, model: your-model-id }   # agentic CLI (tools, cwd)
+  triage: { backend: openai-compat,                       # ANY chat-completions API:
+            base_url: "http://127.0.0.1:11434/v1",        # local runtime, gateway, cloud
+            model: some-chat-model, api_key_ref: LOCAL }  # key ref, never the key
 prompts:
   fix: prompts/fix.md               # the base prompt for that role
 schemas:
   verdict: schemas/verdict.yaml     # what a valid answer looks like
 ```
+
+API keys live in ONE place: `~/.config/forgeflow/secrets.env` (must be
+`chmod 600`), as `LLM_API_KEY_<REF>=...` — pack files only name the REF.
+Embedding models (BERT-style) are configured the same way:
+
+```yaml
+models:
+  bertish: { base_url: "http://127.0.0.1:11434/v1", model: some-embed-model }
+  tiny:    { path: models/tiny.json, sha256: <pinned> }   # or local pinned weights
+```
+
+Both work through the same `model.embed` block; vectors land in the
+`embeddings` table and are hints for retrieval/dedup — never decisions.
 
 ```yaml
 # schemas/verdict.yaml — the LLM must answer with JSON matching this

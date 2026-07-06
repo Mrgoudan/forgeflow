@@ -87,6 +87,8 @@ class LocalModelTest(unittest.TestCase):
                   "model": "m", "text": "{payload.text}",
                   "object": {"repo": "r", "path": "src/a.c", "sha": "abc"}})
               .on("embed", "ok", "classify")
+              .on("embed", "error", "failed")
+              .on("embed", "timeout", "failed")
               .step("classify", get("model.classify"), timeout_s=10, params={
                   "model": "m", "text": "{payload.text}"})
               .on("classify", "ok", "done"))

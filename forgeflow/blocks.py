@@ -396,18 +396,39 @@ def _load_pack_model(ctx, name):
     return localmodel.load_model(spec["path"], expected_sha=spec["sha256"])
 
 
-@block("model.embed", "local", {"ok"},
+@block("model.embed", "local", {"ok", "error", "timeout"},
        accepts_context={"payload", "pack"}, required_params={"model", "text"})
 def model_embed(ctx, task, prev):
-    """Deterministic embedding from pinned weights. If an 'object' param
+    """Embedding from a pack model: local pinned weights (deterministic) or
+    an /embeddings API endpoint (a BERT-like server). If an 'object' param
     names a code object, the vector is staged into the embeddings table
     (keyed by object + model_sha) at the step boundary. The vector is a
-    claim for retrieval/dedup — never evidence."""
+    claim for retrieval/dedup — never evidence. error = the endpoint
+    failed (HTTP class); local weights cannot produce it."""
     from . import localmodel
-    weights, model_sha = _load_pack_model(ctx, ctx["model"])
     text = _tpl(ctx, task, prev, ctx["text"])
-    vec = localmodel.embed(text, weights)
-    result = {"model_sha": model_sha, "dim": weights["dim"],
+    pack = ctx.get("_pack")
+    if pack is None or ctx["model"] not in getattr(pack, "models", {}):
+        raise RuntimeError("model '%s' not declared in pack models section"
+                           % ctx["model"])
+    spec = pack.models[ctx["model"]]
+    if "base_url" in spec:
+        from . import runner
+        from .util import canonical_json, sha256_text
+        try:
+            vec = runner.embed_api(spec, text, timeout_s=ctx["_timeout_s"],
+                                   out_dir=Path(ctx["_step_dir"]) / "embed")
+        except runner.RunnerError as e:
+            return "error", {"error": str(e), "error_class": e.error_class}
+        model_sha = sha256_text(canonical_json(
+            {"base_url": spec["base_url"], "model": spec["model"]}))
+        dim = len(vec)
+    else:
+        weights, model_sha = localmodel.load_model(spec["path"],
+                                                   expected_sha=spec["sha256"])
+        vec = localmodel.embed(text, weights)
+        dim = weights["dim"]
+    result = {"model_sha": model_sha, "dim": dim,
               "nonzero": any(x != 0.0 for x in vec)}
     obj = ctx.get("object")
     if obj:
@@ -417,7 +438,7 @@ def model_embed(ctx, task, prev):
                               "symbol": obj.get("symbol"),
                               "sha": obj.get("sha", "unpinned"),
                               "model_sha": model_sha,
-                              "dim": weights["dim"], "vector": vec}]
+                              "dim": dim, "vector": vec}]
     else:
         result["vector"] = vec
     return "ok", result

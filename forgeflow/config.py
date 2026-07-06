@@ -148,26 +148,37 @@ def load_pack(pack_dir) -> Pack:
         with open(p) as f:
             schemas[sname] = yaml.safe_load(f)
 
-    # models: pinned weights, verified at startup like tools
+    # models: local weights (pinned by sha256) OR an embedding API endpoint
+    # (a "BERT-like" local server, any /embeddings-speaking service)
     from .util import sha256_file
     models = {}
     for mname, spec in (doc.get("models") or {}).items():
         spec = spec or {}
-        if "path" not in spec or "sha256" not in spec:
-            _fail("models.%s: needs 'path' and 'sha256' (weights are pinned)"
-                  % mname)
-        mp = Path(str(spec["path"])).expanduser()
-        if not mp.is_absolute():
-            mp = pack_dir / mp
-        if not mp.is_file():
-            _fail("models.%s -> %s does not exist" % (mname, mp))
-        actual = sha256_file(mp)
-        if actual != spec["sha256"]:
-            _fail("models.%s: sha256 mismatch (file %s, declared %s) — "
-                  "weights drifted, refuse to start"
-                  % (mname, actual, spec["sha256"]))
-        models[mname] = {"path": str(mp), "sha256": spec["sha256"],
-                         "params": spec.get("params") or {}}
+        if "path" in spec:
+            if "sha256" not in spec:
+                _fail("models.%s: local weights need 'sha256' (pinned)" % mname)
+            mp = Path(str(spec["path"])).expanduser()
+            if not mp.is_absolute():
+                mp = pack_dir / mp
+            if not mp.is_file():
+                _fail("models.%s -> %s does not exist" % (mname, mp))
+            actual = sha256_file(mp)
+            if actual != spec["sha256"]:
+                _fail("models.%s: sha256 mismatch (file %s, declared %s) — "
+                      "weights drifted, refuse to start"
+                      % (mname, actual, spec["sha256"]))
+            models[mname] = {"path": str(mp), "sha256": spec["sha256"],
+                             "params": spec.get("params") or {}}
+        elif "base_url" in spec:
+            if "model" not in spec:
+                _fail("models.%s: api-backed model needs 'model'" % mname)
+            models[mname] = {"base_url": str(spec["base_url"]),
+                             "model": str(spec["model"]),
+                             "api_key_ref": spec.get("api_key_ref"),
+                             "params": spec.get("params") or {}}
+        else:
+            _fail("models.%s: needs either path+sha256 (local weights) or "
+                  "base_url+model (embedding API)" % mname)
 
     agents = doc.get("agents") or {}
     for aname, acfg in agents.items():

@@ -41,22 +41,16 @@ class RunnerError(Exception):
 
 
 # --------------------------------------------------------------- backends
+#
+# A backend takes one ask and returns a normalized response dict:
+#   { "exit_code": int, "result": model text, "session": opaque continuation
+#     state for re-asks, "error_class": None | POLICY class, "detail": str }
+# Classification uses exit codes / HTTP status / envelope structure ONLY.
 
-def _claude_cli_backend(binding, prompt, *, cwd, timeout_s, out_dir,
-                        session_ref=None):
-    """Agentic CLI backend. Fixed argv; the prompt travels via stdin (never
-    argv — argv leaks into process listings). Returns
-    (exit_code, stdout_path, stderr_path)."""
-    argv = [binding.get("cli", "claude"), "-p",
-            "--permission-mode", binding.get("permission_mode", "bypassPermissions"),
-            "--output-format", "json"]
-    if binding.get("model"):
-        argv += ["--model", str(binding["model"])]
-    if session_ref:
-        argv += ["--resume", session_ref]
-    # minimal env: never leak the daemon's secrets into agent processes.
-    # Base set = process basics + proxy transport; anything else the
-    # backend needs must be named explicitly in the binding's env_keys.
+def _agent_env(binding):
+    """Minimal env: never leak the daemon's secrets into agent processes.
+    Base set = process basics + proxy transport; anything else the backend
+    needs must be named explicitly in the binding's env_keys."""
     base_keys = ("PATH", "HOME", "TERM", "LANG", "SHELL",
                  "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
                  "http_proxy", "https_proxy", "no_proxy", "all_proxy")
@@ -64,15 +58,136 @@ def _claude_cli_backend(binding, prompt, *, cwd, timeout_s, out_dir,
     for k in binding.get("env_keys", ()):
         if k in os.environ:
             env[k] = os.environ[k]
+    return env
+
+
+def _claude_cli_backend(binding, ask, *, cwd, timeout_s, out_dir,
+                        session=None, secrets=None):
+    """Agentic CLI backend. Fixed argv; the ask travels via stdin (never
+    argv — argv leaks into process listings). Re-asks resume the same CLI
+    session."""
+    argv = [binding.get("cli", "claude"), "-p",
+            "--permission-mode", binding.get("permission_mode", "bypassPermissions"),
+            "--output-format", "json"]
+    if binding.get("model"):
+        argv += ["--model", str(binding["model"])]
+    if session:
+        argv += ["--resume", str(session)]
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     prompt_file = out_dir / "prompt"          # snapshot: what was actually sent
-    prompt_file.write_text(prompt)
-    return run_cmd(argv, timeout_s, out_dir, cwd=cwd, env=env,
-                   stdin_path=prompt_file)
+    prompt_file.write_text(ask)
+    exit_code, stdout_path, stderr_path = run_cmd(
+        argv, timeout_s, out_dir, cwd=cwd, env=_agent_env(binding),
+        stdin_path=prompt_file)
+    envelope = _parse_envelope(stdout_path)
+    error_class = None
+    detail = ""
+    if exit_code != 0 or envelope["is_error"] or envelope["subtype"] != "success":
+        if envelope["subtype"] == "error_max_turns" or \
+                envelope.get("api_error_status") in (401, 403, 429):
+            error_class = "agent_limit"       # auth/limit: park, human/time fixes
+        else:
+            error_class = "agent_backend"
+        detail = ("exit=%s subtype=%s api_status=%s (archived at %s)"
+                  % (exit_code, envelope["subtype"],
+                     envelope.get("api_error_status"), out_dir))
+    return {"exit_code": exit_code, "result": envelope["result"],
+            "session": envelope["session_id"] or session,
+            "error_class": error_class, "detail": detail}
 
 
-BACKENDS = {"claude-cli": _claude_cli_backend}
+def _openai_compat_backend(binding, ask, *, cwd, timeout_s, out_dir,
+                           session=None, secrets=None):
+    """Text-only HTTP backend speaking the de-facto chat-completions
+    protocol (local runtimes, gateways, hosted endpoints). No tools, no
+    cwd access: text in, text out. api_key_ref names LLM_API_KEY_<REF> in
+    the secrets file — the key itself never appears in pack files, argv,
+    or logs. Re-asks carry the message history."""
+    messages = list(session or [])
+    messages.append({"role": "user", "content": ask})
+    body = {"model": binding.get("model", ""), "messages": messages}
+    status, data = _http_json(
+        binding, "/chat/completions", body, timeout_s, out_dir, secrets)
+    try:
+        content = data["choices"][0]["message"]["content"] or ""
+    except (KeyError, IndexError, TypeError):
+        return {"exit_code": status, "result": "", "session": messages,
+                "error_class": "agent_backend",
+                "detail": "malformed chat-completions response (archived)"}
+    messages.append({"role": "assistant", "content": content})
+    return {"exit_code": status, "result": content, "session": messages,
+            "error_class": None, "detail": ""}
+
+
+BACKENDS = {"claude-cli": _claude_cli_backend,
+            "openai-compat": _openai_compat_backend}
+
+
+def _http_json(binding, route, body, timeout_s, out_dir, secrets):
+    """POST canonical JSON, archive request/response verbatim, classify by
+    HTTP status only. Raises RunnerError / TimeoutExpired."""
+    import socket
+    import urllib.error
+    import urllib.request
+    base_url = binding.get("base_url")
+    if not base_url:
+        raise RunnerError("agent_backend", "binding needs base_url")
+    url = base_url.rstrip("/") + route
+    headers = {"Content-Type": "application/json"}
+    ref = binding.get("api_key_ref")
+    if ref:
+        if secrets is None:
+            from .config import load_secrets
+            secrets = load_secrets()
+        key = secrets.get("LLM_API_KEY_%s" % ref)
+        if not key:
+            raise RunnerError("agent_limit",
+                              "secret LLM_API_KEY_%s not configured" % ref)
+        headers["Authorization"] = "Bearer " + key
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    payload = canonical_json(body)
+    (out_dir / "request.json").write_text(payload)   # never contains the key
+    req = urllib.request.Request(url, data=payload.encode("utf-8"),
+                                 headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read()
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        (out_dir / "response.json").write_bytes(raw)
+        if e.code in (401, 403, 429):
+            raise RunnerError("agent_limit", "HTTP %d from %s" % (e.code, url))
+        raise RunnerError("agent_backend", "HTTP %d from %s" % (e.code, url))
+    except socket.timeout:
+        import subprocess
+        raise subprocess.TimeoutExpired(url, timeout_s)
+    except urllib.error.URLError as e:
+        if isinstance(getattr(e, "reason", None), socket.timeout):
+            import subprocess
+            raise subprocess.TimeoutExpired(url, timeout_s)
+        raise RunnerError("agent_backend", "unreachable %s (%s)" % (url, e.reason))
+    (out_dir / "response.json").write_bytes(raw)
+    try:
+        return status, json.loads(raw.decode("utf-8"))
+    except ValueError:
+        raise RunnerError("agent_backend", "non-JSON response from %s" % url)
+
+
+def embed_api(model_spec, text, *, timeout_s, out_dir, secrets=None):
+    """Embeddings over the same HTTP protocol (/embeddings) — how a
+    'BERT-like' local server (or any embedding endpoint) plugs in. Returns
+    the vector. Outputs are claims, exactly like local-weight models."""
+    body = {"model": model_spec.get("model", ""), "input": [text]}
+    status, data = _http_json(model_spec, "/embeddings", body, timeout_s,
+                              out_dir, secrets)
+    try:
+        vec = data["data"][0]["embedding"]
+        return [float(x) for x in vec]
+    except (KeyError, IndexError, TypeError, ValueError):
+        raise RunnerError("agent_backend", "malformed embeddings response")
 
 
 # ---------------------------------------------------------------- helpers
@@ -115,18 +230,20 @@ def _parse_envelope(stdout_path):
                 "subtype": "success"}
     if not isinstance(obj, dict):
         return {"result": raw, "session_id": None, "is_error": False,
-                "subtype": "success"}
+                "subtype": "success", "api_error_status": None}
     return {"result": obj.get("result") or "",
             "session_id": obj.get("session_id"),
             "is_error": bool(obj.get("is_error")),
-            "subtype": obj.get("subtype", "success")}
+            "subtype": obj.get("subtype", "success"),
+            "api_error_status": obj.get("api_error_status")}
 
 
 # ------------------------------------------------------------------ core
 
 def run_agent(conn, task, binding, base_prompt, schema, *, data_dir,
               pack_rev, cwd=None, timeout_s=3600, context_slice=None,
-              vault_rev=None, probe_rev=None, base_sha=None, build_id=None):
+              vault_rev=None, probe_rev=None, base_sha=None, build_id=None,
+              secrets=None):
     """Execute one agent step. Returns the schema-valid verdict dict.
     Raises RunnerError('agent_backend' | 'agent_limit' |
     'agent_invalid_output') for the workflow to dispatch on."""
@@ -151,32 +268,24 @@ def run_agent(conn, task, binding, base_prompt, schema, *, data_dir,
     run_dir = Path(data_dir) / "runs" / str(run_id)
 
     ask = prompt
-    session_ref = None
+    session = None
     exit_code = None
     last_error = None
     for round_no in range(1 + MAX_REASKS):        # bounded re-asks, same runs row
         out_dir = run_dir / ("ask%d" % round_no)
         try:
-            exit_code, stdout_path, stderr_path = backend(
-                binding, ask, cwd=cwd, timeout_s=timeout_s, out_dir=out_dir,
-                session_ref=session_ref)
+            resp = backend(binding, ask, cwd=cwd, timeout_s=timeout_s,
+                           out_dir=out_dir, session=session, secrets=secrets)
         except Exception:
             _finish(conn, run_id, exit_code, None, str(run_dir))
-            raise                                  # TimeoutExpired -> engine
-        envelope = _parse_envelope(stdout_path)
-        if exit_code != 0:
+            raise                     # TimeoutExpired / RunnerError -> caller
+        exit_code = resp.get("exit_code")
+        session = resp.get("session") or session
+        if resp.get("error_class"):
             _finish(conn, run_id, exit_code, None, str(run_dir))
-            raise RunnerError("agent_backend",
-                              "CLI exited %d (stderr archived at %s)"
-                              % (exit_code, stderr_path))
-        if envelope["is_error"] or envelope["subtype"] != "success":
-            _finish(conn, run_id, exit_code, None, str(run_dir))
-            cls = ("agent_limit" if envelope["subtype"] == "error_max_turns"
-                   else "agent_backend")
-            raise RunnerError(cls, "CLI envelope subtype=%s" % envelope["subtype"])
-        session_ref = envelope["session_id"] or session_ref
+            raise RunnerError(resp["error_class"], resp.get("detail", ""))
         try:
-            verdict = extract_verdict(envelope["result"], schema)
+            verdict = extract_verdict(resp.get("result"), schema)
         except (ValueError, SchemaError) as e:
             last_error = str(e)
             ask = ("Your previous reply did not satisfy the output contract "
