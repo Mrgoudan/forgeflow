@@ -54,8 +54,16 @@ def _claude_cli_backend(binding, prompt, *, cwd, timeout_s, out_dir,
         argv += ["--model", str(binding["model"])]
     if session_ref:
         argv += ["--resume", session_ref]
-    env = {k: v for k, v in os.environ.items()
-           if k in ("PATH", "HOME", "TERM", "LANG", "SHELL")}
+    # minimal env: never leak the daemon's secrets into agent processes.
+    # Base set = process basics + proxy transport; anything else the
+    # backend needs must be named explicitly in the binding's env_keys.
+    base_keys = ("PATH", "HOME", "TERM", "LANG", "SHELL",
+                 "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+                 "http_proxy", "https_proxy", "no_proxy", "all_proxy")
+    env = {k: v for k, v in os.environ.items() if k in base_keys}
+    for k in binding.get("env_keys", ()):
+        if k in os.environ:
+            env[k] = os.environ[k]
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     prompt_file = out_dir / "prompt"          # snapshot: what was actually sent
