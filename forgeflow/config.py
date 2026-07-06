@@ -38,6 +38,7 @@ class Pack:
     paths: dict = field(default_factory=dict)     # name -> verified abs path (str)
     params: dict = field(default_factory=dict)    # free-form, path-templated
     workflow_dirs: tuple = ()                     # dirs of workflow YAML defs
+    block_files: tuple = ()                       # pack-shipped block modules
     tools: dict = field(default_factory=dict)     # name -> resolved path (str)
     tool_versions: dict = field(default_factory=dict)  # name -> version line
     agents: dict = field(default_factory=dict)    # llm binding -> backend cfg
@@ -49,8 +50,8 @@ class Pack:
     unpark_interval_s: int = 600
 
 
-_PACK_KEYS = {"name", "paths", "params", "workflows", "tools", "agents",
-              "prompts", "schemas", "models", "workspace_root",
+_PACK_KEYS = {"name", "paths", "params", "workflows", "blocks", "tools",
+              "agents", "prompts", "schemas", "models", "workspace_root",
               "idle_interval_s", "unpark_interval_s"}
 
 
@@ -99,6 +100,17 @@ def load_pack(pack_dir) -> Pack:
         if not p.is_dir():
             _fail("workflows entry %s is not a directory" % p)
         workflow_dirs.append(p)
+
+    # pack-shipped block modules: files must exist NOW; imported at engine
+    # startup so their @block registrations precede workflow compilation
+    block_files = []
+    for entry in doc.get("blocks") or []:
+        p = Path(str(entry))
+        if not p.is_absolute():
+            p = pack_dir / p
+        if not p.is_file():
+            _fail("blocks entry %s does not exist" % p)
+        block_files.append(str(p))
 
     # tools (verified, never installed)
     tools, tool_versions = {}, {}
@@ -169,7 +181,8 @@ def load_pack(pack_dir) -> Pack:
 
     return Pack(
         name=name, root=pack_dir, rev=_git_rev(pack_dir), paths=paths,
-        params=params, workflow_dirs=tuple(workflow_dirs), tools=tools,
+        params=params, workflow_dirs=tuple(workflow_dirs),
+        block_files=tuple(block_files), tools=tools,
         tool_versions=tool_versions, agents=agents, prompts=prompts,
         schemas=schemas, models=models, workspace_root=workspace_root,
         idle_interval_s=int(doc.get("idle_interval_s", 15)),

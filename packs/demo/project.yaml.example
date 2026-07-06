@@ -13,6 +13,9 @@ paths:                      # every entry must exist at load time
 workflows:                  # dirs of workflow YAML defs
   - workflows
 
+# blocks: [blocks/custom.py]   # pack-shipped block modules (custom Python,
+                               # only for genuinely new capabilities)
+
 tools:                      # verified at startup, never installed
   git: { path: git, version_cmd: ["--version"] }
 

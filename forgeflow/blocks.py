@@ -75,6 +75,30 @@ def all_blocks() -> dict:
     return dict(_BLOCKS)
 
 
+_LOADED_FILES = set()
+
+
+def load_files(paths) -> None:
+    """Import pack-shipped block modules (their @block decorators register
+    on import). This is how layer-2 customization ships CODE without
+    touching the engine. Idempotent per file (same pack loaded twice in one
+    process is fine); a name clash with any existing block remains a
+    startup error, exactly like a duplicate in-tree registration."""
+    import importlib.util
+    from .util import sha256_text
+    for p in paths:
+        resolved = str(Path(p).resolve())
+        if resolved in _LOADED_FILES:
+            continue
+        modname = "forgeflow_pack_block_" + sha256_text(resolved)[:12]
+        spec = importlib.util.spec_from_file_location(modname, resolved)
+        if spec is None or spec.loader is None:
+            raise SystemExit("pack blocks file %s is not importable" % resolved)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)      # SyntaxError etc. fail startup loudly
+        _LOADED_FILES.add(resolved)
+
+
 # --------------------------------------------------------------- helpers
 
 def _tpl(ctx, task, prev, value):
@@ -427,6 +451,23 @@ def db_upsert_finding(ctx, task, prev):
         if ctx.get(f) is not None:
             op[f] = _tpl(ctx, task, prev, ctx[f])
     return "ok", {"_staged": [op]}
+
+
+@block("event.emit", "state", {"ok"},
+       accepts_context={"payload"}, required_params={"name"})
+def event_emit(ctx, task, prev):
+    """Stage an arbitrary event: the engine appends it to the event log and
+    enqueues every workflow whose consumes: lists it — same transaction as
+    this step's boundary. This is the ONLY way one workflow hands work to
+    another outside a finding transition; the loader refuses names not
+    declared under emits:. Replays are absorbed by the queue's
+    payload-hash idempotency key."""
+    data = _tpl(ctx, task, prev, ctx.get("data") or {})
+    if not isinstance(data, dict):
+        raise RuntimeError("event.emit: 'data' must be a mapping")
+    name = _tpl(ctx, task, prev, ctx["name"])
+    return "ok", {"_staged": [{"op": "emit_event", "name": name,
+                               "payload": data}]}
 
 
 @block("db.transition", "state", {"ok"},

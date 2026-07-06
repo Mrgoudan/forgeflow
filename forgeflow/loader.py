@@ -189,6 +189,17 @@ def load_workflow_file(path, pack=None) -> Workflow:
             _die(swhere, "block '%s' requires params %s"
                  % (blk.name, sorted(missing_params)))
 
+        # event.emit steps: the event they stage is an EMIT — declared
+        # names only, well-formed only (no undeclared emits, ever).
+        if blk.name == "event.emit":
+            ev = params.get("name")
+            if isinstance(ev, str) and "{" not in ev:
+                if not _EVENT_RE.match(ev):
+                    _die(swhere, "malformed event name %r" % ev)
+                if ev not in emits:
+                    _die(swhere, "emits event '%s' but 'emits:' does not "
+                         "declare it — no undeclared emits" % ev)
+
         # db.transition steps: the transition they stage is an EMIT — it
         # must be declared, and the target state must exist.
         if blk.name == "db.transition":

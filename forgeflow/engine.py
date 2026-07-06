@@ -30,6 +30,10 @@ class Engine:
         for d in (self.state_dir, self.data_dir, self.workspaces_dir):
             Path(d).mkdir(parents=True, exist_ok=True)
         self.conn = db.connect(self.state_dir / "forgeflow.db")
+        if pack and pack.block_files:
+            # pack code registers its blocks BEFORE workflows compile
+            from . import blocks as blocks_mod
+            blocks_mod.load_files(pack.block_files)
         dirs = list(pack.workflow_dirs) if pack else []
         dirs += list(extra_defs_dirs)
         self.workflows = loader.load_defs(dirs, pack=pack)
