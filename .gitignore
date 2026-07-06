@@ -1,0 +1,16 @@
+# --- data zones (see docs/DATA.md): only the platform is tracked here ---
+vault/
+state/
+data/
+workspaces/
+legacy/
+logs/
+
+# machine-local config
+packs/*/project.yaml
+
+# python
+__pycache__/
+*.egg-info/
+.venv/
+*.pyc
