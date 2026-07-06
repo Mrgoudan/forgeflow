@@ -48,7 +48,8 @@ def payload_hash(payload: dict) -> str:
 
 # ---------------------------------------------------------------- processes
 
-def run_cmd(cmd, timeout_s, out_dir, cwd=None, env=None, tools=None):
+def run_cmd(cmd, timeout_s, out_dir, cwd=None, env=None, tools=None,
+            stdin_path=None):
     """The single subprocess choke point.
 
     cmd: list of argv strings. If `tools` (a {name: resolved_path} mapping,
@@ -71,14 +72,16 @@ def run_cmd(cmd, timeout_s, out_dir, cwd=None, env=None, tools=None):
     out_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = out_dir / "stdout"
     stderr_path = out_dir / "stderr"
-    with open(stdout_path, "wb") as out, open(stderr_path, "wb") as err:
-        try:
+    stdin_f = open(stdin_path, "rb") if stdin_path else subprocess.DEVNULL
+    try:
+        with open(stdout_path, "wb") as out, open(stderr_path, "wb") as err:
             proc = subprocess.run(
-                cmd, stdout=out, stderr=err, cwd=str(cwd) if cwd else None,
-                env=env, timeout=timeout_s,
+                cmd, stdin=stdin_f, stdout=out, stderr=err,
+                cwd=str(cwd) if cwd else None, env=env, timeout=timeout_s,
             )
-        except subprocess.TimeoutExpired:
-            raise
+    finally:
+        if stdin_path:
+            stdin_f.close()
     return proc.returncode, str(stdout_path), str(stderr_path)
 
 

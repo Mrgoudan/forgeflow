@@ -50,6 +50,8 @@ class Step:
     resumable: bool = False      # a new ATTEMPT may reuse the last result
     llm: str = None              # pack agent binding name (llm blocks only)
     schema: str = None           # verdict schema name (llm blocks only)
+    outcomes: frozenset = None   # effective set; block.outcomes unless an
+                                 # llm step extends it with schema enums
 
 
 @dataclass
@@ -67,14 +69,20 @@ class Workflow:
 
     def step(self, name: str, block, *, timeout_s: int, params=None,
              context=(), max_visits: int = DEFAULT_MAX_VISITS,
-             resumable=None, llm=None, schema=None) -> "Workflow":
+             resumable=None, llm=None, schema=None,
+             outcomes=None) -> "Workflow":
         if any(s.name == name for s in self.steps):
             raise WorkflowError("%s: duplicate step '%s'" % (self.kind, name))
         if resumable is None:
             resumable = getattr(block, "resumable", False)
+        eff = frozenset(outcomes) if outcomes else frozenset(block.outcomes)
+        if not eff >= frozenset(block.outcomes):
+            raise WorkflowError(
+                "%s.%s: step outcome set may extend, never shrink, the "
+                "block's declared set" % (self.kind, name))
         self.steps.append(Step(name, block, timeout_s, dict(params or {}),
                                tuple(context), max_visits, resumable,
-                               llm, schema))
+                               llm, schema, eff))
         return self
 
     def on(self, step_name: str, outcome: str, target: str) -> "Workflow":
@@ -100,7 +108,7 @@ class Workflow:
                 raise WorkflowError("%s.%s: every step needs timeout_s > 0" % (w, s.name))
             if s.max_visits < 1:
                 raise WorkflowError("%s.%s: max_visits must be >= 1" % (w, s.name))
-            declared = set(s.block.outcomes)
+            declared = set(s.outcomes)
             mapped = {o for (n, o) in self.dispatch if n == s.name}
             missing = declared - mapped
             phantom = mapped - declared
@@ -147,7 +155,7 @@ class Workflow:
             for s in self.steps:
                 if s.name in can_finish:
                     continue
-                for o in s.block.outcomes:
+                for o in s.outcomes:
                     target = self.dispatch[(s.name, o)]
                     if target in TERMINAL_TASK_STATES or target in can_finish:
                         can_finish.add(s.name)
@@ -233,7 +241,7 @@ def execute(env: ExecEnv, workflow: Workflow, task: dict) -> str:
             try:
                 outcome, result, wall_ms = _run_block(env, step, task, prev)
             except subprocess.TimeoutExpired:
-                if "timeout" in step.block.outcomes:
+                if "timeout" in step.outcomes:
                     outcome, result, wall_ms = "timeout", {"timeout_s": step.timeout_s}, step.timeout_s * 1000
                 else:
                     return _fail_loud(env, task, "framework_bug",
@@ -243,7 +251,7 @@ def execute(env: ExecEnv, workflow: Workflow, task: dict) -> str:
                 return _fail_loud(env, task, "framework_bug",
                                   "uncaught exception in step '%s' (block '%s'):\n%s"
                                   % (current, step.block.name, traceback.format_exc()))
-            if outcome not in step.block.outcomes:
+            if outcome not in step.outcomes:
                 return _fail_loud(env, task, "framework_bug",
                                   "step '%s': block '%s' returned undeclared outcome "
                                   "%r (declared: %s)"
@@ -321,6 +329,10 @@ def _run_block(env, step, task, prev):
     ctx["_step_dir"] = str(step_dir)
     ctx["_workspaces_dir"] = str(env.workspaces_dir)
     ctx["_tools"] = dict(env.pack.tools) if env.pack else {}
+    ctx["_data_dir"] = str(env.data_dir)
+    ctx["_conn"] = env.conn      # for runner-backed blocks (runs row pinning)
+    ctx["_pack"] = env.pack
+    ctx["_step"] = step
     started = time.monotonic()
     outcome, result = step.block.fn(ctx, task, prev)
     wall_ms = int((time.monotonic() - started) * 1000)

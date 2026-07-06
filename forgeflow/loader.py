@@ -101,11 +101,45 @@ def load_workflow_file(path, pack=None) -> Workflow:
         if not isinstance(s.get("timeout_s"), int) or s["timeout_s"] <= 0:
             _die(swhere, "timeout_s (positive integer) is required — every step is bounded")
 
-        # outcomes: exact set equality with the block's declared set
+        # llm steps: binding, prompt and schema must resolve; the schema's
+        # verdict enum EXTENDS the block's outcome set for this step.
+        llm = s.get("llm")
+        step_outcomes = set(blk.outcomes)
+        if blk.exec_class == "llm":
+            if not llm:
+                _die(swhere, "block '%s' is llm-class: an 'llm:' binding is required"
+                     % blk.name)
+            agents = getattr(pack, "agents", None) or {}
+            if llm not in agents:
+                _die(swhere, "llm binding '%s' not found in pack agent section "
+                     "(defined: %s)" % (llm, sorted(agents) or "none"))
+            prompts = getattr(pack, "prompts", None) or {}
+            if llm not in prompts:
+                _die(swhere, "no pack prompt for llm binding '%s'" % llm)
+            schema_name = s.get("schema")
+            schemas = getattr(pack, "schemas", None) or {}
+            if not schema_name or schema_name not in schemas:
+                _die(swhere, "llm step needs 'schema:' resolving in pack schemas "
+                     "(defined: %s)" % (sorted(schemas) or "none"))
+            enum = (schemas[schema_name].get("properties", {})
+                    .get("verdict", {}).get("enum"))
+            if not enum:
+                _die(swhere, "schema '%s' must declare properties.verdict.enum — "
+                     "that enum IS the step's success outcome set" % schema_name)
+            overlap = set(enum) & step_outcomes
+            if overlap:
+                _die(swhere, "schema enum values %s collide with framework "
+                     "outcomes" % sorted(overlap))
+            step_outcomes |= set(enum)
+        elif llm:
+            _die(swhere, "block '%s' is %s-class: it cannot carry an 'llm:' binding"
+                 % (blk.name, blk.exec_class))
+
+        # outcomes: exact set equality with the step's effective set
         outcomes = s.get("outcomes")
         if not isinstance(outcomes, dict) or not outcomes:
             _die(swhere, "step needs an 'outcomes: {outcome: target}' mapping")
-        declared = set(blk.outcomes)
+        declared = step_outcomes
         mapped = set(outcomes)
         if mapped != declared:
             missing = declared - mapped
@@ -146,20 +180,6 @@ def load_workflow_file(path, pack=None) -> Workflow:
             _die(swhere, "block '%s' requires params %s"
                  % (blk.name, sorted(missing_params)))
 
-        # llm binding: exactly for llm-class blocks, resolving in the pack
-        llm = s.get("llm")
-        if blk.exec_class == "llm":
-            if not llm:
-                _die(swhere, "block '%s' is llm-class: an 'llm:' binding is required"
-                     % blk.name)
-            agents = getattr(pack, "agents", None) or {}
-            if llm not in agents:
-                _die(swhere, "llm binding '%s' not found in pack agent section "
-                     "(defined: %s)" % (llm, sorted(agents) or "none"))
-        elif llm:
-            _die(swhere, "block '%s' is %s-class: it cannot carry an 'llm:' binding"
-                 % (blk.name, blk.exec_class))
-
         # db.transition steps: the transition they stage is an EMIT — it
         # must be declared, and the target state must exist.
         if blk.name == "db.transition":
@@ -175,7 +195,8 @@ def load_workflow_file(path, pack=None) -> Workflow:
         wf.step(name, blk, timeout_s=s["timeout_s"], params=params,
                 context=tuple(context),
                 max_visits=s.get("max_visits", 3),
-                resumable=s.get("resumable"), llm=llm, schema=s.get("schema"))
+                resumable=s.get("resumable"), llm=llm, schema=s.get("schema"),
+                outcomes=step_outcomes)
         for outcome, target in outcomes.items():
             wf.on(name, outcome, target)
 

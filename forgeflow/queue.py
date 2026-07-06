@@ -32,6 +32,7 @@ POLICY = {
     "forge_auth":           Policy(20, 30, 3600, park_on_exhaust=True),
     "forge_server":         Policy(10, 10, 600,  park_on_exhaust=True),
     "agent_limit":          Policy(0,  0,  0,    park_on_exhaust=True),   # park immediately
+    "agent_backend":        Policy(3,  60, 3600, park_on_exhaust=True),   # CLI/transport errors
     "agent_invalid_output": Policy(2,  0,  0,    park_on_exhaust=False),  # re-ask twice then fail
     "verify_red":           Policy(1,  0,  0,    park_on_exhaust=False),  # one retry then fail
     "timeout":              Policy(1,  60, 3600, park_on_exhaust=False),  # one delayed retry

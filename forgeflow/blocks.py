@@ -323,6 +323,44 @@ def evidence_suite(ctx, task, prev):
     return "green", {"checks": ran, "failed": None}
 
 
+# -------------------------------------------------------------- llm block
+
+@block("agent.run", "llm",
+       {"agent_limit", "agent_invalid", "agent_backend", "timeout"},
+       accepts_context={"payload", "pack", "lessons", "readings", "chains",
+                        "notes", "diff", "finding"})
+def agent_run(ctx, task, prev):
+    """THE llm block — delegates to runner.run_agent(), the only path to
+    any model. The step's schema enums extend this block's outcome set at
+    load time (loader), so 'the model said something weird' can only ever
+    surface as agent_invalid. A new task attempt is a new runs row; agent
+    steps are never resumable."""
+    from . import runner
+    step = ctx["_step"]
+    pack = ctx["_pack"]
+    if pack is None:
+        raise RuntimeError("agent.run needs a pack (agents/prompts/schemas)")
+    binding = pack.agents[step.llm]
+    schema = pack.schemas[step.schema]
+    base_prompt = Path(pack.prompts[step.llm]).read_text()
+    declared = {name for name, _ in step.context}
+    context_slice = {k: ctx[k] for k in declared if k in ctx}
+    cwd = ctx.get("cwd") or (prev or {}).get("path")
+    if cwd:
+        cwd = _tpl(ctx, task, prev, cwd)
+    try:
+        verdict = runner.run_agent(
+            ctx["_conn"], task, binding, base_prompt, schema,
+            data_dir=ctx["_data_dir"], pack_rev=pack.rev, cwd=cwd,
+            timeout_s=ctx["_timeout_s"], context_slice=context_slice,
+            base_sha=(prev or {}).get("base_sha"))
+    except runner.RunnerError as e:
+        outcome = ("agent_invalid" if e.error_class == "agent_invalid_output"
+                   else e.error_class)
+        return outcome, {"error": str(e)}
+    return verdict["verdict"], verdict
+
+
 # ------------------------------------------------------------ state blocks
 
 @block("db.upsert_finding", "state", {"ok"},
