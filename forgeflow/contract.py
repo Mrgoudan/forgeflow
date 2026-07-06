@@ -227,6 +227,70 @@ def _check_notes_spec(spec, pack):
 _ctx_notes.check_spec = _check_notes_spec
 
 
+@context_provider("retrieval")
+def _ctx_retrieval(env, task, spec):
+    """k-nearest stored code objects by embedding similarity — the lesser
+    model shaping what the agent sees, never deciding anything. The query
+    (templated from the payload) is embedded with the named pack model;
+    candidates come from the embeddings table rows produced by the SAME
+    model (model_sha match); ties break by object id, so identical db
+    state always yields the identical context slice."""
+    from . import localmodel, runner
+    from .util import canonical_json, sha256_text
+    from .util import template as _template
+    mspec = env.pack.models[spec["model"]]
+    query = _template(spec["query"], {"payload": task.get("payload") or {}})
+    k = int(spec.get("k", 5))
+    if "base_url" in mspec:
+        out_dir = (Path(env.data_dir) / "tasks" / str(task["id"])
+                   / "retrieval")
+        vec = runner.embed_api(mspec, query, timeout_s=60, out_dir=out_dir)
+        model_sha = sha256_text(canonical_json(
+            {"base_url": mspec["base_url"], "model": mspec["model"]}))
+    else:
+        weights, model_sha = localmodel.load_model(
+            mspec["path"], expected_sha=mspec["sha256"])
+        vec = localmodel.embed(query, weights)
+    scored = []
+    for r in env.conn.execute(
+            "SELECT e.object_id, e.vector, co.repo, co.path, co.symbol"
+            " FROM embeddings e JOIN code_objects co ON co.id = e.object_id"
+            " WHERE e.model_sha=?", (model_sha,)):
+        score = localmodel.cosine(vec, json.loads(r["vector"]))
+        scored.append((-score, r["object_id"], r))
+    scored.sort(key=lambda t: (t[0], t[1]))
+    out = []
+    for neg_score, obj_id, r in scored[:k]:
+        entry = {"repo": r["repo"], "path": r["path"], "symbol": r["symbol"],
+                 "score": round(-neg_score, 6)}
+        if spec.get("from", "readings") == "readings":
+            reading = env.conn.execute(
+                "SELECT summary FROM readings WHERE object_id=?"
+                " ORDER BY id DESC LIMIT 1", (obj_id,)).fetchone()
+            if reading:
+                entry["summary"] = reading["summary"]
+        out.append(entry)
+    return out
+
+
+def _check_retrieval_spec(spec, pack):
+    if not spec.get("model"):
+        return "retrieval context needs 'model' (a pack models entry)"
+    models = getattr(pack, "models", None) or {}
+    if spec["model"] not in models:
+        return ("retrieval model '%s' not in pack models section (defined: %s)"
+                % (spec["model"], sorted(models) or "none"))
+    if not spec.get("query") or not isinstance(spec["query"], str):
+        return "retrieval context needs a string 'query'"
+    k = spec.get("k", 5)
+    if not isinstance(k, int) or k < 1:
+        return "retrieval 'k' must be a positive integer"
+    return None
+
+
+_ctx_retrieval.check_spec = _check_retrieval_spec
+
+
 @dataclass
 class ExecEnv:
     conn: "object"

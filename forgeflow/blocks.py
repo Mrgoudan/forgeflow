@@ -352,7 +352,7 @@ def evidence_suite(ctx, task, prev):
 @block("agent.run", "llm",
        {"agent_limit", "agent_invalid", "agent_backend", "timeout"},
        accepts_context={"payload", "pack", "lessons", "readings", "chains",
-                        "notes", "diff", "finding"})
+                        "notes", "diff", "finding", "retrieval"})
 def agent_run(ctx, task, prev):
     """THE llm block — delegates to runner.run_agent(), the only path to
     any model. The step's schema enums extend this block's outcome set at
