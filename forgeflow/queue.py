@@ -116,11 +116,20 @@ def park(conn, task_id: int, reason: str) -> None:
 
 
 def unpark(conn, task_id=None, ids=None) -> int:
-    """parked -> pending, attempts unchanged. Three modes:
+    """parked -> pending, STARTING A FRESH ATTEMPT (attempts += 1). Three modes:
       - ids=[...]   : exactly these (the daemon's cadence/health tick).
       - task_id=N   : one (targeted operator/board override).
       - both None   : ALL parked (operator 'release everything').
-    Returns how many tasks became eligible."""
+    Returns how many tasks became eligible.
+
+    Why bump attempts: the contract replays a step's RECORDED outcome for the
+    SAME attempt (crash-resume). A task parked by a workflow outcome->parked
+    mapping (e.g. explore's agent_limit->parked) still has that failing step
+    recorded for the current attempt, so resuming WITHOUT a new attempt would
+    just replay the stored failure and re-park — the agent would never re-run.
+    A fresh attempt has no recorded steps, so the workflow runs from scratch."""
+    bump = ("UPDATE tasks SET state='pending', attempts=attempts+1,"
+            " next_attempt=NULL, updated_at=datetime('now')")
     with ensure_tx(conn):
         if ids is not None:
             ids = list(ids)
@@ -128,18 +137,11 @@ def unpark(conn, task_id=None, ids=None) -> int:
                 return 0
             ph = ",".join("?" * len(ids))
             cur = conn.execute(
-                "UPDATE tasks SET state='pending', next_attempt=NULL,"
-                " updated_at=datetime('now')"
-                " WHERE state='parked' AND id IN (%s)" % ph, ids)
+                bump + " WHERE state='parked' AND id IN (%s)" % ph, ids)
         elif task_id is None:
-            cur = conn.execute(
-                "UPDATE tasks SET state='pending', next_attempt=NULL,"
-                " updated_at=datetime('now') WHERE state='parked'")
+            cur = conn.execute(bump + " WHERE state='parked'")
         else:
-            cur = conn.execute(
-                "UPDATE tasks SET state='pending', next_attempt=NULL,"
-                " updated_at=datetime('now') WHERE id=? AND state='parked'",
-                (task_id,))
+            cur = conn.execute(bump + " WHERE id=? AND state='parked'", (task_id,))
         return cur.rowcount
 
 

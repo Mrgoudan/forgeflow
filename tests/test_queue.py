@@ -87,7 +87,8 @@ class QueueTest(unittest.TestCase):
         self.assertEqual(queue.unpark(self.conn), 1)
         row = self.conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
         self.assertEqual(row["state"], "pending")
-        self.assertEqual(row["attempts"], 1)  # unpark does NOT reset attempts
+        # unpark starts a FRESH attempt (1 -> 2) so recorded steps don't replay
+        self.assertEqual(row["attempts"], 2)
         t = queue.claim(self.conn)
         self.assertEqual(t["id"], tid)
 
@@ -133,6 +134,10 @@ class QueueTest(unittest.TestCase):
         self.assertEqual(queue.unpark(self.conn, ids=[a]), 1)  # only a
         self.assertEqual(self._state(a), "pending")
         self.assertEqual(self._state(b), "parked")
+        self.assertEqual(self.conn.execute(   # a got a fresh attempt, b didn't
+            "SELECT attempts FROM tasks WHERE id=?", (a,)).fetchone()[0], 1)
+        self.assertEqual(self.conn.execute(
+            "SELECT attempts FROM tasks WHERE id=?", (b,)).fetchone()[0], 0)
         queue.rearm(self.conn, [b])               # reset b's clock
         self.assertEqual(queue.parked_due(self.conn), [])     # b no longer due
 
