@@ -298,7 +298,40 @@ python3 -m forgeflow --root R           trace ID    # one task's full story: ste
 
 (Installed via pip? `forgeflow ...` works instead of `python3 -m forgeflow ...`.)
 
-## 9. The standard blocks
+## 9. Running in parallel (optional)
+
+By default the daemon runs one task at a time. Opt into parallelism in the pack:
+
+```yaml
+# project.yaml
+concurrency:
+  workers: 6                 # up to 6 tasks executing at once
+  lanes:                     # per-lane concurrency caps (a shared semaphore)
+    build: 1                 # only ONE build runs, across all workers
+    llm:   4                 # ≤4 agent calls at a time (rate-limit friendly)
+```
+
+A step runs in a **lane** — its `lane:` if set, else the block's exec-class
+(`local`/`llm`/`state`). A capped lane admits at most that many concurrent step
+runs across *all* workers; an uncapped lane is bounded only by `workers`. So you
+get throughput while still forcing specific steps to be serial:
+
+```yaml
+- name: build
+  block: shell.run
+  lane: build          # shares the build lane (cap 1): never two builds at once
+  timeout_s: 3600
+  params: { cmd: [ ... ] }
+  outcomes: { ok: ok, nonzero: failed, mismatch: failed, timeout: failed }
+```
+
+Integrity holds: each worker has its own SQLite connection, claims are atomic
+(`BEGIN IMMEDIATE`), a block runs *outside* any transaction (so a slow step
+never blocks another worker's commit), and every task's steps stay sequential +
+resume-on-crash. Omit `concurrency` (or set `workers: 1`) for the classic
+one-at-a-time daemon.
+
+## 10. The standard blocks
 
 | block | outcomes | what it does |
 |---|---|---|
@@ -313,7 +346,7 @@ python3 -m forgeflow --root R           trace ID    # one task's full story: ste
 | `agent.run` | your schema's enums + agent_limit/agent_invalid/agent_backend/timeout | the LLM step |
 | `model.embed` / `model.classify` | ok | tiny local models (pinned weight files); outputs are hints, never decisions |
 
-## 10. What protects you (the short version)
+## 11. What protects you (the short version)
 
 - **Everything checked at startup** — unmapped outcome, missing file,
   missing tool, wrong-hash model, bad event name: `validate` refuses with
