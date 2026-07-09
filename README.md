@@ -16,12 +16,13 @@ You never write orchestration code. You write:
 ## 1. Install
 
 ```bash
-git clone git@github.com:Mrgoudan/forgeflow.git
+git clone https://github.com/Mrgoudan/forgeflow.git
 cd forgeflow
-pip install -e .        # or: no install — use PYTHONPATH=. python3 -m forgeflow
+pip install -e .        # or skip install and use: PYTHONPATH=. python3 -m forgeflow …
 ```
 
-Needs Python ≥ 3.8 and `pyyaml`. Nothing else.
+Needs Python ≥ 3.8 and `pyyaml`. Nothing else. (Prefer no install? Every
+command below also works as `PYTHONPATH=. python3 -m forgeflow …` from the repo.)
 
 ## 2. Your first workflow (copy-paste, 2 minutes)
 
@@ -291,7 +292,8 @@ python3 -m forgeflow --root R --pack P run         # the daemon (one per root)
 python3 -m forgeflow --root R --pack P once        # drain queued work, exit
 python3 -m forgeflow --root R --pack P emit NAME --data '{...}' [--drive]
 python3 -m forgeflow --root R           status     # tasks/findings/parked/events
-python3 -m forgeflow --root R           unpark [ID]
+python3 -m forgeflow --root R           unpark [ID] # parked -> pending (all, or one id)
+python3 -m forgeflow --root R           trace ID    # one task's full story: steps, outcomes, timings
 ```
 
 (Installed via pip? `forgeflow ...` works instead of `python3 -m forgeflow ...`.)
@@ -326,10 +328,19 @@ python3 -m forgeflow --root R           unpark [ID]
   prompt and every model answer is on disk under `--root`, addressed by
   task/run id.
 
+## A real-world pack
+
+Want a production example instead of `hello`? [**forgeflow-packs**](https://github.com/Mrgoudan/forgeflow-packs)
+is a full deployment on this engine: an automated **BiSheng C compiler
+reviewer + differential-probe bug-hunter + auto-fixer** — many chained
+workflows, custom blocks, LLM steps, a live control-room dashboard, and a
+git-versioned knowledge store. Its `packs/bsc/` shows every section above
+composed at scale.
+
 ## Tests & docs
 
 ```bash
-python3 -m unittest discover -s tests    # 92 tests, stdlib only
+python3 -m unittest discover -s tests    # 111 tests, stdlib only
 ./scripts/check_generic.sh               # proves the engine has no domain leaks
 ```
 
