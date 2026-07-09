@@ -87,7 +87,7 @@ def run_cmd(cmd, timeout_s, out_dir, cwd=None, env=None, tools=None,
 
 def files_equal(a, b) -> bool:
     """Byte-exact comparison — the deterministic 'did we get what we
-    expected' primitive for oracle blocks."""
+    expected' primitive for compare-to-expected blocks."""
     pa, pb = Path(a), Path(b)
     if not pa.is_file() or not pb.is_file():
         return False

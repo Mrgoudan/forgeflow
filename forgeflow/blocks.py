@@ -274,7 +274,7 @@ def shell_run(ctx, task, prev):
 @block("scan.grep_rules", "local", {"ok", "timeout"},
        accepts_context={"payload", "pack"}, required_params={"repo", "rules"})
 def scan_grep_rules(ctx, task, prev):
-    """No-AI finder: run pattern rules over a tree; hits become candidates.
+    """Pattern scan: run rules over a tree; hits become candidates.
     grep exit 0 = hits, 1 = clean, anything else = a broken rule (loud)."""
     deadline = _deadline(ctx)
     repo = _tpl(ctx, task, prev, ctx["repo"])

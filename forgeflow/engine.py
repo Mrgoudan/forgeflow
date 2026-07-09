@@ -31,6 +31,11 @@ class Engine:
         for d in (self.state_dir, self.data_dir, self.workspaces_dir):
             Path(d).mkdir(parents=True, exist_ok=True)
         self.conn = db.connect(self.state_dir / "forgeflow.db")
+        # apply pack-declared schema after the generic core (idempotent CREATE
+        # IF NOT EXISTS). Written once to the db file here; worker connections
+        # open the core schema and see these tables already present.
+        for sf in (pack.schema_files if pack else ()):
+            self.conn.executescript(Path(sf).read_text())
         if pack and pack.block_files:
             # pack code registers its blocks BEFORE workflows compile
             from . import blocks as blocks_mod

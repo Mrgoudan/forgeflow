@@ -22,6 +22,8 @@ check '\bbsc\b|bisheng|\.cbs\b|\bclang\b|\bllvm\b|\bninja\b' "project/toolchain 
 check '/home/[a-z]' "absolute user paths in core"
 check '\bopus\b|\bsonnet\b|\bqwen\b|glm-|gpt-' "model names in core"
 check 'gitcode|gitee|github' "forge names outside forge/" --exclude-dir=forge
+check '\bfinding\b|\boracle\b|\bdefect\b|upsert_finding' "review/hunt domain vocabulary in core"
+check 'CREATE TABLE.*\b(methods|regions|patterns|chains|coverage|lessons|implications)\b' "domain tables in core schema"
 
 if [ "$FAIL" -eq 0 ]; then echo "core is generic: OK"; fi
 exit $FAIL

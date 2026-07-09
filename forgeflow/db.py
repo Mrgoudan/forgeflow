@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS transitions (           -- append-only audit log
     from_state    TEXT NOT NULL,
     to_state      TEXT NOT NULL,
     event         TEXT NOT NULL,         -- machine event, e.g. 'evidence:build_green'
-    evidence      TEXT,                  -- JSON: exit codes, probe diff, shas
+    evidence      TEXT,                  -- JSON: exit codes, check output, shas
     run_id        INTEGER REFERENCES runs(id),
     at            TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -108,7 +108,7 @@ CREATE TABLE IF NOT EXISTS runs (                  -- one row per agent invocati
     prompt_sha    TEXT NOT NULL,         -- sha256 of the assembled prompt
     pack_rev      TEXT NOT NULL,         -- git rev of the pack
     vault_rev     TEXT,                  -- git rev of the method vault
-    probe_rev     TEXT,                  -- git rev of the probe set
+    probe_rev     TEXT,                  -- git rev of the check set
     base_sha      TEXT,
     build_id      TEXT,                  -- toolchain build fingerprint
     exit_code     INTEGER,
@@ -131,14 +131,6 @@ CREATE TABLE IF NOT EXISTS egress (                -- everything ever sent out
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_egress_idem ON egress(kind, target, body_sha);
 
-CREATE TABLE IF NOT EXISTS lessons (
-    id            INTEGER PRIMARY KEY,
-    task_kind     TEXT NOT NULL,         -- which task kinds this lesson applies to
-    trigger       TEXT NOT NULL,         -- what situation activates it
-    rule          TEXT NOT NULL,         -- the instruction injected into prompts
-    provenance    TEXT,                  -- PR/incident it came from
-    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
-);
 
 CREATE TABLE IF NOT EXISTS watermarks (            -- external cursor state
     scope         TEXT PRIMARY KEY,      -- e.g. 'pr_comments:<repo>'
@@ -181,59 +173,11 @@ CREATE TABLE IF NOT EXISTS embeddings (           -- local-model vectors, pinned
     PRIMARY KEY (object_id, model_sha)
 );
 
-CREATE TABLE IF NOT EXISTS coverage (              -- hunt ledger: where we have looked
-    object_id     INTEGER NOT NULL REFERENCES code_objects(id),
-    workflow      TEXT NOT NULL,
-    sha           TEXT NOT NULL,         -- tree state when swept
-    probe_rev     TEXT,                  -- oracle version used
-    outcome       TEXT NOT NULL,         -- clean | items:<n>
-    swept_at      TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (object_id, workflow, sha)
-);
 
-CREATE TABLE IF NOT EXISTS implications (          -- item <-> code mapping
-    item_id    INTEGER NOT NULL REFERENCES items(id),
-    object_id     INTEGER NOT NULL REFERENCES code_objects(id),
-    role          TEXT NOT NULL,         -- root_cause | touched_by_fix | witness
-    PRIMARY KEY (item_id, object_id, role)
-);
 
-CREATE TABLE IF NOT EXISTS patterns (              -- graduated from items.pattern
-    id            TEXT PRIMARY KEY,
-    description   TEXT NOT NULL,
-    review_lens   TEXT,                  -- text injected into review prompts
-    grep_rule     TEXT,                  -- machine-checkable rule: a no-AI finder
-    status        TEXT NOT NULL DEFAULT 'active',  -- active | retired
-    escapes       INTEGER NOT NULL DEFAULT 0,      -- found later after review missed it
-    catches       INTEGER NOT NULL DEFAULT 0       -- caught at review time
-);
 
-CREATE TABLE IF NOT EXISTS regions (               -- explore surface map
-    id            TEXT PRIMARY KEY,      -- a source subsystem path prefix
-    repo          TEXT NOT NULL,
-    dry_streak    INTEGER NOT NULL DEFAULT 0,      -- consecutive no-new explores
-    cooldown_until_round INTEGER,
-    leased_by_task INTEGER REFERENCES tasks(id)    -- disjointness: one explorer per region
-);
 
-CREATE TABLE IF NOT EXISTS chains (                -- curated traced call-paths
-    id            TEXT PRIMARY KEY,
-    repo          TEXT NOT NULL,
-    sha           TEXT NOT NULL,         -- validity pin; hops drift with code
-    nodes         TEXT NOT NULL,         -- JSON: [{path, line, symbol}, ...]
-    hop_invariants TEXT NOT NULL,        -- JSON: per-hop promise + rank
-    yields        TEXT,                  -- JSON: item keys this chain produced
-    status        TEXT NOT NULL DEFAULT 'active'
-);
 
-CREATE TABLE IF NOT EXISTS methods (               -- the oracle bench
-    id            TEXT PRIMARY KEY,
-    description   TEXT NOT NULL,
-    status        TEXT NOT NULL DEFAULT 'candidate', -- candidate | active | exhausted
-    trials        INTEGER NOT NULL DEFAULT 0,
-    verified_yield INTEGER NOT NULL DEFAULT 0,     -- items that passed the repro gate
-    last_used_round INTEGER
-);
 
 CREATE INDEX IF NOT EXISTS idx_tasks_claim
     ON tasks(state, next_attempt) WHERE state IN ('pending','retry_wait');
