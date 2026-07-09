@@ -48,6 +48,11 @@ class Pack:
     workspace_root: Path = None
     idle_interval_s: int = 15
     unpark_interval_s: int = 600
+    # parallel daemon: {workers: N, lanes: {name: cap}}. A step runs in a lane
+    # (step.lane, else the block's exec_class); a lane with a cap admits at most
+    # that many concurrent steps across workers (e.g. lanes.build=1 serializes a
+    # rebuild). Absent -> single worker, no lane caps.
+    concurrency: dict = field(default_factory=dict)
     # optional health probe for park recovery: the daemon GETs this before
     # unparking agent-backend-dependent tasks (see Engine._agent_online). An
     # "env:VAR" value reads the URL from that env var.
@@ -56,7 +61,8 @@ class Pack:
 
 _PACK_KEYS = {"name", "paths", "params", "workflows", "blocks", "tools",
               "agents", "prompts", "schemas", "models", "workspace_root",
-              "idle_interval_s", "unpark_interval_s", "agent_health_url"}
+              "idle_interval_s", "unpark_interval_s", "agent_health_url",
+              "concurrency"}
 
 
 def load_pack(pack_dir) -> Pack:
@@ -224,6 +230,7 @@ def load_pack(pack_dir) -> Pack:
         idle_interval_s=int(doc.get("idle_interval_s", 15)),
         unpark_interval_s=int(doc.get("unpark_interval_s", 600)),
         agent_health_url=doc.get("agent_health_url"),
+        concurrency=doc.get("concurrency") or {},
     )
 
 

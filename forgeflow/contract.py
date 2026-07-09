@@ -52,6 +52,9 @@ class Step:
     schema: str = None           # verdict schema name (llm blocks only)
     outcomes: frozenset = None   # effective set; block.outcomes unless an
                                  # llm step extends it with schema enums
+    lane: str = None             # concurrency lane (semaphore key); a step runs
+                                 # only when its lane has a free slot. default =
+                                 # the block's exec_class.
 
 
 @dataclass
@@ -70,7 +73,7 @@ class Workflow:
     def step(self, name: str, block, *, timeout_s: int, params=None,
              context=(), max_visits: int = DEFAULT_MAX_VISITS,
              resumable=None, llm=None, schema=None,
-             outcomes=None) -> "Workflow":
+             outcomes=None, lane=None) -> "Workflow":
         if any(s.name == name for s in self.steps):
             raise WorkflowError("%s: duplicate step '%s'" % (self.kind, name))
         if resumable is None:
@@ -82,7 +85,7 @@ class Workflow:
                 "block's declared set" % (self.kind, name))
         self.steps.append(Step(name, block, timeout_s, dict(params or {}),
                                tuple(context), max_visits, resumable,
-                               llm, schema, eff))
+                               llm, schema, eff, lane))
         return self
 
     def on(self, step_name: str, outcome: str, target: str) -> "Workflow":
@@ -298,6 +301,8 @@ class ExecEnv:
     data_dir: Path = Path("data")
     workspaces_dir: Path = Path("workspaces")
     pack: "object" = None
+    lanes: dict = None           # lane name -> BoundedSemaphore (parallel daemon);
+                                 # None = no throttling (serial driver / tests).
 
 
 # ------------------------------------------------------------ execution
@@ -432,8 +437,19 @@ def _run_block(env, step, task, prev):
     ctx["_conn"] = env.conn      # for runner-backed blocks (runs row pinning)
     ctx["_pack"] = env.pack
     ctx["_step"] = step
+    # concurrency lane: under the parallel daemon, hold the lane's semaphore for
+    # the block's duration so a capped lane (e.g. build=1) serializes across
+    # workers. No-op for the serial driver (env.lanes is None). The block runs
+    # OUTSIDE any db transaction, so holding a lane never blocks other workers'
+    # commits.
+    lane = step.lane or getattr(step.block, "exec_class", None)
+    sem = (env.lanes or {}).get(lane)
     started = time.monotonic()
-    outcome, result = step.block.fn(ctx, task, prev)
+    if sem is not None:
+        with sem:
+            outcome, result = step.block.fn(ctx, task, prev)
+    else:
+        outcome, result = step.block.fn(ctx, task, prev)
     wall_ms = int((time.monotonic() - started) * 1000)
     if wall_ms > step.timeout_s * 1000:
         print("contract: step '%s' exceeded its budget (%dms > %ds)"

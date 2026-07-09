@@ -34,7 +34,7 @@ from .util import template
 _EVENT_RE = re.compile(r"^[a-z0-9_]+(\.[a-z0-9_]+)+$")
 
 _STEP_KEYS = {"name", "block", "timeout_s", "params", "context", "outcomes",
-              "max_visits", "resumable", "llm", "schema"}
+              "max_visits", "resumable", "llm", "schema", "lane"}
 _DOC_KEYS = {"workflow", "consumes", "emits", "steps"}
 
 
@@ -216,7 +216,7 @@ def load_workflow_file(path, pack=None) -> Workflow:
                 context=tuple(context),
                 max_visits=s.get("max_visits", 3),
                 resumable=s.get("resumable"), llm=llm, schema=s.get("schema"),
-                outcomes=step_outcomes)
+                outcomes=step_outcomes, lane=s.get("lane"))
         for outcome, target in outcomes.items():
             wf.on(name, outcome, target)
 
