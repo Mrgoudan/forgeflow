@@ -48,11 +48,15 @@ class Pack:
     workspace_root: Path = None
     idle_interval_s: int = 15
     unpark_interval_s: int = 600
+    # optional health probe for park recovery: the daemon GETs this before
+    # unparking agent-backend-dependent tasks (see Engine._agent_online). An
+    # "env:VAR" value reads the URL from that env var.
+    agent_health_url: str = None
 
 
 _PACK_KEYS = {"name", "paths", "params", "workflows", "blocks", "tools",
               "agents", "prompts", "schemas", "models", "workspace_root",
-              "idle_interval_s", "unpark_interval_s"}
+              "idle_interval_s", "unpark_interval_s", "agent_health_url"}
 
 
 def load_pack(pack_dir) -> Pack:
@@ -219,6 +223,7 @@ def load_pack(pack_dir) -> Pack:
         schemas=schemas, models=models, workspace_root=workspace_root,
         idle_interval_s=int(doc.get("idle_interval_s", 15)),
         unpark_interval_s=int(doc.get("unpark_interval_s", 600)),
+        agent_health_url=doc.get("agent_health_url"),
     )
 
 

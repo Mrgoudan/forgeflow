@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import threading
 import unittest
+from types import SimpleNamespace
 
 from helpers import tmpdir
 
 from forgeflow import db, queue
+from forgeflow.engine import Engine
 
 
 class QueueTest(unittest.TestCase):
@@ -88,6 +90,77 @@ class QueueTest(unittest.TestCase):
         self.assertEqual(row["attempts"], 1)  # unpark does NOT reset attempts
         t = queue.claim(self.conn)
         self.assertEqual(t["id"], tid)
+
+    def _park(self, cls):
+        self._pn = getattr(self, "_pn", 0) + 1   # unique payload (avoid dedup)
+        tid = queue.enqueue(self.conn, "k", {"i": cls, "n": self._pn})
+        queue.claim(self.conn)
+        queue.park(self.conn, tid, cls)          # force-park with this class
+        return tid
+
+    def _age(self, tid, seconds):
+        # backdate the park clock so a cadence has 'elapsed'
+        self.conn.execute(
+            "UPDATE tasks SET updated_at=datetime('now', '-' || ? || ' seconds')"
+            " WHERE id=?", (seconds, tid))
+        self.conn.commit()
+
+    def _state(self, tid):
+        return self.conn.execute(
+            "SELECT state FROM tasks WHERE id=?", (tid,)).fetchone()["state"]
+
+    def test_parked_due_respects_per_class_cadence(self):
+        limit = self._park("agent_limit")        # cadence 1800s (30 min)
+        srv = self._park("forge_server")         # cadence 600s
+        auth = self._park("forge_auth")          # cadence None -> never
+        self.assertEqual(queue.parked_due(self.conn), [])   # fresh: nothing due
+        for t in (limit, srv, auth):
+            self._age(t, 700)
+        due = dict(queue.parked_due(self.conn))
+        self.assertIn(srv, due)                   # 700 >= 600
+        self.assertNotIn(limit, due)              # 700 < 1800
+        self.assertNotIn(auth, due)               # never auto-unparks
+        self._age(limit, 2000)
+        self._age(auth, 10 ** 6)
+        due = dict(queue.parked_due(self.conn))
+        self.assertIn(limit, due)                 # 2000 >= 1800
+        self.assertNotIn(auth, due)               # STILL never (human-only)
+
+    def test_unpark_ids_and_rearm(self):
+        a, b = self._park("forge_server"), self._park("forge_server")
+        self._age(a, 700)
+        self._age(b, 700)
+        self.assertEqual(queue.unpark(self.conn, ids=[a]), 1)  # only a
+        self.assertEqual(self._state(a), "pending")
+        self.assertEqual(self._state(b), "parked")
+        queue.rearm(self.conn, [b])               # reset b's clock
+        self.assertEqual(queue.parked_due(self.conn), [])     # b no longer due
+
+    def test_unpark_tick_health_gates_backend_classes(self):
+        limit = self._park("agent_limit")
+        srv = self._park("forge_server")
+        self._age(limit, 2000)
+        self._age(srv, 2000)
+        # backend DOWN: forge_server recovers by cadence; agent_limit does not
+        stub = SimpleNamespace(conn=self.conn, _agent_online=lambda: False,
+                               pack=SimpleNamespace(agent_health_url="env:_x"))
+        Engine._unpark_tick(stub)
+        self.assertEqual(self._state(srv), "pending")   # non-backend: cadence only
+        self.assertEqual(self._state(limit), "parked")  # backend down: held
+        # re-armed on the failed probe -> not due until a full cadence later
+        self.assertNotIn(limit, dict(queue.parked_due(self.conn)))
+        # backend UP: the next due tick restarts it
+        self._age(limit, 2000)
+        stub._agent_online = lambda: True
+        Engine._unpark_tick(stub)
+        self.assertEqual(self._state(limit), "pending")
+
+    def test_agent_online_ungated_without_url(self):
+        # no URL, or an env: pointing at an unset var -> not gated (True)
+        self.assertTrue(Engine._agent_online(
+            SimpleNamespace(pack=SimpleNamespace(agent_health_url=None))))
+        self.assertTrue(Engine._agent_online(SimpleNamespace(
+            pack=SimpleNamespace(agent_health_url="env:_DEFINITELY_UNSET_x9"))))
 
     def test_consume_task_never_retries(self):
         tid = queue.enqueue(self.conn, "k", {"i": 1})

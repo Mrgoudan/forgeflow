@@ -26,13 +26,18 @@ class Policy:
     backoff_cap_s: int
     park_on_exhaust: bool     # park (human-visible, resumable) vs fail
     consume_task: bool = False  # True = terminal immediately, never retry
+    # how long a PARKED task of this class waits before the daemon re-tries it
+    # (parked_due). None = never auto-unpark: the cause can't heal on its own
+    # (e.g. a bad token) and a human must unpark it. Backend-dependent classes
+    # (see BACKEND_PARK_CLASSES) are additionally health-gated by the engine.
+    unpark_after_s: object = 600
 
 
 POLICY = {
-    "forge_auth":           Policy(20, 30, 3600, park_on_exhaust=True),
-    "forge_server":         Policy(10, 10, 600,  park_on_exhaust=True),
-    "agent_limit":          Policy(0,  0,  0,    park_on_exhaust=True),   # park immediately
-    "agent_backend":        Policy(3,  60, 3600, park_on_exhaust=True),   # CLI/transport errors
+    "forge_auth":           Policy(20, 30, 3600, park_on_exhaust=True, unpark_after_s=None),
+    "forge_server":         Policy(10, 10, 600,  park_on_exhaust=True, unpark_after_s=600),
+    "agent_limit":          Policy(0,  0,  0,    park_on_exhaust=True, unpark_after_s=1800),  # quota window: probe every 30 min
+    "agent_backend":        Policy(3,  60, 3600, park_on_exhaust=True, unpark_after_s=300),   # transport blip: recovers fast
     "agent_invalid_output": Policy(2,  0,  0,    park_on_exhaust=False),  # re-ask twice then fail
     "verify_red":           Policy(1,  0,  0,    park_on_exhaust=False),  # one retry then fail
     "timeout":              Policy(1,  60, 3600, park_on_exhaust=False),  # one delayed retry
@@ -41,6 +46,16 @@ POLICY = {
     "framework_bug":        Policy(0,  0,  0,    park_on_exhaust=False, consume_task=True),
     "step_budget_exhausted": Policy(0, 0,  0,    park_on_exhaust=False, consume_task=True),
 }
+
+# classes whose recovery depends on the agent backend being reachable: the
+# engine health-probes before unparking these (see Engine._unpark_tick).
+BACKEND_PARK_CLASSES = {"agent_limit", "agent_backend"}
+UNPARK_AFTER_DEFAULT = 600
+
+
+def _unpark_after(error_class):
+    p = POLICY.get(error_class)
+    return p.unpark_after_s if p else UNPARK_AFTER_DEFAULT
 
 TERMINAL_TASK_STATES = {"done", "failed", "deferred"}
 
@@ -100,11 +115,23 @@ def park(conn, task_id: int, reason: str) -> None:
             (reason, reason, task_id))
 
 
-def unpark(conn, task_id=None) -> int:
-    """parked -> pending, attempts unchanged. Targeted (operator/board) or
-    bulk (daemon unpark tick). Returns how many tasks became eligible."""
+def unpark(conn, task_id=None, ids=None) -> int:
+    """parked -> pending, attempts unchanged. Three modes:
+      - ids=[...]   : exactly these (the daemon's cadence/health tick).
+      - task_id=N   : one (targeted operator/board override).
+      - both None   : ALL parked (operator 'release everything').
+    Returns how many tasks became eligible."""
     with ensure_tx(conn):
-        if task_id is None:
+        if ids is not None:
+            ids = list(ids)
+            if not ids:
+                return 0
+            ph = ",".join("?" * len(ids))
+            cur = conn.execute(
+                "UPDATE tasks SET state='pending', next_attempt=NULL,"
+                " updated_at=datetime('now')"
+                " WHERE state='parked' AND id IN (%s)" % ph, ids)
+        elif task_id is None:
             cur = conn.execute(
                 "UPDATE tasks SET state='pending', next_attempt=NULL,"
                 " updated_at=datetime('now') WHERE state='parked'")
@@ -114,6 +141,39 @@ def unpark(conn, task_id=None) -> int:
                 " updated_at=datetime('now') WHERE id=? AND state='parked'",
                 (task_id,))
         return cur.rowcount
+
+
+def parked_due(conn, classes=None):
+    """Parked tasks whose per-class cadence (POLICY.unpark_after_s) has elapsed
+    since they parked. Returns [(id, error_class), ...]. Classes with
+    unpark_after_s=None never come due (human-only). `classes` optionally
+    restricts to a subset."""
+    rows = conn.execute(
+        "SELECT id, error_class,"
+        " CAST(strftime('%s','now') - strftime('%s', updated_at) AS INTEGER) age"
+        " FROM tasks WHERE state='parked'").fetchall()
+    due = []
+    for r in rows:
+        cls = r["error_class"]
+        if classes is not None and cls not in classes:
+            continue
+        after = _unpark_after(cls)
+        if after is not None and r["age"] is not None and r["age"] >= after:
+            due.append((r["id"], cls))
+    return due
+
+
+def rearm(conn, ids) -> None:
+    """Reset the park clock on these tasks. A failed health probe re-arms the
+    cadence so the next probe is a FULL cadence away (probe every 30 min, not
+    every daemon tick)."""
+    ids = list(ids)
+    if not ids:
+        return
+    with ensure_tx(conn):
+        ph = ",".join("?" * len(ids))
+        conn.execute("UPDATE tasks SET updated_at=datetime('now')"
+                     " WHERE state='parked' AND id IN (%s)" % ph, ids)
 
 
 def fail(conn, task_id: int, error_class: str, detail=None) -> str:

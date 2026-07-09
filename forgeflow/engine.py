@@ -124,10 +124,52 @@ class Engine:
         while True:
             now = time.monotonic()
             if now - last_unpark >= unpark_every:
-                queue.unpark(self.conn)
+                self._unpark_tick()
                 last_unpark = now
             task = queue.claim(self.conn)
             if task is None:
                 time.sleep(idle)
                 continue
             self.execute_one(task)
+
+    def _unpark_tick(self):
+        """Recover parked tasks by per-class cadence. Backend-dependent classes
+        (agent_limit / agent_backend) are additionally health-gated: they only
+        restart when the agent endpoint answers. If it's still down, re-arm the
+        clock so the next probe is a full cadence away."""
+        due = queue.parked_due(self.conn)
+        if not due:
+            return
+        backend = [i for i, c in due if c in queue.BACKEND_PARK_CLASSES]
+        ready = [i for i, c in due if c not in queue.BACKEND_PARK_CLASSES]
+        if backend:
+            if self._agent_online():
+                ready += backend
+            else:
+                queue.rearm(self.conn, backend)   # probe again in one cadence
+        n = queue.unpark(self.conn, ids=ready) if ready else 0
+        if n:
+            print("engine: unparked %d task(s) by cadence/health" % n)
+
+    def _agent_online(self) -> bool:
+        """Health probe for the agent backend. GET the configured URL (an
+        'env:VAR' value reads that env var, so the endpoint isn't duplicated
+        into the pack file). Any HTTP answer < 500 means reachable; a network
+        error / timeout / 5xx means down. No URL configured -> not gated
+        (recover by cadence alone), keeping the engine backend-agnostic."""
+        import os
+        import urllib.error
+        import urllib.request
+        url = getattr(self.pack, "agent_health_url", None) if self.pack else None
+        if url and url.startswith("env:"):
+            url = os.environ.get(url[4:])
+        if not url:
+            return True
+        try:
+            with urllib.request.urlopen(
+                    urllib.request.Request(url, method="GET"), timeout=10) as r:
+                return r.status < 500
+        except urllib.error.HTTPError as e:
+            return e.code < 500
+        except Exception:
+            return False
