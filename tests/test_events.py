@@ -11,26 +11,26 @@ class EventsTest(unittest.TestCase):
     def setUp(self):
         self.dir = tmpdir()
         self.conn = db.connect(self.dir / "t.db")
-        self.subs = {"finding.triaged": ["fix", "notify"],
+        self.subs = {"item.triaged": ["fix", "notify"],
                      "custom.ping": ["pong"]}
 
     def test_fanout_enqueues_all_subscribers_atomically(self):
-        fid = db.upsert_finding(self.conn, "K", "t", "test", "r")
+        fid = db.upsert_item(self.conn, "K", "t", "test", "r")
         db.record_transition(self.conn, fid, "triaged", "evidence:x",
                              subscriptions=self.subs)
         tasks = self.conn.execute(
             "SELECT kind, state FROM tasks ORDER BY id").fetchall()
         self.assertEqual([(t["kind"], t["state"]) for t in tasks],
                          [("fix", "pending"), ("notify", "pending")])
-        # the finding, the audit row, the event, and both tasks all exist
+        # the item, the audit row, the event, and both tasks all exist
         self.assertEqual(self.conn.execute(
             "SELECT count(*) c FROM transitions").fetchone()["c"], 1)
         self.assertEqual(self.conn.execute(
-            "SELECT count(*) c FROM events WHERE name='finding.triaged'"
+            "SELECT count(*) c FROM events WHERE name='item.triaged'"
         ).fetchone()["c"], 1)
 
     def test_rollback_rolls_back_fanout_too(self):
-        fid = db.upsert_finding(self.conn, "K", "t", "test", "r")
+        fid = db.upsert_item(self.conn, "K", "t", "test", "r")
         try:
             with util.tx(self.conn):
                 db.record_transition(self.conn, fid, "triaged", "evidence:x",
@@ -46,11 +46,11 @@ class EventsTest(unittest.TestCase):
         self.assertEqual(self.conn.execute(
             "SELECT count(*) c FROM tasks").fetchone()["c"], 0)
         self.assertEqual(self.conn.execute(
-            "SELECT state FROM findings WHERE id=?", (fid,)).fetchone()["state"],
+            "SELECT state FROM items WHERE id=?", (fid,)).fetchone()["state"],
             "found")
 
     def test_replayed_event_does_not_double_enqueue(self):
-        payload = {"finding_id": 1, "transition_id": 9}
+        payload = {"item_id": 1, "transition_id": 9}
         db.emit_event(self.conn, "custom.ping", payload, self.subs)
         db.emit_event(self.conn, "custom.ping", payload, self.subs)  # replay
         self.assertEqual(self.conn.execute(
@@ -60,7 +60,7 @@ class EventsTest(unittest.TestCase):
             "SELECT count(*) c FROM events").fetchone()["c"], 2)
 
     def test_illegal_transition_refused(self):
-        fid = db.upsert_finding(self.conn, "K", "t", "test", "r")
+        fid = db.upsert_item(self.conn, "K", "t", "test", "r")
         with self.assertRaises(db.TransitionError):
             db.record_transition(self.conn, fid, "merged", "nope")
         with self.assertRaises(db.TransitionError):

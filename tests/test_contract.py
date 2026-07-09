@@ -196,7 +196,7 @@ class ExecuteTest(unittest.TestCase):
         check = self.dir / "check.sh"
         check.write_text("#!/bin/sh\n[ ! -f %s ] || exit 7\n" % flag)
         wf = contract.Workflow.define("w")
-        wf.step("verify", blocks.get("evidence.suite"), timeout_s=30, params={
+        wf.step("verify", blocks.get("check.suite"), timeout_s=30, params={
             "checks": [{"name": "c", "cmd": ["sh", str(check)],
                         "retryable_exits": [7]}]})
         wf.on("verify", "green", "done").on("verify", "red", "failed")

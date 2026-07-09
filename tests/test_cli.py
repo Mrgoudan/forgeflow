@@ -39,7 +39,7 @@ class CliTest(unittest.TestCase):
         text = out.stdout.decode()
         self.assertIn("filebug", text)
         self.assertIn("scan -> reproduce -> file -> record", text)
-        self.assertIn("finding.triaged", text)
+        self.assertIn("item.triaged", text)
         self.assertIn("-> notify", text)
         self.assertIn("OK: every workflow is total", text)
 
@@ -58,8 +58,8 @@ class CliTest(unittest.TestCase):
         self.assertIn("demo.scan_requested -> filebug", text)
         self.assertIn("executed 2 task(s)", text)   # filebug + notify via bus
         conn = self._db()
-        finding = conn.execute("SELECT key, state FROM findings").fetchone()
-        self.assertEqual((finding["key"], finding["state"]),
+        item = conn.execute("SELECT key, state FROM items").fetchone()
+        self.assertEqual((item["key"], item["state"]),
                          ("demo-cli-1", "triaged"))
         tasks = conn.execute("SELECT kind, state FROM tasks ORDER BY id").fetchall()
         self.assertEqual([(t["kind"], t["state"]) for t in tasks],
@@ -97,7 +97,7 @@ class CliTest(unittest.TestCase):
         self.assertIn("created by event 1: demo.scan_requested", text)
         for step in ("scan", "reproduce", "file", "record"):
             self.assertIn(step, text)
-        self.assertIn("transition 1: finding 1 found -> triaged", text)
+        self.assertIn("transition 1: item 1 found -> triaged", text)
         self.assertIn("emitted event", text)
         self.assertIn("kind=notify", text)          # the follow-on task
         # and the child's own trace links back

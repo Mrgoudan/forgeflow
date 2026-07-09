@@ -1,13 +1,13 @@
-"""SQLite state store: findings state machine, task queue, audit log, run pins.
+"""SQLite state store: items state machine, task queue, audit log, run pins.
 
 Single-writer (the daemon). WAL mode. No ORM — the schema IS the design.
 
 Two choke points live here:
-- record_transition() is the ONLY way finding state changes. It enforces
-  FINDING_STATES, appends to the audit log, and fans the transition event
+- record_transition() is the ONLY way item state changes. It enforces
+  ITEM_STATES, appends to the audit log, and fans the transition event
   out to subscribed workflows — all inside the caller's transaction, so
   workflow interaction is atomic.
-- emit_event() is the ONLY way any event (finding or otherwise) reaches
+- emit_event() is the ONLY way any event (item or otherwise) reaches
   the queue. Idempotency lives in queue.enqueue's payload-hash unique key.
 """
 from __future__ import annotations
@@ -19,9 +19,9 @@ from pathlib import Path
 from . import queue
 from .util import ensure_tx
 
-# The finding lifecycle. Transitions happen ONLY through record_transition(),
+# The item lifecycle. Transitions happen ONLY through record_transition(),
 # which enforces this map and appends to the audit log.
-FINDING_STATES = {
+ITEM_STATES = {
     "found":     {"triaged", "rejected"},
     "triaged":   {"fixing", "deferred"},
     "fixing":    {"verifying", "deferred", "failed"},
@@ -35,7 +35,7 @@ FINDING_STATES = {
 }
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS findings (
+CREATE TABLE IF NOT EXISTS items (
     id            INTEGER PRIMARY KEY,
     key           TEXT UNIQUE NOT NULL,  -- stable dedup key
     source        TEXT NOT NULL,         -- which workflow/human/import produced it
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS findings (
 
 CREATE TABLE IF NOT EXISTS transitions (           -- append-only audit log
     id            INTEGER PRIMARY KEY,
-    finding_id    INTEGER NOT NULL REFERENCES findings(id),
+    item_id    INTEGER NOT NULL REFERENCES items(id),
     from_state    TEXT NOT NULL,
     to_state      TEXT NOT NULL,
     event         TEXT NOT NULL,         -- machine event, e.g. 'evidence:build_green'
@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS transitions (           -- append-only audit log
 
 CREATE TABLE IF NOT EXISTS events (                -- append-only event log
     id            INTEGER PRIMARY KEY,
-    name          TEXT NOT NULL,         -- 'finding.triaged', 'pr.opened', ...
+    name          TEXT NOT NULL,         -- 'item.triaged', 'pr.opened', ...
     payload       TEXT NOT NULL,         -- canonical JSON
     at            TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS events (                -- append-only event log
 CREATE TABLE IF NOT EXISTS tasks (
     id            INTEGER PRIMARY KEY,
     kind          TEXT NOT NULL,         -- workflow kind that handles this task
-    finding_id    INTEGER REFERENCES findings(id),
+    item_id    INTEGER REFERENCES items(id),
     payload       TEXT NOT NULL,         -- JSON task input
     payload_hash  TEXT NOT NULL,         -- sha256(canonical_json(payload))
     state         TEXT NOT NULL DEFAULT 'pending',
@@ -186,19 +186,19 @@ CREATE TABLE IF NOT EXISTS coverage (              -- hunt ledger: where we have
     workflow      TEXT NOT NULL,
     sha           TEXT NOT NULL,         -- tree state when swept
     probe_rev     TEXT,                  -- oracle version used
-    outcome       TEXT NOT NULL,         -- clean | findings:<n>
+    outcome       TEXT NOT NULL,         -- clean | items:<n>
     swept_at      TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (object_id, workflow, sha)
 );
 
-CREATE TABLE IF NOT EXISTS implications (          -- finding <-> code mapping
-    finding_id    INTEGER NOT NULL REFERENCES findings(id),
+CREATE TABLE IF NOT EXISTS implications (          -- item <-> code mapping
+    item_id    INTEGER NOT NULL REFERENCES items(id),
     object_id     INTEGER NOT NULL REFERENCES code_objects(id),
     role          TEXT NOT NULL,         -- root_cause | touched_by_fix | witness
-    PRIMARY KEY (finding_id, object_id, role)
+    PRIMARY KEY (item_id, object_id, role)
 );
 
-CREATE TABLE IF NOT EXISTS patterns (              -- graduated from findings.pattern
+CREATE TABLE IF NOT EXISTS patterns (              -- graduated from items.pattern
     id            TEXT PRIMARY KEY,
     description   TEXT NOT NULL,
     review_lens   TEXT,                  -- text injected into review prompts
@@ -222,7 +222,7 @@ CREATE TABLE IF NOT EXISTS chains (                -- curated traced call-paths
     sha           TEXT NOT NULL,         -- validity pin; hops drift with code
     nodes         TEXT NOT NULL,         -- JSON: [{path, line, symbol}, ...]
     hop_invariants TEXT NOT NULL,        -- JSON: per-hop promise + rank
-    yields        TEXT,                  -- JSON: finding keys this chain produced
+    yields        TEXT,                  -- JSON: item keys this chain produced
     status        TEXT NOT NULL DEFAULT 'active'
 );
 
@@ -231,18 +231,18 @@ CREATE TABLE IF NOT EXISTS methods (               -- the oracle bench
     description   TEXT NOT NULL,
     status        TEXT NOT NULL DEFAULT 'candidate', -- candidate | active | exhausted
     trials        INTEGER NOT NULL DEFAULT 0,
-    verified_yield INTEGER NOT NULL DEFAULT 0,     -- findings that passed the repro gate
+    verified_yield INTEGER NOT NULL DEFAULT 0,     -- items that passed the repro gate
     last_used_round INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_claim
     ON tasks(state, next_attempt) WHERE state IN ('pending','retry_wait');
-CREATE INDEX IF NOT EXISTS idx_findings_state ON findings(state);
+CREATE INDEX IF NOT EXISTS idx_items_state ON items(state);
 """
 
 
 class TransitionError(ValueError):
-    """A transition outside FINDING_STATES. Always a caller bug — loud."""
+    """A transition outside ITEM_STATES. Always a caller bug — loud."""
 
 
 def connect(path) -> sqlite3.Connection:
@@ -260,16 +260,16 @@ def connect(path) -> sqlite3.Connection:
     return conn
 
 
-def upsert_finding(conn, key: str, title: str, source: str, repo: str,
+def upsert_item(conn, key: str, title: str, source: str, repo: str,
                    detail=None, severity=None, pattern=None, base_sha=None) -> int:
-    """Insert a finding in state 'found', or return the existing id for the
+    """Insert a item in state 'found', or return the existing id for the
     same key (stable dedup). Never regresses state."""
     with ensure_tx(conn):
-        row = conn.execute("SELECT id FROM findings WHERE key=?", (key,)).fetchone()
+        row = conn.execute("SELECT id FROM items WHERE key=?", (key,)).fetchone()
         if row:
             return row["id"]
         cur = conn.execute(
-            "INSERT INTO findings(key, source, pattern, title, detail, severity,"
+            "INSERT INTO items(key, source, pattern, title, detail, severity,"
             " repo, base_sha) VALUES (?,?,?,?,?,?,?,?)",
             (key, source, pattern, title, detail, severity, repo, base_sha))
         return cur.lastrowid
@@ -287,48 +287,48 @@ def emit_event(conn, name: str, payload: dict, subscriptions=None) -> int:
         event_id = cur.lastrowid
         task_payload = dict(payload)
         task_payload["event"] = name
-        finding_id = payload.get("finding_id")
-        if finding_id is not None:
-            row = conn.execute("SELECT 1 FROM findings WHERE id=?",
-                               (finding_id,)).fetchone()
+        item_id = payload.get("item_id")
+        if item_id is not None:
+            row = conn.execute("SELECT 1 FROM items WHERE id=?",
+                               (item_id,)).fetchone()
             if row is None:  # payload key, not a proven row — don't link
-                finding_id = None
+                item_id = None
         for kind in subscriptions.get(name, ()):
-            queue.enqueue(conn, kind, task_payload, finding_id=finding_id)
+            queue.enqueue(conn, kind, task_payload, item_id=item_id)
         return event_id
 
 
-def record_transition(conn, finding_id: int, to_state: str, event: str,
+def record_transition(conn, item_id: int, to_state: str, event: str,
                       evidence=None, run_id=None, subscriptions=None) -> int:
-    """The ONLY way finding state changes. Enforces FINDING_STATES, appends
-    the audit row, and fans out 'finding.<to_state>' to subscribed workflows
+    """The ONLY way item state changes. Enforces ITEM_STATES, appends
+    the audit row, and fans out 'item.<to_state>' to subscribed workflows
     in the SAME transaction. Returns the transition id."""
-    if to_state not in FINDING_STATES:
-        raise TransitionError("unknown finding state '%s'" % to_state)
+    if to_state not in ITEM_STATES:
+        raise TransitionError("unknown item state '%s'" % to_state)
     with ensure_tx(conn):
-        row = conn.execute("SELECT state FROM findings WHERE id=?",
-                           (finding_id,)).fetchone()
+        row = conn.execute("SELECT state FROM items WHERE id=?",
+                           (item_id,)).fetchone()
         if row is None:
-            raise TransitionError("finding %s does not exist" % finding_id)
+            raise TransitionError("item %s does not exist" % item_id)
         from_state = row["state"]
-        if to_state not in FINDING_STATES[from_state]:
+        if to_state not in ITEM_STATES[from_state]:
             raise TransitionError(
-                "illegal transition %s -> %s for finding %s (event %s)"
-                % (from_state, to_state, finding_id, event))
+                "illegal transition %s -> %s for item %s (event %s)"
+                % (from_state, to_state, item_id, event))
         conn.execute(
-            "UPDATE findings SET state=?, updated_at=datetime('now') WHERE id=?",
-            (to_state, finding_id))
+            "UPDATE items SET state=?, updated_at=datetime('now') WHERE id=?",
+            (to_state, item_id))
         cur = conn.execute(
-            "INSERT INTO transitions(finding_id, from_state, to_state, event,"
+            "INSERT INTO transitions(item_id, from_state, to_state, event,"
             " evidence, run_id) VALUES (?,?,?,?,?,?)",
-            (finding_id, from_state, to_state, event,
+            (item_id, from_state, to_state, event,
              json.dumps(evidence) if evidence is not None else None, run_id))
         transition_id = cur.lastrowid
         # 'via' = the machine event that caused the transition; the key is
         # NOT named 'event' because emit_event reserves that for the event
         # name when building subscriber task payloads.
-        emit_event(conn, "finding." + to_state,
-                   {"finding_id": finding_id, "transition_id": transition_id,
+        emit_event(conn, "item." + to_state,
+                   {"item_id": item_id, "transition_id": transition_id,
                     "from_state": from_state, "via": event},
                    subscriptions)
         return transition_id

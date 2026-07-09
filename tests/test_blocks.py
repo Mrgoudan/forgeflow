@@ -83,12 +83,12 @@ class BlocksTest(unittest.TestCase):
                   "expect": {"exit_code": 0,
                              "output_file": str(repo / "out.txt"),
                              "expected_file": str(repo / "expected.txt")}}
-        outcome, result = run_isolated("oracle.reproduce", dict(params))
+        outcome, result = run_isolated("check.recheck", dict(params))
         self.assertEqual(outcome, "confirmed")
         # remove the planted bug -> same oracle refutes
         main = repo / "src" / "main.txt"
         main.write_text(main.read_text().replace("PLANTED_BUG", "fixed"))
-        outcome, result = run_isolated("oracle.reproduce", dict(params))
+        outcome, result = run_isolated("check.recheck", dict(params))
         self.assertEqual(outcome, "refuted")
 
     def test_evidence_suite_exit_codes_only(self):
@@ -97,13 +97,13 @@ class BlocksTest(unittest.TestCase):
             {"name": "b", "cmd": ["sh", "-c", "exit %d" % code],
              "retryable_exits": [7]},
             {"name": "c", "cmd": ["true"]}]}
-        outcome, result = run_isolated("evidence.suite", checks(0))
+        outcome, result = run_isolated("check.suite", checks(0))
         self.assertEqual(outcome, "green")
         self.assertEqual(len(result["checks"]), 3)
-        outcome, result = run_isolated("evidence.suite", checks(7))
+        outcome, result = run_isolated("check.suite", checks(7))
         self.assertEqual((outcome, result["failed"]), ("red_retryable", "b"))
         self.assertEqual(len(result["checks"]), 2)  # stopped at first failure
-        outcome, result = run_isolated("evidence.suite", checks(1))
+        outcome, result = run_isolated("check.suite", checks(1))
         self.assertEqual((outcome, result["failed"]), ("red", "b"))
 
     def test_worktree_create_and_drop(self):

@@ -10,7 +10,7 @@ Per step, before the daemon accepts work:
   4. every required param is present (after load-time path templating);
   5. llm: bindings resolve in the pack's agent section and only llm-class
      blocks may carry one (and they must);
-  6. consumes/emits are well-formed event names; finding.* events must
+  6. consumes/emits are well-formed event names; item.* events must
      name a real state; a db.transition step's implied emit must be listed;
   7. the compiled workflow passes contract validation (total, bounded,
      terminal).
@@ -28,7 +28,7 @@ import yaml
 
 from . import blocks as blocks_mod
 from .contract import CONTEXT_PROVIDERS, Workflow, WorkflowError
-from .db import FINDING_STATES
+from .db import ITEM_STATES
 from .util import template
 
 _EVENT_RE = re.compile(r"^[a-z0-9_]+(\.[a-z0-9_]+)+$")
@@ -60,12 +60,12 @@ def load_workflow_file(path, pack=None) -> Workflow:
     emits = doc.get("emits") or []
     for ev in list(consumes) + list(emits):
         if not isinstance(ev, str) or not _EVENT_RE.match(ev):
-            _die(where, "malformed event name %r (want e.g. 'finding.triaged')" % ev)
-        if ev.startswith("finding."):
+            _die(where, "malformed event name %r (want e.g. 'item.triaged')" % ev)
+        if ev.startswith("item."):
             state = ev.split(".", 1)[1]
-            if state not in FINDING_STATES:
-                _die(where, "event %r names unknown finding state '%s' (known: %s)"
-                     % (ev, state, ", ".join(sorted(FINDING_STATES))))
+            if state not in ITEM_STATES:
+                _die(where, "event %r names unknown item state '%s' (known: %s)"
+                     % (ev, state, ", ".join(sorted(ITEM_STATES))))
 
     steps = doc.get("steps")
     if not steps or not isinstance(steps, list):
@@ -205,9 +205,9 @@ def load_workflow_file(path, pack=None) -> Workflow:
         if blk.name == "db.transition":
             to_state = params.get("to_state")
             if isinstance(to_state, str) and "{" not in to_state:
-                if to_state not in FINDING_STATES:
-                    _die(swhere, "to_state '%s' is not a finding state" % to_state)
-                implied = "finding." + to_state
+                if to_state not in ITEM_STATES:
+                    _die(swhere, "to_state '%s' is not a item state" % to_state)
+                implied = "item." + to_state
                 if implied not in emits:
                     _die(swhere, "stages transition to '%s' but 'emits:' does not "
                          "declare '%s' — no undeclared emits" % (to_state, implied))

@@ -10,7 +10,7 @@ from forgeflow import db, queue
 
 class EndToEndTest(unittest.TestCase):
     """THE PROOF: a demo pack + toy workflow YAML (scan.grep_rules ->
-    oracle.reproduce -> db.upsert_finding -> db.transition) running through
+    check.recheck -> db.upsert_item -> db.transition) running through
     the REAL queue + engine + db against a throwaway git repo — and a second
     workflow triggered purely by the transition event."""
 
@@ -25,7 +25,7 @@ class EndToEndTest(unittest.TestCase):
         # loader wired the interactions from consumes: lists alone
         self.assertEqual(eng.subscriptions,
                          {"demo.scan_requested": ["filebug"],
-                          "finding.triaged": ["notify"]})
+                          "item.triaged": ["notify"]})
 
         # intake: one event starts everything
         db.emit_event(eng.conn, "demo.scan_requested", {"key": "planted-1"},
@@ -33,10 +33,10 @@ class EndToEndTest(unittest.TestCase):
         executed = eng.run_until_idle()
         self.assertEqual(executed, 2)  # filebug, then notify via the event bus
 
-        # the finding was filed and transitioned by the evidence, atomically
-        finding = eng.conn.execute("SELECT * FROM findings").fetchone()
-        self.assertEqual(finding["key"], "demo-planted-1")
-        self.assertEqual(finding["state"], "triaged")
+        # the item was filed and transitioned by the evidence, atomically
+        item = eng.conn.execute("SELECT * FROM items").fetchone()
+        self.assertEqual(item["key"], "demo-planted-1")
+        self.assertEqual(item["state"], "triaged")
         trans = eng.conn.execute("SELECT * FROM transitions").fetchall()
         self.assertEqual([(t["from_state"], t["to_state"], t["event"]) for t in trans],
                          [("found", "triaged", "evidence:repro_confirmed")])
@@ -52,10 +52,10 @@ class EndToEndTest(unittest.TestCase):
                          [("scan", "ok"), ("reproduce", "confirmed"),
                           ("file", "ok"), ("record", "ok")])
 
-        # the notify workflow saw the finding id through the event payload
+        # the notify workflow saw the item id through the event payload
         outbox = self.base / "outbox"
         self.assertEqual([p.name for p in outbox.iterdir()],
-                         ["notified-%d" % finding["id"]])
+                         ["notified-%d" % item["id"]])
 
         # replayed intake event: no duplicate task, nothing re-runs
         db.emit_event(eng.conn, "demo.scan_requested", {"key": "planted-1"},
@@ -74,7 +74,7 @@ class EndToEndTest(unittest.TestCase):
         task = self.engine.conn.execute(
             "SELECT * FROM tasks WHERE kind='filebug'").fetchone()
         self.assertEqual(task["state"], "done")
-        n = self.engine.conn.execute("SELECT count(*) c FROM findings").fetchone()["c"]
+        n = self.engine.conn.execute("SELECT count(*) c FROM items").fetchone()["c"]
         self.assertEqual(n, 0)
 
     def test_genericity_gate_passes(self):

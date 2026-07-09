@@ -17,12 +17,12 @@ def _oddctx(ctx, task, prev):
 GOOD = """\
 workflow: demo_wf
 consumes: [demo.go]
-emits: [finding.triaged]
+emits: [item.triaged]
 steps:
   - name: only
     block: db.transition
     timeout_s: 10
-    params: { finding_id: "{payload.finding_id}", to_state: triaged, event: "e:x" }
+    params: { item_id: "{payload.item_id}", to_state: triaged, event: "e:x" }
     outcomes: { ok: done }
 """
 
@@ -172,7 +172,7 @@ steps:
     params: { to_state: triaged, event: "e:x" }
     outcomes: { ok: done }
 """)
-        with self.assertRaisesRegex(SystemExit, "does not declare 'finding.triaged'"):
+        with self.assertRaisesRegex(SystemExit, "does not declare 'item.triaged'"):
             loader.load_workflow_file(p)
 
     def test_malformed_event_name_refused(self):
@@ -183,10 +183,10 @@ steps:
             loader.load_workflow_file(p)
 
     def test_unknown_finding_state_event_refused(self):
-        p = self._write("w.yaml", "workflow: w\nconsumes: [finding.polished]\nsteps:\n"
+        p = self._write("w.yaml", "workflow: w\nconsumes: [item.polished]\nsteps:\n"
                                   "  - {name: a, block: db.transition, timeout_s: 5,\n"
                                   "     params: {to_state: triaged, event: e}, outcomes: {ok: done}}\n")
-        with self.assertRaisesRegex(SystemExit, "unknown finding state 'polished'"):
+        with self.assertRaisesRegex(SystemExit, "unknown item state 'polished'"):
             loader.load_workflow_file(p)
 
     def test_llm_binding_on_local_block_refused(self):
@@ -215,12 +215,12 @@ steps:
         self.assertEqual(sorted(wfs), ["filebug", "notify"])
         subs = loader.subscriptions(wfs)
         self.assertEqual(subs, {"demo.scan_requested": ["filebug"],
-                                "finding.triaged": ["notify"]})
+                                "item.triaged": ["notify"]})
         # pack paths resolved at load; runtime placeholders survived
         scan = wfs["filebug"].steps[0]
         self.assertEqual(scan.params["repo"], "/r")
         record = wfs["filebug"].steps[3]
-        self.assertEqual(record.params["finding_id"], "{prev.finding_id}")
+        self.assertEqual(record.params["item_id"], "{prev.item_id}")
 
 
 if __name__ == "__main__":

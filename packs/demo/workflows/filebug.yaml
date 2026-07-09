@@ -1,9 +1,9 @@
 # Demo: the identity test for the engine. Four stdlib blocks, one YAML —
-# scan a tree for a marker, reproduce it deterministically, file a finding,
+# scan a tree for a marker, reproduce it deterministically, file a item,
 # transition it. No domain knowledge anywhere.
 workflow: filebug
 consumes: [demo.scan_requested]
-emits: [finding.triaged]
+emits: [item.triaged]
 
 steps:
   - name: scan
@@ -16,7 +16,7 @@ steps:
     outcomes: { ok: reproduce, timeout: failed }
 
   - name: reproduce
-    block: oracle.reproduce
+    block: check.recheck
     timeout_s: 60
     params:
       cmd: ["sh", "repro.sh"]
@@ -28,7 +28,7 @@ steps:
     outcomes: { confirmed: file, refuted: done, timeout: failed }
 
   - name: file
-    block: db.upsert_finding
+    block: db.upsert_item
     timeout_s: 10
     params:
       key: "demo-{payload.key}"
@@ -41,7 +41,7 @@ steps:
     block: db.transition
     timeout_s: 10
     params:
-      finding_id: "{prev.finding_id}"
+      item_id: "{prev.item_id}"
       to_state: triaged
       event: "evidence:repro_confirmed"
     outcomes: { ok: done }

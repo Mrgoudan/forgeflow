@@ -299,9 +299,9 @@ def scan_grep_rules(ctx, task, prev):
     return "ok", {"candidates": candidates, "count": len(candidates)}
 
 
-@block("oracle.reproduce", "local", {"confirmed", "refuted", "timeout"},
+@block("check.recheck", "local", {"confirmed", "refuted", "timeout"},
        accepts_context={"payload", "pack"}, required_params={"cmd"})
-def oracle_reproduce(ctx, task, prev):
+def check_recheck(ctx, task, prev):
     """Run a repro command; classify by exit code and (optionally) an
     expected-output file comparison. confirmed iff every declared
     expectation holds. No prose ever."""
@@ -325,9 +325,9 @@ def oracle_reproduce(ctx, task, prev):
     return ("confirmed" if ok else "refuted"), result
 
 
-@block("evidence.suite", "local", {"green", "red_retryable", "red", "timeout"},
+@block("check.suite", "local", {"green", "red_retryable", "red", "timeout"},
        accepts_context={"payload", "pack"}, required_params={"checks"})
-def evidence_suite(ctx, task, prev):
+def check_suite(ctx, task, prev):
     """The evidence gate: run configured verify commands in order, classify
     by exit codes ONLY. First failure decides: red_retryable if its exit
     code is in that check's retryable_exits, else red."""
@@ -466,12 +466,12 @@ def model_classify(ctx, task, prev):
 
 # ------------------------------------------------------------ state blocks
 
-@block("db.upsert_finding", "state", {"ok"},
+@block("db.upsert_item", "state", {"ok"},
        accepts_context={"payload"}, required_params={"key", "title", "source", "repo"})
-def db_upsert_finding(ctx, task, prev):
-    """Stage a finding upsert; the engine applies it at the step boundary
-    and merges the finding_id into this step's persisted result."""
-    op = {"op": "upsert_finding"}
+def db_upsert_item(ctx, task, prev):
+    """Stage a item upsert; the engine applies it at the step boundary
+    and merges the item_id into this step's persisted result."""
+    op = {"op": "upsert_item"}
     for f in ("key", "title", "source", "repo", "detail", "severity",
               "pattern", "base_sha"):
         if ctx.get(f) is not None:
@@ -485,7 +485,7 @@ def event_emit(ctx, task, prev):
     """Stage an arbitrary event: the engine appends it to the event log and
     enqueues every workflow whose consumes: lists it — same transaction as
     this step's boundary. This is the ONLY way one workflow hands work to
-    another outside a finding transition; the loader refuses names not
+    another outside a item transition; the loader refuses names not
     declared under emits:. Replays are absorbed by the queue's
     payload-hash idempotency key."""
     data = _tpl(ctx, task, prev, ctx.get("data") or {})
@@ -499,22 +499,22 @@ def event_emit(ctx, task, prev):
 @block("db.transition", "state", {"ok"},
        accepts_context={"payload"}, required_params={"to_state", "event"})
 def db_transition(ctx, task, prev):
-    """Stage the ONE finding state change this step is allowed to make.
+    """Stage the ONE item state change this step is allowed to make.
     Applied via db.record_transition inside the boundary transaction —
     event fan-out to subscribed workflows is atomic with the step."""
-    finding_id = ctx.get("finding_id")
-    if finding_id is None:
-        finding_id = (prev or {}).get("finding_id") \
-            or (task.get("payload") or {}).get("finding_id")
+    item_id = ctx.get("item_id")
+    if item_id is None:
+        item_id = (prev or {}).get("item_id") \
+            or (task.get("payload") or {}).get("item_id")
     else:
-        finding_id = _tpl(ctx, task, prev, finding_id)
-    if finding_id is None:
-        raise RuntimeError("db.transition: no finding_id in params, prev, or payload")
+        item_id = _tpl(ctx, task, prev, item_id)
+    if item_id is None:
+        raise RuntimeError("db.transition: no item_id in params, prev, or payload")
     evidence = ctx.get("evidence")
     if evidence is not None:
         evidence = _tpl(ctx, task, prev, evidence)
     return "ok", {"_staged": [{
-        "op": "transition", "finding_id": int(finding_id),
+        "op": "transition", "item_id": int(item_id),
         "to_state": _tpl(ctx, task, prev, ctx["to_state"]),
         "event": _tpl(ctx, task, prev, ctx["event"]),
         "evidence": evidence,

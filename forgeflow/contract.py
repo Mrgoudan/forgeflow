@@ -466,14 +466,14 @@ def _apply_staged(env, ops):
     out = {}
     for op in ops:
         kind = op.get("op")
-        if kind == "upsert_finding":
-            out["finding_id"] = dbmod.upsert_finding(
+        if kind == "upsert_item":
+            out["item_id"] = dbmod.upsert_item(
                 env.conn, op["key"], op["title"], op["source"], op["repo"],
                 detail=op.get("detail"), severity=op.get("severity"),
                 pattern=op.get("pattern"), base_sha=op.get("base_sha"))
         elif kind == "transition":
             out["transition_id"] = dbmod.record_transition(
-                env.conn, op["finding_id"], op["to_state"], op["event"],
+                env.conn, op["item_id"], op["to_state"], op["event"],
                 evidence=op.get("evidence"), run_id=op.get("run_id"),
                 subscriptions=env.subscriptions)
         elif kind == "emit_event":

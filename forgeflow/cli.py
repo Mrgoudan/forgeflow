@@ -9,7 +9,7 @@ it:
     forgeflow once --pack P --root R       drain the queue, then exit (cron)
     forgeflow emit NAME --data JSON        inject an event; --drive runs the
                                            resulting task tree to idle
-    forgeflow status --root R              tasks / findings / parked / events
+    forgeflow status --root R              tasks / items / parked / events
     forgeflow unpark [ID]                  release parked task(s)
 
 Per ENGINE.md: one-shot commands (emit --drive, once) run WITHOUT the
@@ -91,8 +91,8 @@ def cmd_status(args):
         for r in parked:
             print("  #%d %s reason=%s attempts=%d"
                   % (r["id"], r["kind"], r["park_reason"], r["attempts"]))
-    print("findings:")
-    for r in conn.execute("SELECT state, count(*) c FROM findings"
+    print("items:")
+    for r in conn.execute("SELECT state, count(*) c FROM items"
                           " GROUP BY state ORDER BY state"):
         print("  %-12s %d" % (r["state"], r["c"]))
     print("recent events:")
@@ -166,8 +166,8 @@ def cmd_trace(args):
         if kind == "transition":
             t = conn.execute("SELECT * FROM transitions WHERE id=?", (ref,)).fetchone()
             if t:
-                print("transition %d: finding %d %s -> %s (%s)"
-                      % (t["id"], t["finding_id"], t["from_state"],
+                print("transition %d: item %d %s -> %s (%s)"
+                      % (t["id"], t["item_id"], t["from_state"],
                          t["to_state"], t["event"]))
             ev = conn.execute(
                 "SELECT * FROM events WHERE payload LIKE ? ORDER BY id LIMIT 1",
@@ -205,7 +205,7 @@ def main(argv=None):
     pe.add_argument("--drive", action="store_true",
                     help="then drive the claim loop until idle (one-shot mode)")
 
-    ps = sub.add_parser("status", help="tasks / findings / parked / events")
+    ps = sub.add_parser("status", help="tasks / items / parked / events")
     ps.add_argument("--limit", default=10, help="recent events to show")
 
     pu = sub.add_parser("unpark", help="parked -> pending (all, or one id)")

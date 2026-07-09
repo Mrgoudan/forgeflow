@@ -60,16 +60,16 @@ def _unpark_after(error_class):
 TERMINAL_TASK_STATES = {"done", "failed", "deferred"}
 
 
-def enqueue(conn, kind: str, payload: dict, finding_id=None) -> int:
+def enqueue(conn, kind: str, payload: dict, item_id=None) -> int:
     """Insert a pending task, idempotent on (kind, payload-hash): replaying
     the same event yields the SAME task id and no duplicate row. Joins the
     caller's transaction (event fan-out atomicity depends on this)."""
     h = payload_hash(payload)
     with ensure_tx(conn):
         cur = conn.execute(
-            "INSERT OR IGNORE INTO tasks(kind, finding_id, payload, payload_hash)"
+            "INSERT OR IGNORE INTO tasks(kind, item_id, payload, payload_hash)"
             " VALUES (?,?,?,?)",
-            (kind, finding_id, json.dumps(payload, sort_keys=True), h))
+            (kind, item_id, json.dumps(payload, sort_keys=True), h))
         if cur.rowcount:
             return cur.lastrowid
         row = conn.execute(
