@@ -27,6 +27,14 @@ def _boom(ctx, task, prev):
     raise RuntimeError("kaboom")
 
 
+@block("test.stepdir_write", "local", {"ok"})
+def _stepdir_write(ctx, task, prev):
+    """writes STRAIGHT to _step_dir with no mkdir — passes only if the engine
+    created the step dir before running the block (blocks must not defend)."""
+    (Path(ctx["_step_dir"]) / "out.txt").write_text("ok")
+    return "ok", {}
+
+
 def shell_step(wf, name, cmd, targets, **kw):
     wf.step(name, blocks.get("shell.run"), timeout_s=kw.pop("timeout_s", 30),
             params={"cmd": cmd}, **kw)
@@ -116,6 +124,17 @@ class ExecuteTest(unittest.TestCase):
         row = self.conn.execute("SELECT error_class FROM tasks WHERE id=?",
                                 (task["id"],)).fetchone()
         self.assertEqual(row["error_class"], "framework_bug")
+
+    def test_engine_creates_step_dir(self):
+        # the engine must create _step_dir before the block runs; a block that
+        # writes directly to it (no mkdir) is proof.
+        wf = contract.Workflow.define("w")
+        wf.step("a", blocks.get("test.stepdir_write"), timeout_s=5).on("a", "ok", "done")
+        wf.validate()
+        task = self._claim("w")
+        self.assertEqual(contract.execute(self.env, wf, task), "done")
+        out = (self.env.data_dir / "tasks" / str(task["id"]) / "a0" / "a" / "out.txt")
+        self.assertTrue(out.exists())
 
     def test_timeout_maps_to_declared_outcome_then_policy(self):
         wf = contract.Workflow.define("w")

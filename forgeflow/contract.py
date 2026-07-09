@@ -421,6 +421,9 @@ def _run_block(env, step, task, prev):
         ctx[provider_name] = provider(env, task, spec)
     step_dir = (Path(env.data_dir) / "tasks" / str(task["id"])
                 / ("a%d" % task["attempts"]) / step.name)
+    # the engine guarantees the step dir exists before the block runs, so a
+    # block can write straight to _step_dir without defending itself.
+    step_dir.mkdir(parents=True, exist_ok=True)
     ctx["_timeout_s"] = step.timeout_s
     ctx["_step_dir"] = str(step_dir)
     ctx["_workspaces_dir"] = str(env.workspaces_dir)
