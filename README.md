@@ -377,6 +377,21 @@ must match your schema or it is re-asked at most twice and then fails as
 can only ever produce one of the outcomes you mapped. It cannot invent a
 state.
 
+And you never debug a binding blind:
+
+```bash
+python3 -m forgeflow --root R --pack P llm check          # live probe: reachable?
+                                                          # auth ok? model loaded?
+                                                          # follows the contract?
+python3 -m forgeflow --root R --pack P llm show fix \
+    --data '{"bug": "demo"}'                              # the EXACT prompt + sha
+python3 -m forgeflow --root R llm runs                    # verdicts, latency, re-asks
+```
+
+Setup recipes for **Ollama, vLLM, llama.cpp, LM Studio, gateways, the
+Claude CLI, and record/replay** — plus the error-class troubleshooting
+table — live in [docs/LLM.md](docs/LLM.md).
+
 ### Deterministic tests: record & replay
 
 Every successful agent step already archives its schema-valid answer. Point
@@ -425,6 +440,9 @@ python3 -m forgeflow --root R           trace ID    # one task's full story: ste
 python3 -m forgeflow --root R           metrics     # throughput / park-rate / queue-depth
 python3 -m forgeflow --root R           doctor      # health check (daemon alive? work stuck? disk?)
 python3 -m forgeflow --root R           gc [--days N] [--dry-run]  # reclaim disk: old archives + worktrees
+python3 -m forgeflow --root R --pack P  llm check   # live-probe every agent/model binding
+python3 -m forgeflow --root R --pack P  llm show ROLE --data '{...}'  # exact prompt + sha
+python3 -m forgeflow --root R           llm runs    # recent agent runs: verdict/latency/re-asks
 ```
 
 `emit --force` re-triggers a repeat event (bypasses payload-hash dedup).

@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.3.0 — 2026-07-11
+
+The LLM-experience release. Schema: v3 (`runs.wall_ms`, `runs.reasks`) —
+existing roots migrate automatically.
+
+### Added
+- **`llm check`** — one live probe per agent binding and per pack model:
+  endpoint reachable, auth valid, model loaded, and the model follows the
+  fenced-JSON output contract (a model that can't would fail every step as
+  `agent_invalid`, so the probe says exactly that). Exit 1 on failure —
+  croneable. Replay bindings report available recordings; embedding models
+  (API and pinned local weights) are probed too.
+- **`llm show ROLE --data '{...}'`** — render the EXACT assembled prompt a
+  step would send (base prompt + context sections + output contract) plus
+  the `prompt_sha` the runs table would pin.
+- **`llm runs`** — recent agent runs: model, verdict, wall time, correction
+  rounds. `metrics` (and `/api/metrics`) gain a per-model section: runs,
+  no-verdict rate, avg/max latency, re-ask totals.
+- **Binding validation in three fail-loud stages**: structure at pack load
+  (known backend, per-backend key allowlist, required fields, types);
+  environment at engine start after any `--replay-from` wrap (cli resolved
+  and pinned like pack tools, `api_key_ref` secret present); live chain via
+  `llm check`.
+- **openai-compat `params:` passthrough** — temperature, max_tokens,
+  response_format, anything: forwarded verbatim (model/messages stay
+  authoritative). Covers Ollama, vLLM, llama.cpp, LM Studio, gateways.
+- **claude-cli `max_turns` + `extra_args`** — bound the agentic loop and
+  pass verbatim CLI flags from the verified pack file.
+- **docs/LLM.md** — recipes (Ollama, vLLM, llama.cpp, LM Studio, gateways,
+  Claude CLI, record/replay) and the error-class troubleshooting table.
+
 ## 0.2.0 — 2026-07-10
 
 Schema: v2 (`tasks.def_hash`, `join_groups`, `join_members`) — existing

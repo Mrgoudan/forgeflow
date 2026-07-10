@@ -228,8 +228,23 @@ Order is load-bearing:
 5. extract LAST ```json fenced block; validate against the step schema;
    on failure re-ask (append a correction message) at most twice — each
    re-ask is the SAME runs row (re-asks are not new runs).
-6. UPDATE runs (exit_code, verdict, finished_at). Return verdict or raise
-   RunnerError(error_class) for the engine to map.
+6. UPDATE runs (exit_code, verdict, wall_ms, reasks, finished_at). Return
+   verdict or raise RunnerError(error_class) for the engine to map.
+
+Binding validation is split across three moments, each fail-loud:
+- pack load (config._check_agent): STRUCTURE — known backend, per-backend
+  key allowlist, required fields, types;
+- engine start (runner.check_binding, AFTER any --replay-from wrap):
+  ENVIRONMENT — cli resolvable (pinned to an absolute path like pack
+  tools), api_key_ref secret present, replay source recorded;
+- `llm check` (runner.probe_binding / probe_model): LIVE — one probe
+  round-trip per binding proving reachability, auth, model load, and that
+  the model can follow the fenced-JSON output contract.
+
+Backend knobs: openai-compat forwards `params:` verbatim into the request
+body (temperature, max_tokens, response_format, ... — model/messages stay
+authoritative); claude-cli accepts `max_turns` and `extra_args` (static,
+from the verified pack file).
 
 ## Egress mechanics
 
