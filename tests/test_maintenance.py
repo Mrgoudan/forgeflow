@@ -87,6 +87,40 @@ class GcTest(unittest.TestCase):
         self.assertTrue((self.root / "data" / "tasks" / "1").exists())  # untouched
 
 
+class DoctorTest(unittest.TestCase):
+    def _root(self):
+        root = tmpdir()
+        (root / "state").mkdir()
+        (root / "workspaces").mkdir()
+        conn = db.connect(root / "state" / "forgeflow.db")
+        return root, conn
+
+    def _beat(self, conn, age_s):
+        import time as _t
+        conn.execute("INSERT INTO watermarks(scope,cursor)"
+                     " VALUES('daemon.heartbeat',?)", (str(int(_t.time()) - age_s),))
+        conn.commit()
+
+    def test_healthy_fresh_heartbeat(self):
+        root, conn = self._root()
+        self._beat(conn, 5)
+        self.assertEqual(cli.main(["--root", str(root), "doctor"]), 0)
+
+    def test_stale_daemon_with_running_task_flags(self):
+        root, conn = self._root()
+        self._beat(conn, 999)
+        conn.execute("INSERT INTO tasks(id,kind,payload,payload_hash,state)"
+                     " VALUES(1,'k','{}','h','running')")
+        conn.commit()
+        self.assertEqual(cli.main(["--root", str(root), "doctor", "--stale", "120"]), 1)
+
+    def test_leaked_worktree_flags(self):
+        root, conn = self._root()
+        self._beat(conn, 5)
+        (root / "workspaces" / "task-1-a0").mkdir()   # no such task -> leaked
+        self.assertEqual(cli.main(["--root", str(root), "doctor"]), 1)
+
+
 class CliSmokeTest(unittest.TestCase):
     def test_metrics_and_gc_run(self):
         root = tmpdir()

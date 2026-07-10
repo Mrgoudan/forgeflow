@@ -217,10 +217,13 @@ class Engine:
                 t.start()
             print("engine: %d workers, lane caps=%s"
                   % (workers, {k: v._initial_value for k, v in lanes.items()}))
-            last_unpark = 0.0
+            last_unpark = last_beat = 0.0
             try:
                 while True:
                     now = time.monotonic()
+                    if now - last_beat >= 10:
+                        self._beat()
+                        last_beat = now
                     if now - last_unpark >= unpark_every:
                         self._unpark_tick()
                         last_unpark = now
@@ -231,9 +234,12 @@ class Engine:
                     t.join(timeout=10)
             return
 
-        last_unpark = 0.0
+        last_unpark = last_beat = 0.0
         while True:                                          # single-worker path
             now = time.monotonic()
+            if now - last_beat >= 10:
+                self._beat()
+                last_beat = now
             if now - last_unpark >= unpark_every:
                 self._unpark_tick()
                 last_unpark = now
@@ -242,6 +248,14 @@ class Engine:
                 time.sleep(idle)
                 continue
             self._exec(self.env, task)
+
+    def _beat(self):
+        """Daemon liveness: stamp a heartbeat (wall epoch) in watermarks so
+        `doctor` can tell a running daemon from a dead/stuck one."""
+        self.conn.execute(
+            "INSERT INTO watermarks(scope, cursor) VALUES('daemon.heartbeat', ?)"
+            " ON CONFLICT(scope) DO UPDATE SET cursor=excluded.cursor",
+            (str(int(time.time())),))
 
     def _unpark_tick(self):
         """Recover parked tasks by per-class cadence. Backend-dependent classes

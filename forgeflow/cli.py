@@ -248,6 +248,62 @@ def cmd_metrics(args):
     return 0
 
 
+def cmd_doctor(args):
+    """Generic health check: is the daemon alive, is work stuck, is disk
+    leaking. Exit 1 if any issue is found (usable in monitoring)."""
+    import re
+    conn = db.connect(Path(args.root) / "state" / "forgeflow.db")
+    stale_s = int(args.stale)
+    issues, dead = [], False
+
+    hb = conn.execute("SELECT cursor FROM watermarks WHERE scope='daemon.heartbeat'").fetchone()
+    if hb is None:
+        print("daemon: no heartbeat (never run, or idle since before heartbeats)")
+        dead = True
+    else:
+        age = int(time.time()) - int(hb["cursor"])
+        alive = age < stale_s
+        print("daemon: heartbeat %ds ago (%s)" % (age, "alive" if alive else "STALE"))
+        dead = not alive
+        if dead:
+            issues.append("daemon heartbeat stale (%ds > %ds) — down or stuck" % (age, stale_s))
+
+    running = conn.execute("SELECT count(*) c FROM tasks WHERE state='running'").fetchone()["c"]
+    if running and dead:
+        issues.append("%d task(s) stuck 'running' with no live daemon "
+                      "(reset_orphans on next start)" % running)
+    overdue = conn.execute("SELECT count(*) c FROM tasks WHERE state='retry_wait'"
+                           " AND next_attempt <= datetime('now')").fetchone()["c"]
+    if overdue and dead:
+        issues.append("%d retry_wait task(s) overdue, not being picked up" % overdue)
+
+    ws = Path(args.root) / "workspaces"
+    leaked = 0
+    if ws.is_dir():
+        wsre = re.compile(r"^task-(\d+)-a(\d+)$")
+        states = {r["id"]: r["state"] for r in conn.execute("SELECT id, state FROM tasks")}
+        for e in ws.iterdir():
+            m = wsre.match(e.name)
+            if m and e.is_dir():
+                s = states.get(int(m.group(1)))
+                if s is None or s in ("done", "failed", "deferred"):
+                    leaked += 1
+    if leaked:
+        issues.append("%d leaked worktree(s) — run 'gc'" % leaked)
+
+    parked = conn.execute("SELECT count(*) c FROM tasks WHERE state='parked'").fetchone()["c"]
+    if parked:
+        print("parked: %d (see 'status' / 'metrics'; unpark or retry as needed)" % parked)
+
+    if issues:
+        print("\nISSUES:")
+        for i in issues:
+            print("  ! " + i)
+        return 1
+    print("healthy")
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="forgeflow", description=__doc__.split("\n")[0])
     p.add_argument("--root", default=".",
@@ -286,11 +342,14 @@ def main(argv=None):
 
     sub.add_parser("metrics", help="throughput / park-rate / queue-depth")
 
+    pd = sub.add_parser("doctor", help="health check: daemon alive, work stuck, disk leaking")
+    pd.add_argument("--stale", default=120, help="heartbeat age (s) that counts as stale")
+
     args = p.parse_args(argv)
     return {"validate": cmd_validate, "run": cmd_run, "once": cmd_once,
             "emit": cmd_emit, "status": cmd_status, "unpark": cmd_unpark,
             "retry": cmd_retry, "trace": cmd_trace, "gc": cmd_gc,
-            "metrics": cmd_metrics}[args.cmd](args)
+            "metrics": cmd_metrics, "doctor": cmd_doctor}[args.cmd](args)
 
 
 if __name__ == "__main__":
