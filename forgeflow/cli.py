@@ -264,12 +264,160 @@ def cmd_metrics(args):
     if runs:
         bad = q("SELECT count(*) FROM runs WHERE exit_code!=0 OR verdict='error'")
         print("agent runs: %d · error rate %.0f%%" % (runs, 100 * bad / runs))
+        print("llm per model (finished runs):")
+        for r in conn.execute(
+                "SELECT model, count(*) n,"
+                " sum(CASE WHEN verdict IS NULL THEN 1 ELSE 0 END) noverdict,"
+                " CAST(avg(wall_ms) AS INT) avg_ms, max(wall_ms) max_ms,"
+                " sum(COALESCE(reasks,0)) reasks"
+                " FROM runs WHERE finished_at IS NOT NULL"
+                " GROUP BY model ORDER BY n DESC"):
+            print("  %-26s runs=%-4d no-verdict=%-3d avg=%sms max=%sms reasks=%d"
+                  % (r["model"], r["n"], r["noverdict"],
+                     r["avg_ms"] if r["avg_ms"] is not None else "-",
+                     r["max_ms"] if r["max_ms"] is not None else "-",
+                     r["reasks"] or 0))
     print("slowest step kinds (avg ms):")
     for r in conn.execute(
             "SELECT t.kind, s.step, CAST(avg(s.wall_ms) AS INT) ms, count(*) n"
             " FROM task_steps s JOIN tasks t ON t.id=s.task_id"
             " GROUP BY t.kind, s.step ORDER BY ms DESC LIMIT 8"):
         print("  %-14s %-14s %7dms  (n=%d)" % (r["kind"], r["step"], r["ms"], r["n"]))
+    return 0
+
+
+def cmd_llm(args):
+    return {"check": _llm_check, "show": _llm_show,
+            "runs": _llm_runs}[args.llm_cmd](args)
+
+
+def _llm_check(args):
+    """One live round-trip per agent binding and per pack model: endpoint
+    reachable, auth valid, model loaded, output contract followed. Exit 1
+    on any failure (usable in monitoring/cron). Static problems (unknown
+    backend, missing cli/secret) already failed engine construction."""
+    from . import runner
+    eng = _build_engine(args)
+    if eng.pack is None:
+        print("llm check needs --pack", file=sys.stderr)
+        return 2
+    from .config import load_secrets
+    secrets = load_secrets()
+    agents = dict(eng.pack.agents)
+    models = dict(eng.pack.models)
+    if args.role:
+        unknown = [r for r in args.role if r not in agents and r not in models]
+        if unknown:
+            print("unknown role(s)/model(s) %s (agents: %s; models: %s)"
+                  % (unknown, sorted(agents) or "none", sorted(models) or "none"),
+                  file=sys.stderr)
+            return 2
+        agents = {k: v for k, v in agents.items() if k in args.role}
+        models = {k: v for k, v in models.items() if k in args.role}
+    if not agents and not models:
+        print("pack '%s' declares no agents or models" % eng.pack.name)
+        return 0
+    failures = 0
+    timeout_s = int(args.timeout)
+    for name in sorted(agents):
+        binding = agents[name]
+        r = runner.probe_binding(
+            name, binding, out_dir=eng.data_dir / "probes" / name,
+            secrets=secrets, timeout_s=timeout_s)
+        failures += 0 if r["ok"] else 1
+        print("%s  agent %-12s %-13s model=%-24s %s%s"
+              % ("ok  " if r["ok"] else "FAIL", name, binding.get("backend"),
+                 binding.get("model", "(backend default)"),
+                 ("%5dms  " % r["wall_ms"]) if "wall_ms" in r else "",
+                 r["detail"]))
+    for name in sorted(models):
+        spec = models[name]
+        r = runner.probe_model(
+            name, spec, out_dir=eng.data_dir / "probes" / ("model-" + name),
+            secrets=secrets, timeout_s=timeout_s)
+        failures += 0 if r["ok"] else 1
+        print("%s  model %-12s %-13s model=%-24s %s%s"
+              % ("ok  " if r["ok"] else "FAIL", name,
+                 "embeddings-api" if "base_url" in spec else "local-weights",
+                 spec.get("model", spec.get("path", "?")),
+                 ("%5dms  " % r["wall_ms"]) if "wall_ms" in r else "",
+                 r["detail"]))
+    print("%d binding(s) probed, %d failure(s)"
+          % (len(agents) + len(models), failures))
+    return 1 if failures else 0
+
+
+def _llm_show(args):
+    """Render EXACTLY what a step using this binding would send: base
+    prompt + context sections + output contract, plus the sha that the
+    runs table would pin. Payload context only — steps may declare more
+    (notes/retrieval), which resolve against live task state."""
+    from . import runner
+    from .util import sha256_text
+    pack = config.load_pack(args.pack) if args.pack else None
+    if pack is None:
+        print("llm show needs --pack", file=sys.stderr)
+        return 2
+    role = args.role
+    if role not in pack.agents:
+        print("no agent role '%s' (defined: %s)"
+              % (role, sorted(pack.agents) or "none"), file=sys.stderr)
+        return 2
+    if role not in pack.prompts:
+        print("no pack prompt for role '%s'" % role, file=sys.stderr)
+        return 2
+    schema_name = args.schema
+    if schema_name is None:
+        if len(pack.schemas) == 1:
+            schema_name = next(iter(pack.schemas))
+        else:
+            print("--schema required (defined: %s)"
+                  % (sorted(pack.schemas) or "none"), file=sys.stderr)
+            return 2
+    if schema_name not in pack.schemas:
+        print("no schema '%s' (defined: %s)"
+              % (schema_name, sorted(pack.schemas)), file=sys.stderr)
+        return 2
+    payload = json.loads(args.data)
+    if not isinstance(payload, dict):
+        print("--data must be a JSON object", file=sys.stderr)
+        return 2
+    base = Path(pack.prompts[role]).read_text()
+    prompt = runner.assemble_prompt(base, {"payload": payload},
+                                    pack.schemas[schema_name])
+    binding = pack.agents[role]
+    print("# role=%s backend=%s model=%s schema=%s"
+          % (role, binding.get("backend"),
+             binding.get("model", "(backend default)"), schema_name))
+    print("# prompt_sha=%s" % sha256_text(prompt))
+    print("# note: payload context only — steps may declare more"
+          " (notes/retrieval), resolved against live task state")
+    print(prompt)
+    return 0
+
+
+def _llm_runs(args):
+    """Recent agent runs: what model, what verdict, how long, how many
+    correction rounds. Reads only — safe next to a daemon."""
+    conn = db.connect(Path(args.root) / "state" / "forgeflow.db")
+    rows = conn.execute(
+        "SELECT r.id, r.task_id, t.kind, r.model, r.verdict, r.exit_code,"
+        " r.wall_ms, r.reasks, r.started_at, r.finished_at"
+        " FROM runs r LEFT JOIN tasks t ON t.id = r.task_id"
+        " ORDER BY r.id DESC LIMIT ?", (int(args.limit),)).fetchall()
+    if not rows:
+        print("no agent runs recorded")
+        return 0
+    print("run   task  kind            model                    verdict"
+          "     wall     reasks  started")
+    for r in rows:
+        print("%-5d %-5d %-15s %-24s %-11s %-8s %-7s %s"
+              % (r["id"], r["task_id"], (r["kind"] or "?")[:15],
+                 (r["model"] or "?")[:24],
+                 r["verdict"] or ("(none)" if r["finished_at"] else "RUNNING"),
+                 ("%dms" % r["wall_ms"]) if r["wall_ms"] is not None else "-",
+                 r["reasks"] if r["reasks"] is not None else "-",
+                 r["started_at"]))
     return 0
 
 
@@ -377,6 +525,22 @@ def main(argv=None):
 
     sub.add_parser("metrics", help="throughput / park-rate / queue-depth")
 
+    pl = sub.add_parser("llm", help="agent/model tooling: check, show, runs")
+    pls = pl.add_subparsers(dest="llm_cmd", required=True)
+    plc = pls.add_parser("check", help="live-probe every agent binding and"
+                                       " pack model (exit 1 on failure)")
+    plc.add_argument("role", nargs="*", help="probe only these roles/models")
+    plc.add_argument("--timeout", default=60, help="per-probe timeout (s)")
+    plw = pls.add_parser("show", help="render the exact assembled prompt +"
+                                      " sha for a role")
+    plw.add_argument("role")
+    plw.add_argument("--data", default="{}", help="JSON payload for context")
+    plw.add_argument("--schema", default=None,
+                     help="pack schema name (default: the only one)")
+    plr = pls.add_parser("runs", help="recent agent runs: verdict, latency,"
+                                      " re-asks")
+    plr.add_argument("--limit", default=20, help="rows to show")
+
     pd = sub.add_parser("doctor", help="health check: daemon alive, work stuck, disk leaking")
     pd.add_argument("--stale", default=120, help="heartbeat age (s) that counts as stale")
     pd.add_argument("--min-free", default=0, help="flag if free disk (MB) is below this")
@@ -385,7 +549,8 @@ def main(argv=None):
     return {"validate": cmd_validate, "run": cmd_run, "once": cmd_once,
             "emit": cmd_emit, "status": cmd_status, "unpark": cmd_unpark,
             "retry": cmd_retry, "trace": cmd_trace, "gc": cmd_gc,
-            "metrics": cmd_metrics, "doctor": cmd_doctor}[args.cmd](args)
+            "metrics": cmd_metrics, "doctor": cmd_doctor,
+            "llm": cmd_llm}[args.cmd](args)
 
 
 if __name__ == "__main__":

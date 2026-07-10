@@ -68,6 +68,7 @@ class Engine:
             pack=pack, policy=self.policy)
         self._lowdisk = False           # resource guard: pause claiming when set
         self._check_schedule()
+        self._check_agents()
         self._recover()
 
     # ------------------------------------------------------------ startup
@@ -82,6 +83,21 @@ class Engine:
                 raise ConfigError(
                     "schedule: no workflow consumes '%s' (consumed events: %s)"
                     % (entry["event"], ", ".join(sorted(self.subscriptions)) or "none"))
+
+    def _check_agents(self):
+        """Environment checks for agent bindings (cli resolvable, secrets
+        present) — at engine start, AFTER any --replay-from wrap, so replay
+        runs never demand the live backend's environment. Structure was
+        already checked at pack load; live round-trips are `llm check`."""
+        if not self.pack or not self.pack.agents:
+            return
+        from . import runner
+        from .config import ConfigError, load_secrets
+        secrets = load_secrets()
+        for name, binding in self.pack.agents.items():
+            err = runner.check_binding(name, binding, secrets)
+            if err:
+                raise ConfigError("agents.%s: %s" % (name, err))
 
     def _recover(self):
         """Crash recovery: orphaned 'running' tasks -> pending (their

@@ -238,20 +238,7 @@ def load_pack(pack_dir) -> Pack:
 
     agents = doc.get("agents") or {}
     for aname, acfg in agents.items():
-        if not isinstance(acfg, dict) or "backend" not in acfg:
-            _fail("agents.%s: needs at least 'backend:'" % aname)
-        if acfg["backend"] == "replay":
-            src = acfg.get("source")
-            if not src:
-                _fail("agents.%s: replay backend needs 'source' (a root "
-                      "holding the recording)" % aname)
-            sp = Path(str(src)).expanduser()
-            if not sp.is_absolute():
-                sp = pack_dir / sp
-            if not (sp / "state" / "forgeflow.db").is_file():
-                _fail("agents.%s: replay source %s has no recording "
-                      "(state/forgeflow.db missing)" % (aname, sp))
-            acfg["source"] = str(sp)
+        _check_agent(aname, acfg, _fail, pack_dir)
 
     # retry: per-class overrides / pack-defined classes -> effective policy
     from . import queue as queue_mod
@@ -355,6 +342,64 @@ def _parse_http(spec, _fail):
         _fail("http: binding to %r beyond loopback requires 'token_ref' "
               "(HTTP_TOKEN_<REF> in the secrets file)" % host)
     return {"host": host, "port": port, "token_ref": token_ref}
+
+
+# What each agent backend accepts in its binding. STRUCTURE is checked here
+# (fail loud with the file+field); ENVIRONMENT (cli on PATH, secret present)
+# is checked at engine start via runner.check_binding — after a --replay-from
+# wrap, so replaying on a machine without the live backend still works.
+_AGENT_KEYS = {
+    "claude-cli":    {"backend", "model", "cli", "permission_mode",
+                      "env_keys", "max_turns", "extra_args"},
+    "openai-compat": {"backend", "model", "base_url", "api_key_ref", "params"},
+    "replay":        {"backend", "model", "source"},
+}
+
+
+def _check_agent(aname, acfg, _fail, pack_dir):
+    if not isinstance(acfg, dict) or "backend" not in acfg:
+        _fail("agents.%s: needs at least 'backend:'" % aname)
+    backend = acfg["backend"]
+    if backend not in _AGENT_KEYS:
+        _fail("agents.%s: unknown backend %r (known: %s)"
+              % (aname, backend, ", ".join(sorted(_AGENT_KEYS))))
+    unknown = set(acfg) - _AGENT_KEYS[backend]
+    if unknown:
+        _fail("agents.%s: unknown keys %s for backend %s (accepted: %s)"
+              % (aname, sorted(unknown), backend,
+                 sorted(_AGENT_KEYS[backend])))
+    if backend == "openai-compat":
+        base_url = acfg.get("base_url")
+        if not isinstance(base_url, str) or not base_url.startswith(("http://", "https://")):
+            _fail("agents.%s: openai-compat needs 'base_url' (http(s)://...)" % aname)
+        if not acfg.get("model"):
+            _fail("agents.%s: openai-compat needs 'model'" % aname)
+        params = acfg.get("params")
+        if params is not None and not isinstance(params, dict):
+            _fail("agents.%s: 'params' must be a mapping of request-body "
+                  "fields (temperature, max_tokens, ...)" % aname)
+    elif backend == "claude-cli":
+        mt = acfg.get("max_turns")
+        if mt is not None and (isinstance(mt, bool) or not isinstance(mt, int)
+                               or mt < 1):
+            _fail("agents.%s: 'max_turns' must be an integer >= 1" % aname)
+        for key in ("extra_args", "env_keys"):
+            v = acfg.get(key)
+            if v is not None and (not isinstance(v, list)
+                                  or any(not isinstance(x, str) for x in v)):
+                _fail("agents.%s: '%s' must be a list of strings" % (aname, key))
+    elif backend == "replay":
+        src = acfg.get("source")
+        if not src:
+            _fail("agents.%s: replay backend needs 'source' (a root "
+                  "holding the recording)" % aname)
+        sp = Path(str(src)).expanduser()
+        if not sp.is_absolute():
+            sp = pack_dir / sp
+        if not (sp / "state" / "forgeflow.db").is_file():
+            _fail("agents.%s: replay source %s has no recording "
+                  "(state/forgeflow.db missing)" % (aname, sp))
+        acfg["source"] = str(sp)
 
 
 def _resolve_tool(tpath):

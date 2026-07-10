@@ -29,6 +29,8 @@ def main():
     good = "did things.\n```json\n{\"verdict\": \"FIXED\"}\n```"
     if mode == "good":
         print(envelope(good))
+    elif mode == "probe_ok":     # llm-check probe contract
+        print(envelope("```json\n{\"verdict\": \"OK\"}\n```"))
     elif mode == "checkdb":
         db_path = open(os.path.join(HERE, "dbpath")).read().strip()
         conn = sqlite3.connect(db_path)

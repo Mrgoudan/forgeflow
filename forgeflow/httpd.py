@@ -183,6 +183,17 @@ def _metrics(conn):
     if runs:
         out["agent_errors"] = q("SELECT count(*) FROM runs WHERE exit_code!=0"
                                 " OR verdict='error'")
+        out["llm_per_model"] = [
+            {"model": r["model"], "runs": r["n"], "no_verdict": r["noverdict"],
+             "avg_wall_ms": r["avg_ms"], "max_wall_ms": r["max_ms"],
+             "reasks": r["reasks"] or 0}
+            for r in conn.execute(
+                "SELECT model, count(*) n,"
+                " sum(CASE WHEN verdict IS NULL THEN 1 ELSE 0 END) noverdict,"
+                " CAST(avg(wall_ms) AS INT) avg_ms, max(wall_ms) max_ms,"
+                " sum(COALESCE(reasks,0)) reasks"
+                " FROM runs WHERE finished_at IS NOT NULL"
+                " GROUP BY model ORDER BY n DESC")]
     return out
 
 

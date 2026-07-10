@@ -117,7 +117,7 @@ class VersioningGateTest(unittest.TestCase):
 
 
 class MigrationTest(unittest.TestCase):
-    def test_v1_db_migrates_to_v2(self):
+    def test_v1_db_migrates_to_current(self):
         path = tmpdir() / "old.db"
         conn = sqlite3.connect(str(path))
         conn.executescript("""
@@ -135,24 +135,49 @@ class MigrationTest(unittest.TestCase):
                 created_at    TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
             );
+            CREATE TABLE runs (   -- v1 shape: no wall_ms / reasks
+                id            INTEGER PRIMARY KEY,
+                task_id       INTEGER NOT NULL REFERENCES tasks(id),
+                model         TEXT NOT NULL,
+                prompt_sha    TEXT NOT NULL,
+                pack_rev      TEXT NOT NULL,
+                vault_rev     TEXT,
+                probe_rev     TEXT,
+                base_sha      TEXT,
+                build_id      TEXT,
+                exit_code     INTEGER,
+                verdict       TEXT,
+                output_path   TEXT,
+                started_at    TEXT NOT NULL DEFAULT (datetime('now')),
+                finished_at   TEXT
+            );
             INSERT INTO tasks(kind, payload, payload_hash) VALUES ('k','{}','h');
+            INSERT INTO runs(task_id, model, prompt_sha, pack_rev)
+                VALUES (1, 'm', 's', 'r');
             PRAGMA user_version=1;
         """)
         conn.commit()
         conn.close()
 
         conn = db.connect(path)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                         db.SCHEMA_VERSION)
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
-        self.assertIn("def_hash", cols)
+        self.assertIn("def_hash", cols)                       # v2
+        run_cols = {r["name"] for r in conn.execute("PRAGMA table_info(runs)")}
+        self.assertIn("wall_ms", run_cols)                    # v3
+        self.assertIn("reasks", run_cols)
         tables = {r["name"] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
-        self.assertIn("join_groups", tables)
+        self.assertIn("join_groups", tables)                  # v2
         self.assertIn("join_members", tables)
-        # existing rows survived the ALTER with a NULL stamp
+        # existing rows survived the ALTERs with NULL new columns
         row = conn.execute("SELECT kind, def_hash FROM tasks").fetchone()
         self.assertEqual(row["kind"], "k")
         self.assertIsNone(row["def_hash"])
+        run = conn.execute("SELECT model, wall_ms FROM runs").fetchone()
+        self.assertEqual(run["model"], "m")
+        self.assertIsNone(run["wall_ms"])
 
 
 if __name__ == "__main__":

@@ -117,6 +117,8 @@ CREATE TABLE IF NOT EXISTS runs (                  -- one row per agent invocati
     exit_code     INTEGER,
     verdict       TEXT,                  -- schema-validated verdict enum, never prose
     output_path   TEXT,                  -- full raw output, logged not parsed
+    wall_ms       INTEGER,               -- total wall time incl. re-asks
+    reasks        INTEGER,               -- correction rounds used (0 = clean)
     started_at    TEXT NOT NULL DEFAULT (datetime('now')),
     finished_at   TEXT
 );
@@ -220,7 +222,18 @@ CREATE INDEX IF NOT EXISTS idx_items_state ON items(state);
 # (version > user_version) migrations in order. Migrations are for CHANGES the
 # CREATE-IF-NOT-EXISTS base can't make on an existing table (ALTER, backfill).
 # (Pack tables evolve in the pack's own schema.sql.)
-SCHEMA_VERSION = 2
+def _mig_v3(conn):
+    """v3 (0.3.0): agent run latency + re-ask accounting. Column-guarded so
+    it is safe even against a db whose runs table was (re)created at the
+    latest shape before migrations ran."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
+    if "wall_ms" not in cols:
+        conn.execute("ALTER TABLE runs ADD COLUMN wall_ms INTEGER")
+    if "reasks" not in cols:
+        conn.execute("ALTER TABLE runs ADD COLUMN reasks INTEGER")
+
+
+SCHEMA_VERSION = 3
 MIGRATIONS: list = [
     # v2 (0.2.0): workflow definition versioning + fan-out/join.
     (2, """
@@ -243,7 +256,8 @@ CREATE TABLE IF NOT EXISTS join_members (
 );
 CREATE INDEX IF NOT EXISTS idx_join_members_task ON join_members(task_id);
 """),
-]       # [(version, sql), ...]
+    (3, _mig_v3),
+]       # [(version, sql | callable(conn)), ...]
 
 
 def _migrate(conn, fresh):
@@ -254,9 +268,12 @@ def _migrate(conn, fresh):
         conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
         return
     have = conn.execute("PRAGMA user_version").fetchone()[0] or 1  # unversioned == v1
-    for version, sql in MIGRATIONS:
+    for version, step in MIGRATIONS:
         if have < version:
-            conn.executescript(sql)
+            if callable(step):
+                step(conn)
+            else:
+                conn.executescript(step)
             have = version
     conn.execute("PRAGMA user_version=%d" % max(have, SCHEMA_VERSION))
 
