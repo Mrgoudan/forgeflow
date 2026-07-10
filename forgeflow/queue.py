@@ -145,6 +145,24 @@ def unpark(conn, task_id=None, ids=None) -> int:
         return cur.rowcount
 
 
+def retry(conn, task_id=None, kind=None) -> int:
+    """failed -> pending with a FRESH attempt (attempts+1, so the contract
+    re-runs from step 0 instead of replaying the recorded failure). Targeted
+    (task_id), by kind, or all failed. Returns how many became eligible."""
+    q = ("UPDATE tasks SET state='pending', attempts=attempts+1,"
+         " next_attempt=NULL, error_class=NULL, updated_at=datetime('now')"
+         " WHERE state='failed'")
+    args = []
+    if task_id is not None:
+        q += " AND id=?"
+        args.append(task_id)
+    elif kind is not None:
+        q += " AND kind=?"
+        args.append(kind)
+    with ensure_tx(conn):
+        return conn.execute(q, args).rowcount
+
+
 def parked_due(conn, classes=None):
     """Parked tasks whose per-class cadence (POLICY.unpark_after_s) has elapsed
     since they parked. Returns [(id, error_class), ...]. Classes with

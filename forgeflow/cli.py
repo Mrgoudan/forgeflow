@@ -21,6 +21,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
+from pathlib import Path
 
 from . import config, db, engine, queue
 
@@ -67,6 +69,11 @@ def cmd_emit(args):
     if not isinstance(payload, dict):
         print("--data must be a JSON object", file=sys.stderr)
         return 2
+    if args.force:
+        # re-trigger: a reserved unique key makes the enqueued task's payload
+        # hash differ, so the idempotency index admits a fresh task instead of
+        # deduping. Workflows read named keys only, so _force is ignored.
+        payload["_force"] = time.time_ns()
     event_id = db.emit_event(eng.conn, args.name, payload, eng.subscriptions)
     kinds = eng.subscriptions.get(args.name, [])
     print("event %d: %s -> %s" % (event_id, args.name,
@@ -188,6 +195,59 @@ def cmd_trace(args):
     return 0
 
 
+def cmd_retry(args):
+    eng = _build_engine(args)
+    n = queue.retry(eng.conn, args.task_id, args.kind)
+    print("retried %d failed task(s)" % n)
+    return 0
+
+
+def cmd_gc(args):
+    from . import gc as _gc
+    conn = db.connect(Path(args.root) / "state" / "forgeflow.db")
+    st = _gc.collect(conn, args.root, days=int(args.days), dry_run=args.dry_run)
+    verb = "would remove" if args.dry_run else "removed"
+    print("gc (older than %d days): %s %d worktree(s), %d task archive(s), "
+          "%d run archive(s), %d event(s)"
+          % (int(args.days), verb, st["worktrees"], st["task_dirs"],
+             st["run_dirs"], st["events"]))
+    return 0
+
+
+def cmd_metrics(args):
+    conn = db.connect(Path(args.root) / "state" / "forgeflow.db")
+    q = lambda s, *a: conn.execute(s, a).fetchone()[0]
+    print("queue depth:")
+    for st in ("pending", "running", "retry_wait", "parked"):
+        print("  %-12s %d" % (st, q("SELECT count(*) FROM tasks WHERE state=?", st)))
+    print("throughput:")
+    print("  done/last 1h   %d" % q("SELECT count(*) FROM tasks WHERE state='done'"
+          " AND updated_at > datetime('now','-1 hours')"))
+    print("  done/last 24h  %d" % q("SELECT count(*) FROM tasks WHERE state='done'"
+          " AND updated_at > datetime('now','-1 days')"))
+    done = q("SELECT count(*) FROM tasks WHERE state='done'")
+    failed = q("SELECT count(*) FROM tasks WHERE state='failed'")
+    parked = q("SELECT count(*) FROM tasks WHERE state='parked'")
+    tot = done + failed + parked or 1
+    print("outcomes: done %d · failed %d (%.0f%%) · parked %d (%.0f%%)"
+          % (done, failed, 100 * failed / tot, parked, 100 * parked / tot))
+    print("parked by class:")
+    for r in conn.execute("SELECT error_class, count(*) c FROM tasks"
+                          " WHERE state='parked' GROUP BY error_class ORDER BY c DESC"):
+        print("  %-16s %d" % (r["error_class"], r["c"]))
+    runs = q("SELECT count(*) FROM runs")
+    if runs:
+        bad = q("SELECT count(*) FROM runs WHERE exit_code!=0 OR verdict='error'")
+        print("agent runs: %d · error rate %.0f%%" % (runs, 100 * bad / runs))
+    print("slowest step kinds (avg ms):")
+    for r in conn.execute(
+            "SELECT t.kind, s.step, CAST(avg(s.wall_ms) AS INT) ms, count(*) n"
+            " FROM task_steps s JOIN tasks t ON t.id=s.task_id"
+            " GROUP BY t.kind, s.step ORDER BY ms DESC LIMIT 8"):
+        print("  %-14s %-14s %7dms  (n=%d)" % (r["kind"], r["step"], r["ms"], r["n"]))
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="forgeflow", description=__doc__.split("\n")[0])
     p.add_argument("--root", default=".",
@@ -204,6 +264,8 @@ def main(argv=None):
     pe.add_argument("--data", default="{}", help="JSON object payload")
     pe.add_argument("--drive", action="store_true",
                     help="then drive the claim loop until idle (one-shot mode)")
+    pe.add_argument("--force", action="store_true",
+                    help="re-trigger: bypass payload-hash dedup (fresh task)")
 
     ps = sub.add_parser("status", help="tasks / items / parked / events")
     ps.add_argument("--limit", default=10, help="recent events to show")
@@ -211,13 +273,24 @@ def main(argv=None):
     pu = sub.add_parser("unpark", help="parked -> pending (all, or one id)")
     pu.add_argument("task_id", nargs="?", type=int, default=None)
 
+    pr = sub.add_parser("retry", help="failed -> pending, fresh attempt (all/id/kind)")
+    pr.add_argument("task_id", nargs="?", type=int, default=None)
+    pr.add_argument("--kind", default=None, help="only tasks of this kind")
+
     pt = sub.add_parser("trace", help="one task's full story from the db")
     pt.add_argument("task_id", type=int)
 
+    pg = sub.add_parser("gc", help="reclaim disk: prune old archives + worktrees")
+    pg.add_argument("--days", default=14, help="keep terminal-task archives newer than this")
+    pg.add_argument("--dry-run", action="store_true", help="report, don't delete")
+
+    sub.add_parser("metrics", help="throughput / park-rate / queue-depth")
+
     args = p.parse_args(argv)
     return {"validate": cmd_validate, "run": cmd_run, "once": cmd_once,
-            "emit": cmd_emit, "status": cmd_status,
-            "unpark": cmd_unpark, "trace": cmd_trace}[args.cmd](args)
+            "emit": cmd_emit, "status": cmd_status, "unpark": cmd_unpark,
+            "retry": cmd_retry, "trace": cmd_trace, "gc": cmd_gc,
+            "metrics": cmd_metrics}[args.cmd](args)
 
 
 if __name__ == "__main__":
