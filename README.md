@@ -290,11 +290,20 @@ state.
 python3 -m forgeflow --root R --pack P validate    # load + print orchestration map
 python3 -m forgeflow --root R --pack P run         # the daemon (one per root)
 python3 -m forgeflow --root R --pack P once        # drain queued work, exit
-python3 -m forgeflow --root R --pack P emit NAME --data '{...}' [--drive]
-python3 -m forgeflow --root R           status     # tasks/findings/parked/events
-python3 -m forgeflow --root R           unpark [ID] # parked -> pending (all, or one id)
+python3 -m forgeflow --root R --pack P emit NAME --data '{...}' [--drive] [--force]
+python3 -m forgeflow --root R           status     # tasks / items / parked / events
+python3 -m forgeflow --root R           unpark [ID] # parked  -> pending (all, or one id)
+python3 -m forgeflow --root R           retry [ID] [--kind K]  # failed -> pending, fresh attempt
 python3 -m forgeflow --root R           trace ID    # one task's full story: steps, outcomes, timings
+python3 -m forgeflow --root R           metrics     # throughput / park-rate / queue-depth
+python3 -m forgeflow --root R           doctor      # health check (daemon alive? work stuck? disk?)
+python3 -m forgeflow --root R           gc [--days N] [--dry-run]  # reclaim disk: old archives + worktrees
 ```
+
+`emit --force` re-triggers a repeat event (bypasses payload-hash dedup).
+Daemon knobs live in `project.yaml`: `concurrency: { workers, lanes }`
+(parallel workers + per-lane caps, e.g. `lanes: { build: 1 }` serializes a
+rebuild) and `min_free_disk_mb` (pause claiming when disk runs low).
 
 (Installed via pip? `forgeflow ...` works instead of `python3 -m forgeflow ...`.)
 
