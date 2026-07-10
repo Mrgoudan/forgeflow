@@ -144,6 +144,42 @@ class MigrateTest(unittest.TestCase):
             db.SCHEMA_VERSION, db.MIGRATIONS = old_v, old_m
 
 
+class DiskGuardTest(unittest.TestCase):
+    def test_disk_gate_pauses_then_resumes(self):
+        from types import SimpleNamespace
+        from forgeflow import engine as E
+        stub = SimpleNamespace(pack=SimpleNamespace(min_free_disk_mb=100),
+                               root=".", _lowdisk=False)
+        stub._disk_ok = lambda: E.Engine._disk_ok(stub)
+        orig = E.shutil.disk_usage
+        try:
+            E.shutil.disk_usage = lambda p: SimpleNamespace(free=50 * 1024 * 1024)
+            self.assertFalse(E.Engine._disk_gate(stub))   # 50 MB < 100 floor
+            self.assertTrue(stub._lowdisk)
+            E.shutil.disk_usage = lambda p: SimpleNamespace(free=500 * 1024 * 1024)
+            self.assertTrue(E.Engine._disk_gate(stub))    # recovered
+            self.assertFalse(stub._lowdisk)
+        finally:
+            E.shutil.disk_usage = orig
+
+    def test_disk_ok_disabled_when_zero(self):
+        from types import SimpleNamespace
+        from forgeflow import engine as E
+        stub = SimpleNamespace(pack=SimpleNamespace(min_free_disk_mb=0), root=".")
+        self.assertTrue(E.Engine._disk_ok(stub))
+
+    def test_doctor_flags_low_disk(self):
+        root = tmpdir()
+        (root / "state").mkdir()
+        conn = db.connect(root / "state" / "forgeflow.db")
+        import time as _t
+        conn.execute("INSERT INTO watermarks(scope,cursor)"
+                     " VALUES('daemon.heartbeat',?)", (str(int(_t.time())),))
+        conn.commit()
+        self.assertEqual(cli.main(["--root", str(root), "doctor",
+                                   "--min-free", "99999999999"]), 1)
+
+
 class CliSmokeTest(unittest.TestCase):
     def test_metrics_and_gc_run(self):
         root = tmpdir()

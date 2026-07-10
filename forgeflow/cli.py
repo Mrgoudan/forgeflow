@@ -295,6 +295,12 @@ def cmd_doctor(args):
     if parked:
         print("parked: %d (see 'status' / 'metrics'; unpark or retry as needed)" % parked)
 
+    import shutil
+    free_mb = shutil.disk_usage(str(Path(args.root))).free // (1024 * 1024)
+    print("disk: %d MB free on state root" % free_mb)
+    if int(args.min_free) and free_mb < int(args.min_free):
+        issues.append("low disk: %d MB free < %d MB floor" % (free_mb, int(args.min_free)))
+
     if issues:
         print("\nISSUES:")
         for i in issues:
@@ -344,6 +350,7 @@ def main(argv=None):
 
     pd = sub.add_parser("doctor", help="health check: daemon alive, work stuck, disk leaking")
     pd.add_argument("--stale", default=120, help="heartbeat age (s) that counts as stale")
+    pd.add_argument("--min-free", default=0, help="flag if free disk (MB) is below this")
 
     args = p.parse_args(argv)
     return {"validate": cmd_validate, "run": cmd_run, "once": cmd_once,

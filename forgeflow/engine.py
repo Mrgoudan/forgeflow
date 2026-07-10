@@ -48,6 +48,7 @@ class Engine:
             conn=self.conn, subscriptions=self.subscriptions,
             data_dir=self.data_dir, workspaces_dir=self.workspaces_dir,
             pack=pack)
+        self._lowdisk = False           # resource guard: pause claiming when set
         self._recover()
 
     # ------------------------------------------------------------ startup
@@ -126,6 +127,9 @@ class Engine:
         conn, env = self._worker_env(lanes)
         try:
             while not stop.is_set():
+                if self._lowdisk:                        # resource guard
+                    time.sleep(0.5)
+                    continue
                 try:
                     task = queue.claim(conn)
                 except Exception as e:                       # keep the worker alive
@@ -221,6 +225,7 @@ class Engine:
             try:
                 while True:
                     now = time.monotonic()
+                    self._disk_gate()                    # sets _lowdisk for workers
                     if now - last_beat >= 10:
                         self._beat()
                         last_beat = now
@@ -243,11 +248,37 @@ class Engine:
             if now - last_unpark >= unpark_every:
                 self._unpark_tick()
                 last_unpark = now
+            if not self._disk_gate():                        # resource guard
+                time.sleep(idle)
+                continue
             task = queue.claim(self.conn)
             if task is None:
                 time.sleep(idle)
                 continue
             self._exec(self.env, task)
+
+    def _disk_ok(self) -> bool:
+        mb = getattr(self.pack, "min_free_disk_mb", 0) if self.pack else 0
+        if not mb:
+            return True
+        try:
+            return shutil.disk_usage(str(self.root)).free >= mb * 1024 * 1024
+        except OSError:
+            return True
+
+    def _disk_gate(self) -> bool:
+        """Resource guard: don't take new work while free disk is below the
+        pack's floor (prevents a fill-the-disk outage). Logs the transitions;
+        `_lowdisk` is read by the workers/serial loop before claiming."""
+        ok = self._disk_ok()
+        if not ok and not self._lowdisk:
+            print("engine: LOW DISK (< %d MB free) — pausing new work"
+                  % self.pack.min_free_disk_mb, file=sys.stderr)
+            self._lowdisk = True
+        elif ok and self._lowdisk:
+            print("engine: disk recovered — resuming", file=sys.stderr)
+            self._lowdisk = False
+        return ok
 
     def _beat(self):
         """Daemon liveness: stamp a heartbeat (wall epoch) in watermarks so
