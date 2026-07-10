@@ -17,6 +17,24 @@ db row references is garbage by definition (collectable).
 | `legacy/` | no | nobody (frozen) | read-only snapshots of the predecessor systems (autofix, pr_monitor, autotest sem_tests) kept for reference and as `import_legacy.py` input. Never executed, never edited. |
 | `logs/` | no | daemon | operational logs, rotated, disposable. |
 
+## Passing data between steps
+
+Two channels, chosen by size:
+
+- **Small values** (ids, paths, counts, verdict fields) ride the step result
+  row — the next step reads `{prev.x}`. Result JSON is meant to stay under a
+  few KB; it is replayed on resume and shown in `trace`.
+- **Big artifacts** (build logs, diffs, model output, generated files) go to
+  disk. Every block receives a private `_step_dir`
+  (`data/tasks/<task>/a<attempt>/<step>/`) that the engine creates before the
+  block runs and archives forever (until gc). Write the artifact there and
+  pass its **path** through the result; the consuming step (or a human, or
+  gc) finds it by task/attempt/step address. `shell.run` already does this
+  for stdout/stderr.
+
+Never pass content through the event payload — payloads are identity (the
+dedup hash); artifacts are evidence.
+
 ## Collaboration contract
 
 - **Workflows never read each other's files.** bughunt → autofix → review hand
@@ -37,6 +55,8 @@ db row references is garbage by definition (collectable).
 ## Retention
 
 - `workspaces/<task>`: removed when the task reaches done/failed (parked tasks keep theirs).
+- join groups: fired groups (and their member rows) are pruned by `gc` after
+  the window; UNFIRED groups are live barrier state and are never collected.
 - `data/runs/`: keep forever for findings that reached `pr_open`+; 90 days otherwise.
 - `data/egress/`: keep forever (it is the record of everything we ever said publicly).
 - `logs/`: rotate at 50 MB, keep 10.

@@ -21,17 +21,21 @@ source of truth; one daemon process is the single writer.
 
 ```
 loop:
-  intake()      # poll forge watermarks (and later: drain webhook queue)
-                # -> emit events -> enqueue via subscriptions
-  unpark()      # parked tasks whose park condition may have cleared
-                # (agent_limit: recheck every unpark_interval; operator
-                #  unparks are immediate via board -> db)
+  beat()          # heartbeat watermark (doctor reads it)
+  unpark()        # parked tasks whose park condition may have cleared
+                  # (agent_limit: recheck every unpark_interval; operator
+                  #  unparks are immediate via cli -> db)
+  schedule_tick() # timed triggers: emit each schedule entry's event once
+                  # per every_s window (see "Timed triggers" below)
+  disk_gate()     # pause claiming while free disk < min_free_disk_mb
   task = claim()
   if task is None: sleep(idle_interval); continue
-  execute(task) # contract.execute — see below
+  execute(task)   # contract.execute — see below
 ```
 
 `idle_interval` and `unpark_interval` come from the pack; defaults 15s / 600s.
+If the pack declares an `http:` section, the daemon also serves the
+dashboard/JSON API from a thread (see "HTTP front door" below).
 
 ## Claim (atomic, no double-claim)
 
@@ -87,16 +91,99 @@ CREATE TABLE IF NOT EXISTS task_steps (
 
 ## Failure & retry
 
-`queue.fail(task, error_class)` applies POLICY (queue.py table):
+`queue.fail(task, error_class)` applies the effective policy — the engine's
+POLICY table merged with the pack's `retry:` overrides (`queue.build_policy`,
+carried on the ExecEnv, never global mutation):
 - retryable → state 'retry_wait', attempts+1, `next_attempt = now +
   min(backoff_base * 2^attempts, backoff_cap)`; task_steps rows for the
   FAILED attempt are kept (audit) but the next attempt re-runs all steps
   (attempt number increments) unless the step is marked resumable
   (worktree.create is; agent.run is NOT — a new attempt is a new run row).
 - exhausted → 'parked' (park_on_exhaust) else 'failed'.
-- consume_task classes → terminal immediately, no retry ever.
+- consume_task classes → terminal immediately, no retry ever. These are
+  structural and cannot be reconfigured by packs.
 - 'parked' stores park_reason = error_class; unpark() resets to 'pending'
-  without incrementing attempts.
+  WITH attempts+1 — a fresh attempt, because the contract replays recorded
+  outcomes per attempt and a parked task may carry the failing step's row.
+- packs may define NEW classes in `retry:`; a block outcome whose name is a
+  policy class, mapped to 'failed', gets that class's arithmetic instead of
+  terminal failure.
+
+## Definition versioning
+
+Every workflow definition has a stable fingerprint (`Workflow.def_hash()`:
+steps, params, context, timeouts, visit caps, resumable flags, llm/schema
+bindings, outcome sets, lanes, dispatch, consumes/emits). When an attempt
+first executes, the task is stamped with it (`tasks.def_hash`).
+
+At execute():
+- stamp == current hash → resume normally (recorded steps replay);
+- stamp differs and THIS attempt has recorded steps → the YAML changed under
+  a mid-flight task: **park as `definition_changed`** — recorded outcomes are
+  never replayed through a changed dispatch graph. `unpark`/`retry` starts a
+  fresh attempt that re-stamps and runs from step 0 under the new definition.
+  (`definition_changed` never auto-unparks by default; a pack may opt into
+  timed re-runs via `retry: { definition_changed: { unpark_after_s: N } }`.)
+- stamp is NULL (task predates versioning / attempt not started) → adopt the
+  current definition and proceed.
+
+## Fan-out / join
+
+`fanout.emit` stages a `fanout` op; the engine applies it inside the step
+boundary transaction: create the join group + emit one event per item with
+the reserved `_join {group, index}` payload key. `queue.enqueue` links each
+spawned task as a group member. Every terminal transition
+(`queue._set_state`) updates the member's recorded state and checks the
+group: all members terminal → the join event fires **exactly once**
+(guarded `fired_at` claim), atomically with the member's own transition.
+
+Determinism rules:
+- group key = sha256(task id, event names, item payloads): a re-executed
+  parent reuses the group; payload-hash dedup absorbs re-emitted children.
+- `_join.index` makes identical items distinct members.
+- parked members hold the join open (parked is not terminal).
+- operator `retry` of a failed member of an UNFIRED group re-opens its slot
+  (state → NULL); fired groups are history and never change or re-fire.
+- expect_n = items × consumers at creation; zero (empty list or no
+  consumers) fires the join immediately with total 0.
+- gc prunes groups fired more than `--days` ago (members with them);
+  unfired groups are live state, never collected.
+
+## Timed triggers (schedule)
+
+Per entry `{event, every_s, data}`: occurrence = `now - (now % every_s)`
+(wall clock). Fire iff occurrence > the persisted cursor
+(`watermarks scope='schedule.<event>'`); emitting the event and advancing
+the cursor is one transaction. Consequences: exactly-once per window across
+restarts; a daemon down N windows fires only the current one (missed windows
+skip — no catch-up storm); first sight fires immediately; resolution is the
+daemon loop cadence. Startup refuses a schedule whose event nobody consumes.
+The window start rides in the payload as `schedule_occurrence` (also making
+distinct windows distinct payloads for the dedup key).
+
+## HTTP front door (httpd.py)
+
+Optional, inside the daemon. GET `/` (dashboard), `/api/status`,
+`/api/metrics`, `/api/task/<id>`; POST `/api/emit {name, data, force?}`.
+Rules: config refuses non-loopback bind without `token_ref`; when a token is
+configured EVERY request must present it (`Authorization: Bearer`); the
+token lives in the secrets file (`HTTP_TOKEN_<REF>`), never in pack files;
+emits accept only consumed events; each request thread opens its own
+connection (WAL + busy_timeout serialize writes next to the workers).
+
+## Record / replay
+
+`runner._finish` archives every schema-valid verdict as
+`data/runs/<id>/verdict.json` (canonical JSON, before the `_run_id`
+annotation). The `replay` backend answers an ask by sha256(assembled prompt)
+lookup in the source root's runs table and returns the recorded verdict as a
+fenced block — revalidated against the step schema like any live answer. A
+miss (changed prompt/context/schema, or gc'd archive) is
+`agent_invalid_output`: bounded fast retries then loud failure, never a
+stale answer and never a park-stall in CI. `--replay-from ROOT` rebinds
+every pack agent to the replay backend; a per-agent binding
+(`backend: replay, source: <root>`) is validated at pack load (the
+recording must exist).
 
 ## Crash recovery (daemon start)
 
@@ -159,9 +246,12 @@ a match means it was already sent; return the recorded id (safe replay).
 | decision | source |
 |---|---|
 | which task runs next | ORDER BY id over eligible set |
-| retry timing | POLICY table arithmetic |
-| resume point | task_steps rows |
+| retry timing | effective policy arithmetic (POLICY + pack retry:) |
+| resume point | task_steps rows, gated by tasks.def_hash |
 | who reacts to an event | consumes: lists (loader subscriptions) |
 | double-send / double-enqueue | body_sha / payload-hash unique keys |
+| schedule firing | window arithmetic vs the persisted cursor watermark |
+| join firing | member terminal states + guarded fired_at claim |
+| agent answer under replay | prompt_sha lookup in the recorded runs table |
 | clock | single `now` per transaction, from the db (`datetime('now')`) |
 ```

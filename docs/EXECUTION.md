@@ -29,6 +29,11 @@ step runner refuses anything that can't satisfy these:
    at the last boundary via the queue; a crashed agent leaves its pinned
    `runs` row as evidence. Restart is replay-safe because every step is
    idempotent (plan_id / watermark / findings.key / egress body-sha dedup).
+   Replay is additionally gated by the workflow definition fingerprint
+   (`tasks.def_hash`): recorded outcomes never replay through a CHANGED
+   dispatch graph — a mid-flight task whose YAML changed parks as
+   `definition_changed` and re-runs fresh under the new definition on
+   unpark (ENGINE.md "Definition versioning").
 
 4. **Terminal in bounded steps** — every task provably reaches
    `done | failed | parked | deferred`. `parked` is a *defined* state

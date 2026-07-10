@@ -82,6 +82,41 @@ the db ad hoc; a block's function signature is `(ctx_slice, task, prev)`.
 That makes steps testable in isolation (feed a dict, assert the outcome)
 and makes "what did this step know?" a db lookup instead of archaeology.
 
+## Fan-out / join in YAML
+
+One-per-item parallelism with a barrier is a block, not orchestration code:
+
+```yaml
+- name: spread
+  block: fanout.emit
+  timeout_s: 30
+  params:
+    name: probe.wanted              # per-item event; must be in emits:
+    items: "{prev.candidates}"      # a list
+    data: { candidate: "{item}" }   # per-item payload; {item}/{index} resolve
+    join:
+      event: probe.all_done         # must be in emits:; fires exactly once
+      data: { batch: "{payload.batch}" }
+  outcomes: { ok: done, empty: done }
+```
+
+The join event's payload is `{join_group, total, done, failed, deferred}`
+plus `join.data`. The consumer may use `join.collect` to read the member
+roster. Semantics live in ENGINE.md ("Fan-out / join").
+
+## Reserved payload keys
+
+The engine owns keys starting with `_` plus the names it injects; workflows
+read named keys only and must not fabricate these:
+
+| key | written by | meaning |
+|---|---|---|
+| `event` | emit_event | the event name that created the task |
+| `_force` | emit --force / POST /api/emit | dedup-bypass nonce |
+| `_join` | fanout.emit | `{group, index}` join membership |
+| `join_group`, `total`, `done`, `failed`, `deferred` | join firing | barrier results |
+| `schedule_occurrence` | schedule tick | window start (epoch seconds) |
+
 ## How workflows interact: events, not calls
 
 Workflows never invoke each other. `record_transition()` is the event bus:
@@ -112,6 +147,9 @@ workflow can't strand others — unconsumed events are simply facts in the log.
 | `evidence.suite` / `evidence.check` | local | green, red_retryable, red |
 | `publish.pr` / `publish.comment` | egress | ok, forge_auth, forge_server, leak_blocked |
 | `db.upsert_finding` / `db.transition` | state | ok |
+| `event.emit` | state | ok |
+| `fanout.emit` | state | ok, empty |
+| `join.collect` | state | ok |
 | `scan.grep_rules` | local, no-AI | ok(candidates) |
 | `oracle.reproduce` | local | confirmed, refuted |
 
