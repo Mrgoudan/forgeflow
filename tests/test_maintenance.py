@@ -121,6 +121,29 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(cli.main(["--root", str(root), "doctor"]), 1)
 
 
+class MigrateTest(unittest.TestCase):
+    def test_fresh_db_is_stamped_latest(self):
+        conn = db.connect(tmpdir() / "f.db")
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                         db.SCHEMA_VERSION)
+
+    def test_existing_db_runs_pending_migration(self):
+        import sqlite3
+        p = tmpdir() / "m.db"
+        db.connect(p).close()                       # a real db (tasks exists)
+        c = sqlite3.connect(str(p)); c.execute("PRAGMA user_version=0"); c.close()
+        old_v, old_m = db.SCHEMA_VERSION, db.MIGRATIONS
+        try:
+            db.SCHEMA_VERSION = 2
+            db.MIGRATIONS = [(2, "CREATE TABLE mig_marker(x);")]
+            conn = db.connect(p)                     # existing -> migrate
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertTrue(conn.execute("SELECT 1 FROM sqlite_master WHERE"
+                                         " name='mig_marker'").fetchone())
+        finally:
+            db.SCHEMA_VERSION, db.MIGRATIONS = old_v, old_m
+
+
 class CliSmokeTest(unittest.TestCase):
     def test_metrics_and_gc_run(self):
         root = tmpdir()

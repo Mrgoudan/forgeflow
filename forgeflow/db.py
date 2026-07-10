@@ -184,6 +184,30 @@ CREATE INDEX IF NOT EXISTS idx_tasks_claim
 CREATE INDEX IF NOT EXISTS idx_items_state ON items(state);
 """
 
+# SCHEMA is always the LATEST core schema. Bump SCHEMA_VERSION and append the
+# upgrade to MIGRATIONS whenever it changes: a FRESH db gets SCHEMA and is just
+# stamped (no migration run); an EXISTING older db runs the pending
+# (version > user_version) migrations in order. Migrations are for CHANGES the
+# CREATE-IF-NOT-EXISTS base can't make on an existing table (ALTER, backfill).
+# (Pack tables evolve in the pack's own schema.sql.)
+SCHEMA_VERSION = 1
+MIGRATIONS: list = []       # [(version, sql), ...]
+
+
+def _migrate(conn, fresh):
+    """Bring the core schema to SCHEMA_VERSION. A fresh db already has the
+    latest SCHEMA, so it is only stamped; an existing older db runs the
+    version-ordered deltas past its user_version."""
+    if fresh:
+        conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
+        return
+    have = conn.execute("PRAGMA user_version").fetchone()[0] or 1  # unversioned == v1
+    for version, sql in MIGRATIONS:
+        if have < version:
+            conn.executescript(sql)
+            have = version
+    conn.execute("PRAGMA user_version=%d" % max(have, SCHEMA_VERSION))
+
 
 class TransitionError(ValueError):
     """A transition outside ITEM_STATES. Always a caller bug — loud."""
@@ -200,7 +224,10 @@ def connect(path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
+    fresh = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table'"
+                         " AND name='tasks'").fetchone() is None
     conn.executescript(SCHEMA)
+    _migrate(conn, fresh)
     return conn
 
 
