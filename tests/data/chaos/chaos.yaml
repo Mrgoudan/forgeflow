@@ -1,0 +1,29 @@
+# Chaos workflow: four counted steps. The parent test SIGKILLs the driver at
+# random points; the invariant under any kill schedule is: the task converges
+# to done, committed steps never re-run (each kill can duplicate at most the
+# ONE interrupted step's side effect), and the step ledger stays consistent.
+workflow: chaos_demo
+consumes: [chaos.requested]
+emits: []
+
+steps:
+  - name: s1
+    block: shell.run
+    timeout_s: 60
+    params: { cmd: ["sh", "-c", "echo x >> s1.txt && sleep 0.15"], cwd: "{paths.repo}" }
+    outcomes: { ok: s2, nonzero: failed, mismatch: failed, timeout: failed }
+  - name: s2
+    block: shell.run
+    timeout_s: 60
+    params: { cmd: ["sh", "-c", "echo x >> s2.txt && sleep 0.15"], cwd: "{paths.repo}" }
+    outcomes: { ok: s3, nonzero: failed, mismatch: failed, timeout: failed }
+  - name: s3
+    block: shell.run
+    timeout_s: 60
+    params: { cmd: ["sh", "-c", "echo x >> s3.txt && sleep 0.15"], cwd: "{paths.repo}" }
+    outcomes: { ok: s4, nonzero: failed, mismatch: failed, timeout: failed }
+  - name: s4
+    block: shell.run
+    timeout_s: 60
+    params: { cmd: ["sh", "-c", "echo x >> s4.txt && sleep 0.15"], cwd: "{paths.repo}" }
+    outcomes: { ok: done, nonzero: failed, mismatch: failed, timeout: failed }

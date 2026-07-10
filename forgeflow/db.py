@@ -76,6 +76,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     item_id    INTEGER REFERENCES items(id),
     payload       TEXT NOT NULL,         -- JSON task input
     payload_hash  TEXT NOT NULL,         -- sha256(canonical_json(payload))
+    def_hash      TEXT,                  -- workflow definition fingerprint the
+                                         -- current attempt runs under (stamped
+                                         -- at execution; see contract.execute)
     state         TEXT NOT NULL DEFAULT 'pending',
                   -- pending | running | retry_wait | parked
                   -- | done | failed | deferred        (last three terminal)
@@ -137,6 +140,33 @@ CREATE TABLE IF NOT EXISTS watermarks (            -- external cursor state
     cursor        TEXT NOT NULL          -- last processed id, NOT a timestamp
 );
 
+-- ---- fan-out / join -------------------------------------------------------
+-- A fanout.emit step creates ONE group + one member row per spawned task
+-- (queue.enqueue links members via the payload's reserved _join key). When
+-- every member reaches a terminal state, the group's join event fires exactly
+-- once (fired_at guard) — see queue._set_state / queue.check_join_fire.
+
+CREATE TABLE IF NOT EXISTS join_groups (
+    id            INTEGER PRIMARY KEY,
+    key           TEXT UNIQUE NOT NULL,  -- dedup: a re-applied identical fan-out
+                                         -- (task re-attempt) reuses this group
+    parent_task   INTEGER REFERENCES tasks(id),
+    event         TEXT NOT NULL,         -- join event emitted at completion
+    data          TEXT NOT NULL,         -- JSON merged into the join payload
+    expect_n      INTEGER NOT NULL,      -- members expected (items x consumers)
+    fired_at      TEXT,                  -- NULL until the join event was emitted
+    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS join_members (
+    group_id      INTEGER NOT NULL REFERENCES join_groups(id),
+    task_id       INTEGER NOT NULL REFERENCES tasks(id),
+    state         TEXT,                  -- NULL until the member is terminal
+    PRIMARY KEY (group_id, task_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_join_members_task ON join_members(task_id);
+
 -- ---- code comprehension layer -------------------------------------------
 -- What the system has looked at and learned. These rows may influence WHAT
 -- an agent sees (prompt assembly, targeting); they must NEVER influence what
@@ -190,8 +220,30 @@ CREATE INDEX IF NOT EXISTS idx_items_state ON items(state);
 # (version > user_version) migrations in order. Migrations are for CHANGES the
 # CREATE-IF-NOT-EXISTS base can't make on an existing table (ALTER, backfill).
 # (Pack tables evolve in the pack's own schema.sql.)
-SCHEMA_VERSION = 1
-MIGRATIONS: list = []       # [(version, sql), ...]
+SCHEMA_VERSION = 2
+MIGRATIONS: list = [
+    # v2 (0.2.0): workflow definition versioning + fan-out/join.
+    (2, """
+ALTER TABLE tasks ADD COLUMN def_hash TEXT;
+CREATE TABLE IF NOT EXISTS join_groups (
+    id            INTEGER PRIMARY KEY,
+    key           TEXT UNIQUE NOT NULL,
+    parent_task   INTEGER REFERENCES tasks(id),
+    event         TEXT NOT NULL,
+    data          TEXT NOT NULL,
+    expect_n      INTEGER NOT NULL,
+    fired_at      TEXT,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS join_members (
+    group_id      INTEGER NOT NULL REFERENCES join_groups(id),
+    task_id       INTEGER NOT NULL REFERENCES tasks(id),
+    state         TEXT,
+    PRIMARY KEY (group_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_join_members_task ON join_members(task_id);
+"""),
+]       # [(version, sql), ...]
 
 
 def _migrate(conn, fresh):

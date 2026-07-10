@@ -496,6 +496,84 @@ def event_emit(ctx, task, prev):
                                "payload": data}]}
 
 
+@block("fanout.emit", "state", {"ok", "empty"},
+       accepts_context={"payload"}, required_params={"name", "items", "join"})
+def fanout_emit(ctx, task, prev):
+    """Fan-out with a join: emit the 'name' event once per item in 'items'
+    (a list, usually '{prev.candidates}'), each with a payload templated
+    from 'data' ({item} and {index} resolve per item; default {item: {item}}).
+    When EVERY task those events spawn reaches a terminal state, the
+    join.event fires exactly once with {join_group, total, done, failed,
+    deferred} plus join.data — that is the barrier other workflows consume.
+
+    Determinism: the join group is keyed by (task, event names, payloads),
+    so a re-executed attempt reuses the same group and the queue's
+    payload-hash dedup absorbs re-emitted children. An empty items list is
+    the 'empty' outcome and fires the join immediately (total 0). A parked
+    child holds the join open until it terminates — the join never guesses."""
+    items = _tpl(ctx, task, prev, ctx["items"])
+    if not isinstance(items, list):
+        raise RuntimeError("fanout.emit: 'items' must resolve to a list, "
+                           "got %s" % type(items).__name__)
+    name = _tpl(ctx, task, prev, ctx["name"])
+    join = ctx["join"]           # loader-validated: {event, data?}
+    join_event = _tpl(ctx, task, prev, join["event"])
+    join_data = _tpl(ctx, task, prev, join.get("data") or {})
+    if not isinstance(join_data, dict):
+        raise RuntimeError("fanout.emit: join.data must be a mapping")
+    data_t = ctx.get("data") or {"item": "{item}"}
+    payloads = []
+    for i, item in enumerate(items):
+        p = template(data_t, {"payload": task.get("payload") or {},
+                              "prev": prev or {}, "ctx": ctx,
+                              "item": item, "index": i})
+        if not isinstance(p, dict):
+            raise RuntimeError("fanout.emit: 'data' must template to a "
+                               "mapping per item")
+        payloads.append(p)
+    outcome = "ok" if items else "empty"
+    return outcome, {"count": len(items),
+                     "_staged": [{"op": "fanout", "name": name,
+                                  "payloads": payloads,
+                                  "join_event": join_event,
+                                  "join_data": join_data}]}
+
+
+@block("join.collect", "state", {"ok"}, accepts_context={"payload"})
+def join_collect(ctx, task, prev):
+    """Read a join group's member roster (typically in the workflow that
+    consumes the join event; the group id arrives as payload.join_group).
+    Counts are always exact; the per-member list is capped by 'limit'
+    (default 200) with 'truncated' set — never a silent cut."""
+    gid = ctx.get("group")
+    if gid is not None:
+        gid = _tpl(ctx, task, prev, gid)
+    else:
+        gid = (task.get("payload") or {}).get("join_group")
+    if gid is None:
+        raise RuntimeError("join.collect: no 'group' param and no "
+                           "'join_group' in the payload")
+    gid = int(gid)
+    conn = ctx["_conn"]
+    g = conn.execute("SELECT * FROM join_groups WHERE id=?", (gid,)).fetchone()
+    if g is None:
+        raise RuntimeError("join.collect: join group %d does not exist" % gid)
+    rows = conn.execute(
+        "SELECT m.task_id, m.state, t.kind FROM join_members m"
+        " JOIN tasks t ON t.id = m.task_id"
+        " WHERE m.group_id=? ORDER BY m.task_id", (gid,)).fetchall()
+    counts = {}
+    for r in rows:
+        counts[r["state"] or "waiting"] = counts.get(r["state"] or "waiting", 0) + 1
+    limit = int(ctx.get("limit", 200))
+    members = [{"task_id": r["task_id"], "state": r["state"], "kind": r["kind"]}
+               for r in rows[:limit]]
+    return "ok", {"join_group": gid, "event": g["event"],
+                  "fired_at": g["fired_at"], "total": len(rows),
+                  "counts": counts, "members": members,
+                  "truncated": len(rows) > limit}
+
+
 @block("db.transition", "state", {"ok"},
        accepts_context={"payload"}, required_params={"to_state", "event"})
 def db_transition(ctx, task, prev):

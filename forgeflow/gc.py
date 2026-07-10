@@ -33,11 +33,13 @@ def collect(conn, root, days: int = 14, dry_run: bool = False) -> dict:
     - task_dirs:  run/data/tasks/<id> for tasks terminal AND older than `days`
     - run_dirs:   run/data/runs/<id> whose task is terminal AND older than `days`
     - events:     rows in the event log older than `days`
+    - joins:      join groups FIRED more than `days` ago (+ their members);
+                  unfired groups are live state and are never touched
     """
     root = Path(root)
     ws, data = root / "workspaces", root / "data"
     win = ("datetime('now','-'||?||' days')",)  # bound with (days,)
-    st = {"worktrees": 0, "task_dirs": 0, "run_dirs": 0, "events": 0}
+    st = {"worktrees": 0, "task_dirs": 0, "run_dirs": 0, "events": 0, "joins": 0}
 
     states = {r["id"]: r["state"] for r in conn.execute("SELECT id, state FROM tasks")}
     old_tasks = {r["id"] for r in conn.execute(
@@ -74,5 +76,17 @@ def collect(conn, root, days: int = 14, dry_run: bool = False) -> dict:
         "SELECT count(*) FROM events WHERE at < %s" % win[0], (days,)).fetchone()[0]
     if not dry_run and st["events"]:
         conn.execute("DELETE FROM events WHERE at < %s" % win[0], (days,))
+        conn.commit()
+
+    st["joins"] = conn.execute(
+        "SELECT count(*) FROM join_groups WHERE fired_at IS NOT NULL"
+        " AND fired_at < %s" % win[0], (days,)).fetchone()[0]
+    if not dry_run and st["joins"]:
+        conn.execute(
+            "DELETE FROM join_members WHERE group_id IN (SELECT id FROM"
+            " join_groups WHERE fired_at IS NOT NULL AND fired_at < %s)"
+            % win[0], (days,))
+        conn.execute("DELETE FROM join_groups WHERE fired_at IS NOT NULL"
+                     " AND fired_at < %s" % win[0], (days,))
         conn.commit()
     return st

@@ -120,8 +120,60 @@ def _openai_compat_backend(binding, ask, *, cwd, timeout_s, out_dir,
             "error_class": None, "detail": ""}
 
 
+def _replay_backend(binding, ask, *, cwd, timeout_s, out_dir,
+                    session=None, secrets=None):
+    """Deterministic CI backend: answer from a PRIOR root's recordings
+    instead of calling any model. Every successful agent run archives its
+    schema-valid verdict (data/runs/<id>/verdict.json, written by _finish);
+    replay looks that verdict up by prompt_sha — the sha of the assembled
+    prompt — so a changed prompt, context, or schema is a MISS, never a
+    silently-wrong answer. A miss surfaces as agent_invalid_output: bounded
+    fast retries, then a loud terminal failure (CI-friendly — agent_backend
+    would park and stall the run).
+
+    binding: { backend: replay, source: <root that holds the recording> }.
+    """
+    source = Path(binding.get("source", ""))
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "prompt").write_text(ask)          # parity with live backends
+    db_path = source / "state" / "forgeflow.db"
+    prompt_sha = sha256_text(ask)
+
+    def miss(why):
+        return {"exit_code": 0, "result": "", "session": None,
+                "error_class": "agent_invalid_output",
+                "detail": "replay miss: %s (source %s, prompt %.12s...)"
+                          % (why, source, prompt_sha)}
+
+    if not db_path.is_file():
+        return miss("no recording db at %s" % db_path)
+    import sqlite3
+    src = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
+    src.row_factory = sqlite3.Row
+    try:
+        row = src.execute(
+            "SELECT id FROM runs WHERE prompt_sha=? AND verdict IS NOT NULL"
+            " ORDER BY id DESC LIMIT 1", (prompt_sha,)).fetchone()
+    finally:
+        src.close()
+    if row is None:
+        return miss("no recorded run for this prompt")
+    verdict_path = source / "data" / "runs" / str(row["id"]) / "verdict.json"
+    if not verdict_path.is_file():
+        return miss("run %d has no verdict.json (recorded before 0.2.0, "
+                    "or archives were gc'd)" % row["id"])
+    verdict_text = verdict_path.read_text()
+    (out_dir / "replay.json").write_text(canonical_json(
+        {"source": str(source), "run_id": row["id"], "prompt_sha": prompt_sha}))
+    return {"exit_code": 0,
+            "result": "replayed run %d\n```json\n%s\n```" % (row["id"], verdict_text),
+            "session": None, "error_class": None, "detail": ""}
+
+
 BACKENDS = {"claude-cli": _claude_cli_backend,
-            "openai-compat": _openai_compat_backend}
+            "openai-compat": _openai_compat_backend,
+            "replay": _replay_backend}
 
 
 def _http_json(binding, route, body, timeout_s, out_dir, secrets):
@@ -310,3 +362,9 @@ def _finish(conn, run_id, exit_code, verdict, output_path):
             (exit_code,
              verdict.get("verdict") if isinstance(verdict, dict) else None,
              output_path, run_id))
+    if isinstance(verdict, dict):
+        # the recording half of record/replay: the schema-valid verdict,
+        # canonical and BEFORE the engine's _run_id annotation, so a replay
+        # revalidates against the step schema byte-for-byte
+        from .util import atomic_write
+        atomic_write(Path(output_path) / "verdict.json", canonical_json(verdict))

@@ -1,0 +1,11 @@
+# Join member: exits with the item value, so item 0 -> done, item 1 -> failed.
+workflow: jointest_probe
+consumes: [jointest.probe]
+emits: []
+
+steps:
+  - name: run
+    block: shell.run
+    timeout_s: 30
+    params: { cmd: ["sh", "-c", "exit {payload.value}"] }
+    outcomes: { ok: done, nonzero: failed, mismatch: failed, timeout: failed }

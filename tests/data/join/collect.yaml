@@ -1,0 +1,10 @@
+# Barrier consumer: reads the member roster of the join group that fired.
+workflow: jointest_collect
+consumes: [jointest.done]
+emits: []
+
+steps:
+  - name: gather
+    block: join.collect
+    timeout_s: 30
+    outcomes: { ok: done }

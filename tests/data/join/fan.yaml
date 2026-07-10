@@ -1,0 +1,18 @@
+# Fan-out demo: one event per item, then a join event once every spawned
+# task is terminal. The join is the barrier the 'collect' workflow consumes.
+workflow: jointest_fan
+consumes: [jointest.wanted]
+emits: [jointest.probe, jointest.done]
+
+steps:
+  - name: spread
+    block: fanout.emit
+    timeout_s: 30
+    params:
+      name: jointest.probe
+      items: "{payload.items}"
+      data: { value: "{item}" }
+      join:
+        event: jointest.done
+        data: { batch: "{payload.batch}" }
+    outcomes: { ok: done, empty: done }

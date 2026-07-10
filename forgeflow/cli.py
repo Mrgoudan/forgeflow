@@ -29,7 +29,8 @@ from . import config, db, engine, queue
 
 def _build_engine(args):
     pack = config.load_pack(args.pack) if args.pack else None
-    return engine.Engine(args.root, pack=pack)
+    return engine.Engine(args.root, pack=pack,
+                         replay_from=getattr(args, "replay_from", None))
 
 
 def cmd_validate(args):
@@ -49,6 +50,13 @@ def cmd_validate(args):
         print("  (no subscriptions)")
     for ev in sorted(eng.subscriptions):
         print("  %-28s -> %s" % (ev, ", ".join(eng.subscriptions[ev])))
+    if eng.pack and eng.pack.schedule:
+        print("schedules (event fired once per window):")
+        for e in eng.pack.schedule:
+            print("  %-28s every %ds" % (e["event"], e["every_s"]))
+    if eng.pack and eng.pack.http:
+        print("http: %s:%d%s" % (eng.pack.http["host"], eng.pack.http["port"],
+                                 " (token required)" if eng.pack.http["token_ref"] else ""))
     print("OK: every workflow is total, every reference resolves")
     return 0
 
@@ -98,6 +106,15 @@ def cmd_status(args):
         for r in parked:
             print("  #%d %s reason=%s attempts=%d"
                   % (r["id"], r["kind"], r["park_reason"], r["attempts"]))
+    joins = conn.execute(
+        "SELECT g.id, g.event, g.expect_n,"
+        " (SELECT count(state) FROM join_members m WHERE m.group_id=g.id) done_n"
+        " FROM join_groups g WHERE g.fired_at IS NULL ORDER BY g.id").fetchall()
+    if joins:
+        print("open joins (waiting on members):")
+        for r in joins:
+            print("  group %d -> %s  (%d/%d terminal)"
+                  % (r["id"], r["event"], r["done_n"], r["expect_n"]))
     print("items:")
     for r in conn.execute("SELECT state, count(*) c FROM items"
                           " GROUP BY state ORDER BY state"):
@@ -136,6 +153,14 @@ def cmd_trace(args):
           % (task["id"], task["kind"], task["state"], task["attempts"],
              "  error_class=%s" % task["error_class"] if task["error_class"] else ""))
     print("  payload: %s" % _json.dumps(payload, sort_keys=True))
+    j = payload.get("_join")
+    if isinstance(j, dict) and "group" in j:
+        g = conn.execute("SELECT event, fired_at FROM join_groups WHERE id=?",
+                         (j["group"],)).fetchone()
+        if g:
+            print("  member of join group %s -> %s (%s)"
+                  % (j["group"], g["event"],
+                     "fired %s" % g["fired_at"] if g["fired_at"] else "open"))
 
     # origin: a task enqueued via the event bus carries its event name
     ev_name = payload.get("event")
@@ -208,9 +233,9 @@ def cmd_gc(args):
     st = _gc.collect(conn, args.root, days=int(args.days), dry_run=args.dry_run)
     verb = "would remove" if args.dry_run else "removed"
     print("gc (older than %d days): %s %d worktree(s), %d task archive(s), "
-          "%d run archive(s), %d event(s)"
+          "%d run archive(s), %d event(s), %d fired join group(s)"
           % (int(args.days), verb, st["worktrees"], st["task_dirs"],
-             st["run_dirs"], st["events"]))
+             st["run_dirs"], st["events"], st["joins"]))
     return 0
 
 
@@ -315,6 +340,10 @@ def main(argv=None):
     p.add_argument("--root", default=".",
                    help="state root (holds state/, data/, workspaces/)")
     p.add_argument("--pack", default=None, help="pack directory (project.yaml)")
+    p.add_argument("--replay-from", default=None, metavar="ROOT",
+                   help="answer every agent step from this root's recorded"
+                        " verdicts instead of calling a model (deterministic"
+                        " CI; a prompt with no recording fails loudly)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("validate", help="load everything, print the orchestration map")

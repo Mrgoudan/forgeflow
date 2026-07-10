@@ -15,6 +15,7 @@ Rules (each one is a scar from a predecessor incident):
 from __future__ import annotations
 
 import os
+import re
 import stat
 import subprocess
 import tempfile
@@ -23,7 +24,7 @@ from pathlib import Path
 
 import yaml
 
-from .util import run_cmd, template
+from .util import EVENT_RE, run_cmd, template
 
 
 class ConfigError(SystemExit):
@@ -61,12 +62,21 @@ class Pack:
     # unparking agent-backend-dependent tasks (see Engine._agent_online). An
     # "env:VAR" value reads the URL from that env var.
     agent_health_url: str = None
+    # effective retry policy: queue.POLICY merged with the pack's retry:
+    # overrides (queue.build_policy). Empty = engine defaults.
+    policy: dict = field(default_factory=dict)
+    # timed triggers: ({event, every_s, data}, ...) — the daemon emits each
+    # event once per every_s window (see Engine._schedule_tick).
+    schedule: tuple = ()
+    # optional HTTP front door: {host, port, token_ref} — serves the
+    # dashboard + JSON API + POST /api/emit inside the daemon (httpd.py).
+    http: dict = None
 
 
 _PACK_KEYS = {"name", "paths", "params", "workflows", "blocks", "schema",
               "tools", "agents", "prompts", "schemas", "models", "workspace_root",
               "idle_interval_s", "unpark_interval_s", "agent_health_url",
-              "concurrency", "min_free_disk_mb"}
+              "concurrency", "min_free_disk_mb", "retry", "schedule", "http"}
 
 
 def load_pack(pack_dir) -> Pack:
@@ -230,6 +240,28 @@ def load_pack(pack_dir) -> Pack:
     for aname, acfg in agents.items():
         if not isinstance(acfg, dict) or "backend" not in acfg:
             _fail("agents.%s: needs at least 'backend:'" % aname)
+        if acfg["backend"] == "replay":
+            src = acfg.get("source")
+            if not src:
+                _fail("agents.%s: replay backend needs 'source' (a root "
+                      "holding the recording)" % aname)
+            sp = Path(str(src)).expanduser()
+            if not sp.is_absolute():
+                sp = pack_dir / sp
+            if not (sp / "state" / "forgeflow.db").is_file():
+                _fail("agents.%s: replay source %s has no recording "
+                      "(state/forgeflow.db missing)" % (aname, sp))
+            acfg["source"] = str(sp)
+
+    # retry: per-class overrides / pack-defined classes -> effective policy
+    from . import queue as queue_mod
+    try:
+        policy = queue_mod.build_policy(doc.get("retry"))
+    except ValueError as e:
+        _fail("retry: %s" % e)
+
+    schedule = _parse_schedule(doc.get("schedule"), _fail)
+    http = _parse_http(doc.get("http"), _fail)
 
     workspace_root = doc.get("workspace_root")
     if workspace_root:
@@ -248,7 +280,81 @@ def load_pack(pack_dir) -> Pack:
         agent_health_url=doc.get("agent_health_url"),
         concurrency=doc.get("concurrency") or {},
         min_free_disk_mb=int(doc.get("min_free_disk_mb", 0)),
+        policy=policy, schedule=schedule, http=http,
     )
+
+
+_EVERY_RE = re.compile(r"^(\d+)([smhd])$")
+_EVERY_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def parse_every(value):
+    """'90s' / '5m' / '6h' / '1d' or a plain integer of seconds -> seconds.
+    Returns None if malformed (caller fails loud with context)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 1 else None
+    if isinstance(value, str):
+        m = _EVERY_RE.match(value.strip())
+        if m:
+            s = int(m.group(1)) * _EVERY_UNITS[m.group(2)]
+            return s if s >= 1 else None
+    return None
+
+
+def _parse_schedule(entries, _fail) -> tuple:
+    """schedule: [{event, every, data?}, ...] -> ({event, every_s, data}, ...).
+    Event names are format-checked here; 'someone must consume it' is checked
+    at engine startup once the workflows are loaded."""
+    if entries is None:
+        return ()
+    if not isinstance(entries, list):
+        _fail("schedule: must be a list of {event, every, data?} entries")
+    out = []
+    for i, e in enumerate(entries):
+        where = "schedule[%d]" % i
+        if not isinstance(e, dict):
+            _fail("%s: must be a mapping" % where)
+        unknown = set(e) - {"event", "every", "data"}
+        if unknown:
+            _fail("%s: unknown keys %s" % (where, sorted(unknown)))
+        ev = e.get("event")
+        if not isinstance(ev, str) or not EVENT_RE.match(ev):
+            _fail("%s: malformed event name %r (want e.g. 'nightly.build')"
+                  % (where, ev))
+        every_s = parse_every(e.get("every"))
+        if every_s is None:
+            _fail("%s: bad 'every' %r (want '30s'/'5m'/'6h'/'1d' or seconds)"
+                  % (where, e.get("every")))
+        data = e.get("data") or {}
+        if not isinstance(data, dict):
+            _fail("%s: 'data' must be a mapping" % where)
+        out.append({"event": ev, "every_s": every_s, "data": data})
+    return tuple(out)
+
+
+def _parse_http(spec, _fail):
+    """http: {host?, port, token_ref?}. Binding beyond loopback without a
+    token is refused outright — an open emit endpoint is an incident."""
+    if spec is None:
+        return None
+    if not isinstance(spec, dict):
+        _fail("http: must be a mapping {host, port, token_ref}")
+    unknown = set(spec) - {"host", "port", "token_ref"}
+    if unknown:
+        _fail("http: unknown keys %s" % sorted(unknown))
+    port = spec.get("port")
+    if isinstance(port, bool) or not isinstance(port, int) or not (0 <= port <= 65535):
+        _fail("http: 'port' must be an integer 0-65535")
+    host = str(spec.get("host", "127.0.0.1"))
+    token_ref = spec.get("token_ref")
+    if token_ref is not None and (not isinstance(token_ref, str) or not token_ref):
+        _fail("http: 'token_ref' must be a non-empty string")
+    if host not in ("127.0.0.1", "localhost", "::1") and not token_ref:
+        _fail("http: binding to %r beyond loopback requires 'token_ref' "
+              "(HTTP_TOKEN_<REF> in the secrets file)" % host)
+    return {"host": host, "port": port, "token_ref": token_ref}
 
 
 def _resolve_tool(tpath):

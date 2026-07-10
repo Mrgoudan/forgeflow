@@ -71,7 +71,8 @@ class GcTest(unittest.TestCase):
         self.conn.commit()
 
         st = gc.collect(self.conn, self.root, days=14)
-        self.assertEqual(st, {"worktrees": 2, "task_dirs": 1, "run_dirs": 1, "events": 1})
+        self.assertEqual(st, {"worktrees": 2, "task_dirs": 1, "run_dirs": 1,
+                              "events": 1, "joins": 0})
         self.assertFalse((self.root / "data" / "tasks" / "1").exists())     # old done
         self.assertTrue((self.root / "data" / "tasks" / "3").exists())      # recent
         self.assertFalse((self.root / "workspaces" / "task-1-a0").exists())  # terminal

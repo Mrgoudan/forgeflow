@@ -20,9 +20,26 @@ from . import contract, db, loader, queue
 _WS_RE = re.compile(r"^task-(\d+)-a(\d+)$")
 
 
+def _replay_pack(pack, replay_from):
+    """--replay-from ROOT: rebind EVERY agent to the replay backend reading
+    that root's recordings — deterministic CI runs with zero pack edits.
+    The recording must exist (fail loud, never silently run live models)."""
+    import dataclasses
+    replay_from = Path(replay_from)
+    if not (replay_from / "state" / "forgeflow.db").is_file():
+        from .config import ConfigError
+        raise ConfigError("--replay-from %s: no recording there "
+                          "(state/forgeflow.db missing)" % replay_from)
+    agents = {name: {"backend": "replay", "source": str(replay_from)}
+              for name in pack.agents}
+    return dataclasses.replace(pack, agents=agents)
+
+
 class Engine:
-    def __init__(self, root, pack=None, extra_defs_dirs=()):
+    def __init__(self, root, pack=None, extra_defs_dirs=(), replay_from=None):
         self.root = Path(root)
+        if replay_from is not None and pack is not None:
+            pack = _replay_pack(pack, replay_from)
         self.pack = pack
         self.state_dir = self.root / "state"
         self.data_dir = self.root / "data"
@@ -44,14 +61,27 @@ class Engine:
         dirs += list(extra_defs_dirs)
         self.workflows = loader.load_defs(dirs, pack=pack)
         self.subscriptions = loader.subscriptions(self.workflows)
+        self.policy = (pack.policy if pack else None) or None
         self.env = contract.ExecEnv(
             conn=self.conn, subscriptions=self.subscriptions,
             data_dir=self.data_dir, workspaces_dir=self.workspaces_dir,
-            pack=pack)
+            pack=pack, policy=self.policy)
         self._lowdisk = False           # resource guard: pause claiming when set
+        self._check_schedule()
         self._recover()
 
     # ------------------------------------------------------------ startup
+
+    def _check_schedule(self):
+        """Startup guard: every scheduled event must have at least one
+        consumer. A schedule feeding nobody is a config bug (fail loud at
+        start), not a stream of ignored log entries at 3am."""
+        for entry in (self.pack.schedule if self.pack else ()):
+            if entry["event"] not in self.subscriptions:
+                from .config import ConfigError
+                raise ConfigError(
+                    "schedule: no workflow consumes '%s' (consumed events: %s)"
+                    % (entry["event"], ", ".join(sorted(self.subscriptions)) or "none"))
 
     def _recover(self):
         """Crash recovery: orphaned 'running' tasks -> pending (their
@@ -87,7 +117,8 @@ class Engine:
         wf = self.workflows.get(task["kind"])
         if wf is None:
             return queue.fail(env.conn, task["id"], "framework_bug",
-                              detail="no workflow handles kind '%s'" % task["kind"])
+                              detail="no workflow handles kind '%s'" % task["kind"],
+                              policy=self.policy, subscriptions=self.subscriptions)
         state = contract.execute(env, wf, task)
         if state in queue.TERMINAL_TASK_STATES:
             self._cleanup_task_workspace(task["id"])
@@ -120,7 +151,8 @@ class Engine:
         conn = db.connect(self.state_dir / "forgeflow.db")
         env = contract.ExecEnv(
             conn=conn, subscriptions=self.subscriptions, data_dir=self.data_dir,
-            workspaces_dir=self.workspaces_dir, pack=self.pack, lanes=lanes)
+            workspaces_dir=self.workspaces_dir, pack=self.pack, lanes=lanes,
+            policy=self.policy)
         return conn, env
 
     def _worker_loop(self, lanes, stop, executed=None):
@@ -207,6 +239,7 @@ class Engine:
         except OSError:
             print("engine: another daemon holds %s — exiting" % lock_path)
             return 0
+        self._start_http()
         idle = self.pack.idle_interval_s if self.pack else 15
         unpark_every = self.pack.unpark_interval_s if self.pack else 600
         workers = self._workers()
@@ -232,6 +265,7 @@ class Engine:
                     if now - last_unpark >= unpark_every:
                         self._unpark_tick()
                         last_unpark = now
+                    self._schedule_tick()
                     time.sleep(min(idle, unpark_every))
             finally:
                 stop.set()
@@ -248,6 +282,7 @@ class Engine:
             if now - last_unpark >= unpark_every:
                 self._unpark_tick()
                 last_unpark = now
+            self._schedule_tick()
             if not self._disk_gate():                        # resource guard
                 time.sleep(idle)
                 continue
@@ -256,6 +291,30 @@ class Engine:
                 time.sleep(idle)
                 continue
             self._exec(self.env, task)
+
+    def _start_http(self):
+        """Serve the dashboard/API inside the daemon when the pack asks for
+        it. Fail loud at start if the configured token secret is missing —
+        never fall back to serving unauthenticated."""
+        spec = self.pack.http if self.pack else None
+        if not spec:
+            return None
+        token = None
+        if spec["token_ref"]:
+            from .config import ConfigError, load_secrets
+            token = load_secrets().get("HTTP_TOKEN_%s" % spec["token_ref"])
+            if not token:
+                raise ConfigError("http: secret HTTP_TOKEN_%s not in the "
+                                  "secrets file — refuse to serve" % spec["token_ref"])
+        from . import httpd
+        server = httpd.serve(self.root, self.subscriptions, host=spec["host"],
+                             port=spec["port"], token=token,
+                             pack_name=self.pack.name)
+        httpd.serve_in_thread(server)
+        print("engine: http dashboard/api on %s:%d%s"
+              % (server.server_address[0], server.server_address[1],
+                 " (token required)" if token else ""))
+        return server
 
     def _disk_ok(self) -> bool:
         mb = getattr(self.pack, "min_free_disk_mb", 0) if self.pack else 0
@@ -288,12 +347,47 @@ class Engine:
             " ON CONFLICT(scope) DO UPDATE SET cursor=excluded.cursor",
             (str(int(time.time())),))
 
+    def _schedule_tick(self, now=None) -> int:
+        """Timed triggers: emit each schedule entry's event once per every_s
+        window. The window start (epoch) rides in the payload as
+        'schedule_occurrence' AND a watermark cursor records the last window
+        emitted — together: exactly-once per window across restarts, and no
+        catch-up storm (a daemon down for three windows fires only the
+        current one; missed windows are skipped by design). A schedule seen
+        for the first time fires immediately. Effective resolution is the
+        daemon loop cadence (idle_interval_s)."""
+        entries = self.pack.schedule if self.pack else ()
+        if not entries:
+            return 0
+        from .util import tx
+        now = int(time.time() if now is None else now)
+        fired = 0
+        for e in entries:
+            occurrence = now - (now % e["every_s"])
+            scope = "schedule.%s" % e["event"]
+            row = self.conn.execute(
+                "SELECT cursor FROM watermarks WHERE scope=?", (scope,)).fetchone()
+            if row is not None and occurrence <= int(row["cursor"]):
+                continue
+            payload = dict(e["data"])
+            payload["schedule_occurrence"] = occurrence
+            with tx(self.conn):
+                db.emit_event(self.conn, e["event"], payload, self.subscriptions)
+                self.conn.execute(
+                    "INSERT INTO watermarks(scope, cursor) VALUES (?,?)"
+                    " ON CONFLICT(scope) DO UPDATE SET cursor=excluded.cursor",
+                    (scope, str(occurrence)))
+            fired += 1
+            print("engine: schedule fired %s (window %d, every %ds)"
+                  % (e["event"], occurrence, e["every_s"]))
+        return fired
+
     def _unpark_tick(self):
         """Recover parked tasks by per-class cadence. Backend-dependent classes
         (agent_limit / agent_backend) are additionally health-gated: they only
         restart when the agent endpoint answers. If it's still down, re-arm the
         clock so the next probe is a full cadence away."""
-        due = queue.parked_due(self.conn)
+        due = queue.parked_due(self.conn, policy=self.policy)
         if not due:
             return
         backend = [i for i, c in due if c in queue.BACKEND_PARK_CLASSES]

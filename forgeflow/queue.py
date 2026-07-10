@@ -13,10 +13,11 @@ A parked task never blocks the loop: claim() simply doesn't see it.
 from __future__ import annotations
 
 import json
+import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from .util import ensure_tx, payload_hash, tx
+from .util import canonical_json, ensure_tx, payload_hash, sha256_text, tx
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,11 @@ POLICY = {
     "agent_invalid_output": Policy(2,  0,  0,    park_on_exhaust=False),  # re-ask twice then fail
     "verify_red":           Policy(1,  0,  0,    park_on_exhaust=False),  # one retry then fail
     "timeout":              Policy(1,  60, 3600, park_on_exhaust=False),  # one delayed retry
+    # a workflow definition changed under a mid-flight task: park for the
+    # operator (unpark/retry = fresh attempt under the NEW definition). Never
+    # auto-unparks by default; packs may set unpark_after_s to opt into
+    # automatic re-runs after a definition change.
+    "definition_changed":   Policy(0,  0,  0,    park_on_exhaust=True, unpark_after_s=None),
     "workspace_dirty":      Policy(0,  0,  0,    park_on_exhaust=False, consume_task=True),
     "agent_noop":           Policy(0,  0,  0,    park_on_exhaust=False, consume_task=True),
     "framework_bug":        Policy(0,  0,  0,    park_on_exhaust=False, consume_task=True),
@@ -52,9 +58,71 @@ POLICY = {
 BACKEND_PARK_CLASSES = {"agent_limit", "agent_backend"}
 UNPARK_AFTER_DEFAULT = 600
 
+# What a pack's retry: section may tune. consume_task is structural (the
+# engine's own invariants — framework_bug MUST terminate) and is not exposed.
+_TUNABLE_FIELDS = {"max_attempts", "backoff_base_s", "backoff_cap_s",
+                   "park_on_exhaust", "unpark_after_s"}
+_CLASS_RE = re.compile(r"^[a-z0-9_]+$")
 
-def _unpark_after(error_class):
-    p = POLICY.get(error_class)
+
+def build_policy(overrides) -> dict:
+    """The effective retry policy: POLICY plus a pack's retry: overrides.
+    Packs may retune engine classes (except consume_task classes) and define
+    NEW classes for their own block outcomes — an outcome mapped to 'failed'
+    whose name is a policy class gets that class's retry arithmetic instead
+    of failing terminally. Raises ValueError on any malformed entry; the
+    result is a plain dict consulted per-engine (never global mutation)."""
+    if overrides is None:
+        overrides = {}
+    if not isinstance(overrides, dict):
+        raise ValueError("retry section must be a mapping of class -> fields")
+    policy = dict(POLICY)
+    for cls, fields in overrides.items():
+        if not isinstance(cls, str) or not _CLASS_RE.match(cls):
+            raise ValueError("bad error class name %r (want [a-z0-9_]+)" % (cls,))
+        if not isinstance(fields, dict) or not fields:
+            raise ValueError("retry.%s: must be a non-empty mapping" % cls)
+        unknown = set(fields) - _TUNABLE_FIELDS
+        if unknown:
+            raise ValueError("retry.%s: unknown fields %s (tunable: %s)"
+                             % (cls, sorted(unknown), sorted(_TUNABLE_FIELDS)))
+        base = policy.get(cls)
+        if base is not None and base.consume_task:
+            raise ValueError(
+                "retry.%s: this class terminates immediately by engine "
+                "design and cannot be reconfigured" % cls)
+        kw = {}
+        for f, v in fields.items():
+            if f == "park_on_exhaust":
+                if not isinstance(v, bool):
+                    raise ValueError("retry.%s.park_on_exhaust: want bool, got %r"
+                                     % (cls, v))
+            elif f == "unpark_after_s":
+                if v is not None and (isinstance(v, bool)
+                                      or not isinstance(v, int) or v < 0):
+                    raise ValueError("retry.%s.unpark_after_s: want null or "
+                                     "int >= 0, got %r" % (cls, v))
+            else:
+                if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                    raise ValueError("retry.%s.%s: want int >= 0, got %r"
+                                     % (cls, f, v))
+            kw[f] = v
+        if base is None:  # a NEW pack-defined class
+            missing = {"max_attempts", "park_on_exhaust"} - set(kw)
+            if missing:
+                raise ValueError("retry.%s: new class needs at least %s"
+                                 % (cls, sorted(missing)))
+            kw.setdefault("backoff_base_s", 0)
+            kw.setdefault("backoff_cap_s", 0)
+            kw.setdefault("unpark_after_s", UNPARK_AFTER_DEFAULT)
+            policy[cls] = Policy(**kw)
+        else:
+            policy[cls] = replace(base, **kw)
+    return policy
+
+
+def _unpark_after(error_class, policy=None):
+    p = (policy or POLICY).get(error_class)
     return p.unpark_after_s if p else UNPARK_AFTER_DEFAULT
 
 TERMINAL_TASK_STATES = {"done", "failed", "deferred"}
@@ -63,7 +131,12 @@ TERMINAL_TASK_STATES = {"done", "failed", "deferred"}
 def enqueue(conn, kind: str, payload: dict, item_id=None) -> int:
     """Insert a pending task, idempotent on (kind, payload-hash): replaying
     the same event yields the SAME task id and no duplicate row. Joins the
-    caller's transaction (event fan-out atomicity depends on this)."""
+    caller's transaction (event fan-out atomicity depends on this).
+
+    A payload carrying the reserved _join key ({"group": id, "index": i},
+    written only by fanout.emit) additionally links the task as a member of
+    that join group — the group's join event fires when every member is
+    terminal (see _note_terminal / check_join_fire)."""
     h = payload_hash(payload)
     with ensure_tx(conn):
         cur = conn.execute(
@@ -71,11 +144,29 @@ def enqueue(conn, kind: str, payload: dict, item_id=None) -> int:
             " VALUES (?,?,?,?)",
             (kind, item_id, json.dumps(payload, sort_keys=True), h))
         if cur.rowcount:
-            return cur.lastrowid
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE kind=? AND payload_hash=?",
-            (kind, h)).fetchone()
-        return row["id"]
+            task_id = cur.lastrowid
+        else:
+            task_id = conn.execute(
+                "SELECT id FROM tasks WHERE kind=? AND payload_hash=?",
+                (kind, h)).fetchone()["id"]
+        j = payload.get("_join")
+        if isinstance(j, dict) and "group" in j:
+            _join_link(conn, int(j["group"]), task_id)
+        return task_id
+
+
+def _join_link(conn, group_id: int, task_id: int) -> None:
+    """Register a task as a join-group member. Idempotent (re-applied
+    fan-outs). A dedup hit on an ALREADY-TERMINAL task must record that
+    state immediately — the task will never transition again, and a NULL
+    member would hold the join open forever."""
+    conn.execute("INSERT OR IGNORE INTO join_members(group_id, task_id, state)"
+                 " VALUES (?,?,NULL)", (group_id, task_id))
+    row = conn.execute("SELECT state FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if row and row["state"] in TERMINAL_TASK_STATES:
+        conn.execute("UPDATE join_members SET state=? WHERE group_id=?"
+                     " AND task_id=? AND state IS NULL",
+                     (row["state"], group_id, task_id))
 
 
 def claim(conn):
@@ -99,12 +190,12 @@ def claim(conn):
     return task
 
 
-def complete(conn, task_id: int) -> None:
-    _set_state(conn, task_id, "done")
+def complete(conn, task_id: int, subscriptions=None) -> None:
+    _set_state(conn, task_id, "done", subscriptions=subscriptions)
 
 
-def defer(conn, task_id: int) -> None:
-    _set_state(conn, task_id, "deferred")
+def defer(conn, task_id: int, subscriptions=None) -> None:
+    _set_state(conn, task_id, "deferred", subscriptions=subscriptions)
 
 
 def park(conn, task_id: int, reason: str) -> None:
@@ -148,26 +239,42 @@ def unpark(conn, task_id=None, ids=None) -> int:
 def retry(conn, task_id=None, kind=None) -> int:
     """failed -> pending with a FRESH attempt (attempts+1, so the contract
     re-runs from step 0 instead of replaying the recorded failure). Targeted
-    (task_id), by kind, or all failed. Returns how many became eligible."""
-    q = ("UPDATE tasks SET state='pending', attempts=attempts+1,"
-         " next_attempt=NULL, error_class=NULL, updated_at=datetime('now')"
-         " WHERE state='failed'")
+    (task_id), by kind, or all failed. Returns how many became eligible.
+
+    A retried task that is a member of a join group whose join event has NOT
+    fired yet goes back to waiting (member state -> NULL): the join reflects
+    the re-run's outcome, not the superseded failure. Groups that already
+    fired are untouched (the join event is history, never rewritten)."""
+    sel = "SELECT id FROM tasks WHERE state='failed'"
     args = []
     if task_id is not None:
-        q += " AND id=?"
+        sel += " AND id=?"
         args.append(task_id)
     elif kind is not None:
-        q += " AND kind=?"
+        sel += " AND kind=?"
         args.append(kind)
     with ensure_tx(conn):
-        return conn.execute(q, args).rowcount
+        ids = [r["id"] for r in conn.execute(sel, args)]
+        if not ids:
+            return 0
+        ph = ",".join("?" * len(ids))
+        n = conn.execute(
+            "UPDATE tasks SET state='pending', attempts=attempts+1,"
+            " next_attempt=NULL, error_class=NULL, updated_at=datetime('now')"
+            " WHERE state='failed' AND id IN (%s)" % ph, ids).rowcount
+        conn.execute(
+            "UPDATE join_members SET state=NULL WHERE task_id IN (%s)"
+            " AND group_id IN (SELECT id FROM join_groups WHERE fired_at IS NULL)"
+            % ph, ids)
+        return n
 
 
-def parked_due(conn, classes=None):
+def parked_due(conn, classes=None, policy=None):
     """Parked tasks whose per-class cadence (POLICY.unpark_after_s) has elapsed
     since they parked. Returns [(id, error_class), ...]. Classes with
     unpark_after_s=None never come due (human-only). `classes` optionally
-    restricts to a subset."""
+    restricts to a subset; `policy` is the engine's effective policy dict
+    (build_policy), default the engine table."""
     rows = conn.execute(
         "SELECT id, error_class,"
         " CAST(strftime('%s','now') - strftime('%s', updated_at) AS INTEGER) age"
@@ -177,7 +284,7 @@ def parked_due(conn, classes=None):
         cls = r["error_class"]
         if classes is not None and cls not in classes:
             continue
-        after = _unpark_after(cls)
+        after = _unpark_after(cls, policy)
         if after is not None and r["age"] is not None and r["age"] >= after:
             due.append((r["id"], cls))
     return due
@@ -196,13 +303,16 @@ def rearm(conn, ids) -> None:
                      " WHERE state='parked' AND id IN (%s)" % ph, ids)
 
 
-def fail(conn, task_id: int, error_class: str, detail=None) -> str:
-    """Apply POLICY[error_class]. Returns the resulting task state.
+def fail(conn, task_id: int, error_class: str, detail=None, policy=None,
+         subscriptions=None) -> str:
+    """Apply policy[error_class] (the engine's effective policy — build_policy
+    with pack overrides — or the default table). Returns the resulting task
+    state.
 
     Unknown error classes never guess a retry policy: the task terminates
     as 'failed' and the anomaly is logged loudly.
     """
-    policy = POLICY.get(error_class)
+    policy = (policy or POLICY).get(error_class)
     with ensure_tx(conn):
         row = conn.execute("SELECT attempts FROM tasks WHERE id=?",
                            (task_id,)).fetchone()
@@ -213,10 +323,12 @@ def fail(conn, task_id: int, error_class: str, detail=None) -> str:
             print("queue.fail: UNKNOWN error class '%s' on task %s — "
                   "terminal failure, no retry (%s)"
                   % (error_class, task_id, detail), file=sys.stderr)
-            _set_state(conn, task_id, "failed", error_class)
+            _set_state(conn, task_id, "failed", error_class,
+                       subscriptions=subscriptions)
             return "failed"
         if policy.consume_task:
-            _set_state(conn, task_id, "failed", error_class)
+            _set_state(conn, task_id, "failed", error_class,
+                       subscriptions=subscriptions)
             return "failed"
         new_attempts = attempts + 1
         if new_attempts <= policy.max_attempts:
@@ -234,7 +346,8 @@ def fail(conn, task_id: int, error_class: str, detail=None) -> str:
         if policy.park_on_exhaust:
             park(conn, task_id, error_class)
             return "parked"
-        _set_state(conn, task_id, "failed", error_class)
+        _set_state(conn, task_id, "failed", error_class,
+                   subscriptions=subscriptions)
         return "failed"
 
 
@@ -249,9 +362,96 @@ def reset_orphans(conn) -> int:
         return cur.rowcount
 
 
-def _set_state(conn, task_id: int, state: str, error_class=None) -> None:
+def _set_state(conn, task_id: int, state: str, error_class=None,
+               subscriptions=None) -> None:
     with ensure_tx(conn):
         conn.execute(
             "UPDATE tasks SET state=?, error_class=COALESCE(?, error_class),"
             " next_attempt=NULL, updated_at=datetime('now') WHERE id=?",
             (state, error_class, task_id))
+        if state in TERMINAL_TASK_STATES:
+            _note_terminal(conn, task_id, state, subscriptions)
+
+
+# ---------------------------------------------------------- fan-out / join
+
+def _note_terminal(conn, task_id: int, state: str, subscriptions) -> None:
+    """Record a member task's terminal state on every join group it belongs
+    to, then fire any group that just became complete — atomically with the
+    state change (we are inside the caller's transaction). A task that
+    re-terminates (operator retry) updates its recorded state; a group that
+    already fired never fires again (fired_at guard)."""
+    groups = [r["group_id"] for r in conn.execute(
+        "SELECT group_id FROM join_members WHERE task_id=?", (task_id,))]
+    if not groups:
+        return
+    conn.execute("UPDATE join_members SET state=? WHERE task_id=?",
+                 (state, task_id))
+    for gid in groups:
+        check_join_fire(conn, gid, subscriptions)
+
+
+def check_join_fire(conn, group_id: int, subscriptions=None) -> bool:
+    """Fire the group's join event iff every expected member is terminal and
+    it has not fired yet. Exactly-once: the fired_at stamp is claimed with a
+    guarded UPDATE inside the caller's transaction. Returns True if this
+    call fired the event."""
+    g = conn.execute("SELECT * FROM join_groups WHERE id=?",
+                     (group_id,)).fetchone()
+    if g is None or g["fired_at"] is not None:
+        return False
+    n, waiting = conn.execute(
+        "SELECT count(*), count(*) - count(state) FROM join_members"
+        " WHERE group_id=?", (group_id,)).fetchone()
+    if n < g["expect_n"] or waiting:
+        return False
+    with ensure_tx(conn):
+        claimed = conn.execute(
+            "UPDATE join_groups SET fired_at=datetime('now')"
+            " WHERE id=? AND fired_at IS NULL", (group_id,)).rowcount
+        if not claimed:
+            return False
+        counts = {"done": 0, "failed": 0, "deferred": 0}
+        for r in conn.execute("SELECT state, count(*) c FROM join_members"
+                              " WHERE group_id=? GROUP BY state", (group_id,)):
+            counts[r["state"]] = r["c"]
+        payload = json.loads(g["data"] or "{}")
+        payload.update({"join_group": group_id, "total": n,
+                        "done": counts["done"], "failed": counts["failed"],
+                        "deferred": counts["deferred"]})
+        from . import db  # lazy: db imports queue at module level
+        db.emit_event(conn, g["event"], payload, subscriptions or {})
+    return True
+
+
+def apply_fanout(conn, op: dict, task: dict, subscriptions) -> int:
+    """Apply a fanout.emit staged op inside the step-boundary transaction:
+    create (or reuse) the join group, emit one event per item payload with
+    the reserved _join key injected, and fire immediately if the group is
+    already complete (zero items / zero consumers / all members already
+    terminal via dedup). The group key is deterministic over (task, event
+    names, payloads), so a re-executed attempt reuses the SAME group and the
+    payload-hash dedup absorbs the re-emitted children — a parent re-run
+    never doubles the fan-out."""
+    key = sha256_text(canonical_json(
+        {"task": task["id"], "name": op["name"], "join_event": op["join_event"],
+         "payloads": op["payloads"]}))
+    with ensure_tx(conn):
+        row = conn.execute("SELECT id FROM join_groups WHERE key=?",
+                           (key,)).fetchone()
+        if row is not None:
+            gid = row["id"]
+        else:
+            expect = len(op["payloads"]) * len(subscriptions.get(op["name"], ()))
+            gid = conn.execute(
+                "INSERT INTO join_groups(key, parent_task, event, data, expect_n)"
+                " VALUES (?,?,?,?,?)",
+                (key, task["id"], op["join_event"],
+                 canonical_json(op.get("join_data") or {}), expect)).lastrowid
+        from . import db  # lazy: db imports queue at module level
+        for i, p in enumerate(op["payloads"]):
+            payload = dict(p)
+            payload["_join"] = {"group": gid, "index": i}
+            db.emit_event(conn, op["name"], payload, subscriptions)
+        check_join_fire(conn, gid, subscriptions)
+    return gid

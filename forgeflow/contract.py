@@ -26,7 +26,7 @@ from pathlib import Path
 
 from . import db as dbmod
 from . import queue
-from .util import tx
+from .util import canonical_json, sha256_text, tx
 
 TERMINAL_TASK_STATES = ("done", "failed", "parked", "deferred")
 
@@ -64,6 +64,32 @@ class Workflow:
     dispatch: dict = field(default_factory=dict)  # (step, outcome) -> target
     consumes: list = field(default_factory=list)
     emits: list = field(default_factory=list)
+    _def_hash: str = None                         # def_hash() cache
+
+    def def_hash(self) -> str:
+        """Stable fingerprint of the definition: every field that changes
+        execution (steps, params, context, timeouts, visit caps, resumable,
+        llm/schema bindings, outcome sets, lanes, dispatch, consumes/emits).
+        Tasks are stamped with it when an attempt starts executing; a
+        mid-flight task never replays under a different hash (execute()
+        parks it as definition_changed instead)."""
+        if self._def_hash is None:
+            doc = {
+                "kind": self.kind,
+                "steps": [{
+                    "name": s.name, "block": s.block.name,
+                    "timeout_s": s.timeout_s, "params": s.params,
+                    "context": [[c, spec] for c, spec in s.context],
+                    "max_visits": s.max_visits, "resumable": bool(s.resumable),
+                    "llm": s.llm, "schema": s.schema,
+                    "outcomes": sorted(s.outcomes), "lane": s.lane,
+                } for s in self.steps],
+                "dispatch": sorted([n, o, t] for (n, o), t in self.dispatch.items()),
+                "consumes": list(self.consumes),
+                "emits": list(self.emits),
+            }
+            self._def_hash = sha256_text(canonical_json(doc))
+        return self._def_hash
 
     # -- builder API ---------------------------------------------------
     @classmethod
@@ -86,6 +112,7 @@ class Workflow:
         self.steps.append(Step(name, block, timeout_s, dict(params or {}),
                                tuple(context), max_visits, resumable,
                                llm, schema, eff, lane))
+        self._def_hash = None
         return self
 
     def on(self, step_name: str, outcome: str, target: str) -> "Workflow":
@@ -94,6 +121,7 @@ class Workflow:
         if key in self.dispatch and self.dispatch[key] != target:
             raise WorkflowError("%s: conflicting dispatch for %s" % (self.kind, (key,)))
         self.dispatch[key] = target
+        self._def_hash = None
         return self
 
     # -- startup proof ---------------------------------------------------
@@ -303,6 +331,8 @@ class ExecEnv:
     pack: "object" = None
     lanes: dict = None           # lane name -> BoundedSemaphore (parallel daemon);
                                  # None = no throttling (serial driver / tests).
+    policy: dict = None          # effective retry policy (queue.build_policy with
+                                 # the pack's retry: overrides); None/{} = defaults.
 
 
 # ------------------------------------------------------------ execution
@@ -314,6 +344,33 @@ def execute(env: ExecEnv, workflow: Workflow, task: dict) -> str:
     conn = env.conn
     task_id, attempt = task["id"], task["attempts"]
     by_name = {s.name: s for s in workflow.steps}
+
+    # ---- definition versioning gate ------------------------------------
+    # Each attempt is stamped with the definition hash when it first
+    # executes. Same hash -> resume normally. Different hash while THIS
+    # attempt already has recorded steps -> the YAML changed under a
+    # mid-flight task: never replay old outcomes through a new dispatch
+    # graph — park as definition_changed; unpark/retry starts a FRESH
+    # attempt (no recorded steps) which re-stamps and runs from step 0
+    # under the new definition. A NULL stamp (task predates versioning,
+    # or attempt not started) adopts the current definition.
+    current_hash = workflow.def_hash()
+    if task.get("def_hash") != current_hash:
+        started = conn.execute(
+            "SELECT 1 FROM task_steps WHERE task_id=? AND attempt=? LIMIT 1",
+            (task_id, attempt)).fetchone()
+        if task.get("def_hash") and started:
+            print("contract: task %s [%s] definition_changed: workflow '%s' "
+                  "changed under a mid-flight task (stamped %.12s..., now "
+                  "%.12s...) — parked; unpark/retry re-runs under the new "
+                  "definition" % (task_id, task["kind"], workflow.kind,
+                                  task["def_hash"], current_hash),
+                  file=sys.stderr)
+            queue.park(conn, task_id, reason="definition_changed")
+            return "parked"
+        conn.execute("UPDATE tasks SET def_hash=?, updated_at=datetime('now')"
+                     " WHERE id=?", (current_hash, task_id))
+        task["def_hash"] = current_hash
 
     rows = _load_recorded(conn, task_id, attempt, workflow)
     replayed = set()
@@ -369,7 +426,7 @@ def execute(env: ExecEnv, workflow: Workflow, task: dict) -> str:
                         " AND step=?", (task_id, attempt, current))
                 staged = result.pop("_staged", None)
                 if staged:
-                    result.update(_apply_staged(env, staged))
+                    result.update(_apply_staged(env, staged, task))
                 cur = conn.execute(
                     "INSERT INTO task_steps(task_id, attempt, step, outcome,"
                     " result, wall_ms) VALUES (?,?,?,?,?,?)",
@@ -460,13 +517,16 @@ def _run_block(env, step, task, prev):
     return outcome, result, wall_ms
 
 
-def _apply_staged(env, ops):
+def _apply_staged(env, ops, task):
     """Apply block-staged db effects inside the boundary transaction.
     Returns ids to merge into the persisted step result."""
     out = {}
     for op in ops:
         kind = op.get("op")
-        if kind == "upsert_item":
+        if kind == "fanout":
+            out["join_group"] = queue.apply_fanout(
+                env.conn, op, task, env.subscriptions)
+        elif kind == "upsert_item":
             out["item_id"] = dbmod.upsert_item(
                 env.conn, op["key"], op["title"], op["source"], op["repo"],
                 detail=op.get("detail"), severity=op.get("severity"),
@@ -504,24 +564,28 @@ def _apply_staged(env, ops):
 
 def _apply_terminal(env, task, target, outcome) -> str:
     if target == "done":
-        queue.complete(env.conn, task["id"])
+        queue.complete(env.conn, task["id"], subscriptions=env.subscriptions)
         return "done"
     if target == "deferred":
-        queue.defer(env.conn, task["id"])
+        queue.defer(env.conn, task["id"], subscriptions=env.subscriptions)
         return "deferred"
     if target == "parked":
         queue.park(env.conn, task["id"], reason=outcome)
         return "parked"
-    # 'failed': if the outcome names a known error class, POLICY decides
-    # (retry_wait / park / consume); otherwise it is a plain terminal failure
-    # the workflow author chose.
-    if outcome in queue.POLICY:
-        return queue.fail(env.conn, task["id"], outcome)
-    queue._set_state(env.conn, task["id"], "failed", error_class=outcome)
+    # 'failed': if the outcome names a policy class (engine table or a pack's
+    # retry: section), that class decides (retry_wait / park / consume);
+    # otherwise it is a plain terminal failure the workflow author chose.
+    pol = env.policy or queue.POLICY
+    if outcome in pol:
+        return queue.fail(env.conn, task["id"], outcome, policy=pol,
+                          subscriptions=env.subscriptions)
+    queue._set_state(env.conn, task["id"], "failed", error_class=outcome,
+                     subscriptions=env.subscriptions)
     return "failed"
 
 
 def _fail_loud(env, task, error_class, detail) -> str:
     print("contract: task %s [%s] %s: %s"
           % (task["id"], task["kind"], error_class, detail), file=sys.stderr)
-    return queue.fail(env.conn, task["id"], error_class, detail=detail)
+    return queue.fail(env.conn, task["id"], error_class, detail=detail,
+                      policy=env.policy, subscriptions=env.subscriptions)

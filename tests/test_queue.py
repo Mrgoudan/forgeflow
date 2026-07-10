@@ -148,6 +148,7 @@ class QueueTest(unittest.TestCase):
         self._age(srv, 2000)
         # backend DOWN: forge_server recovers by cadence; agent_limit does not
         stub = SimpleNamespace(conn=self.conn, _agent_online=lambda: False,
+                               policy=None,
                                pack=SimpleNamespace(agent_health_url="env:_x"))
         Engine._unpark_tick(stub)
         self.assertEqual(self._state(srv), "pending")   # non-backend: cadence only

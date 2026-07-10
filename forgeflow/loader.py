@@ -21,7 +21,6 @@ to enqueue consuming tasks. Workflows never call each other.
 """
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import yaml
@@ -29,9 +28,8 @@ import yaml
 from . import blocks as blocks_mod
 from .contract import CONTEXT_PROVIDERS, Workflow, WorkflowError
 from .db import ITEM_STATES
+from .util import EVENT_RE as _EVENT_RE
 from .util import template
-
-_EVENT_RE = re.compile(r"^[a-z0-9_]+(\.[a-z0-9_]+)+$")
 
 _STEP_KEYS = {"name", "block", "timeout_s", "params", "context", "outcomes",
               "max_visits", "resumable", "llm", "schema", "lane"}
@@ -199,6 +197,27 @@ def load_workflow_file(path, pack=None) -> Workflow:
                 if ev not in emits:
                     _die(swhere, "emits event '%s' but 'emits:' does not "
                          "declare it — no undeclared emits" % ev)
+
+        # fanout.emit steps: BOTH the per-item event and the join event are
+        # emits — declared names only, well-formed only; the join spec's
+        # shape is fixed here so a malformed one never reaches runtime.
+        if blk.name == "fanout.emit":
+            join = params.get("join")
+            if not isinstance(join, dict) or "event" not in join:
+                _die(swhere, "fanout.emit needs join: {event: <name>, data?: {...}}")
+            unknown_join = set(join) - {"event", "data"}
+            if unknown_join:
+                _die(swhere, "fanout.emit join: unknown keys %s"
+                     % sorted(unknown_join))
+            if "data" in join and not isinstance(join["data"], dict):
+                _die(swhere, "fanout.emit join.data must be a mapping")
+            for ev in (params.get("name"), join.get("event")):
+                if isinstance(ev, str) and "{" not in ev:
+                    if not _EVENT_RE.match(ev):
+                        _die(swhere, "malformed event name %r" % ev)
+                    if ev not in emits:
+                        _die(swhere, "emits event '%s' but 'emits:' does not "
+                             "declare it — no undeclared emits" % ev)
 
         # db.transition steps: the transition they stage is an EMIT — it
         # must be declared, and the target state must exist.

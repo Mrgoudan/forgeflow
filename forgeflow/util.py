@@ -24,6 +24,11 @@ from pathlib import Path
 
 # ---------------------------------------------------------------- identity
 
+# Event names: dotted lowercase words ('hello.wanted', 'item.triaged').
+# Shared by the loader (consumes/emits) and config (schedule) checks.
+EVENT_RE = re.compile(r"^[a-z0-9_]+(\.[a-z0-9_]+)+$")
+
+
 def canonical_json(obj) -> str:
     """Sorted keys, no whitespace. The canonical form used for hashing."""
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
