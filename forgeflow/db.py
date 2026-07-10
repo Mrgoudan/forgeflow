@@ -222,60 +222,78 @@ CREATE INDEX IF NOT EXISTS idx_items_state ON items(state);
 # (version > user_version) migrations in order. Migrations are for CHANGES the
 # CREATE-IF-NOT-EXISTS base can't make on an existing table (ALTER, backfill).
 # (Pack tables evolve in the pack's own schema.sql.)
+# EVERY migration must be IDEMPOTENT (column/table-guarded): a process can
+# die between executescript(SCHEMA) and the user_version stamp, leaving a
+# db whose tables are already at the latest shape but whose version says
+# otherwise — the next open re-runs the migrations, and re-running must be
+# a no-op, never a duplicate-column error. (Found by the chaos test.)
+
+def _add_column(conn, table, column, decl):
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)}
+    if column not in cols:
+        conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, column, decl))
+
+
+def _mig_v2(conn):
+    """v2 (0.2.0): workflow definition versioning + fan-out/join."""
+    _add_column(conn, "tasks", "def_hash", "TEXT")
+    conn.execute("""CREATE TABLE IF NOT EXISTS join_groups (
+        id            INTEGER PRIMARY KEY,
+        key           TEXT UNIQUE NOT NULL,
+        parent_task   INTEGER REFERENCES tasks(id),
+        event         TEXT NOT NULL,
+        data          TEXT NOT NULL,
+        expect_n      INTEGER NOT NULL,
+        fired_at      TEXT,
+        created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS join_members (
+        group_id      INTEGER NOT NULL REFERENCES join_groups(id),
+        task_id       INTEGER NOT NULL REFERENCES tasks(id),
+        state         TEXT,
+        PRIMARY KEY (group_id, task_id)
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_join_members_task"
+                 " ON join_members(task_id)")
+
+
 def _mig_v3(conn):
-    """v3 (0.3.0): agent run latency + re-ask accounting. Column-guarded so
-    it is safe even against a db whose runs table was (re)created at the
-    latest shape before migrations ran."""
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
-    if "wall_ms" not in cols:
-        conn.execute("ALTER TABLE runs ADD COLUMN wall_ms INTEGER")
-    if "reasks" not in cols:
-        conn.execute("ALTER TABLE runs ADD COLUMN reasks INTEGER")
+    """v3 (0.3.0): agent run latency + re-ask accounting."""
+    _add_column(conn, "runs", "wall_ms", "INTEGER")
+    _add_column(conn, "runs", "reasks", "INTEGER")
 
 
 SCHEMA_VERSION = 3
 MIGRATIONS: list = [
-    # v2 (0.2.0): workflow definition versioning + fan-out/join.
-    (2, """
-ALTER TABLE tasks ADD COLUMN def_hash TEXT;
-CREATE TABLE IF NOT EXISTS join_groups (
-    id            INTEGER PRIMARY KEY,
-    key           TEXT UNIQUE NOT NULL,
-    parent_task   INTEGER REFERENCES tasks(id),
-    event         TEXT NOT NULL,
-    data          TEXT NOT NULL,
-    expect_n      INTEGER NOT NULL,
-    fired_at      TEXT,
-    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE TABLE IF NOT EXISTS join_members (
-    group_id      INTEGER NOT NULL REFERENCES join_groups(id),
-    task_id       INTEGER NOT NULL REFERENCES tasks(id),
-    state         TEXT,
-    PRIMARY KEY (group_id, task_id)
-);
-CREATE INDEX IF NOT EXISTS idx_join_members_task ON join_members(task_id);
-"""),
+    (2, _mig_v2),
     (3, _mig_v3),
-]       # [(version, sql | callable(conn)), ...]
+]       # [(version, callable(conn))] — single statements only (they must
+        #   compose into _migrate's one transaction; executescript commits)
 
 
 def _migrate(conn, fresh):
     """Bring the core schema to SCHEMA_VERSION. A fresh db already has the
     latest SCHEMA, so it is only stamped; an existing older db runs the
-    version-ordered deltas past its user_version."""
+    version-ordered deltas past its user_version — all deltas plus the
+    stamp in ONE transaction, so a crash mid-migration rolls back to a
+    state the next open handles identically."""
     if fresh:
         conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
         return
     have = conn.execute("PRAGMA user_version").fetchone()[0] or 1  # unversioned == v1
-    for version, step in MIGRATIONS:
-        if have < version:
-            if callable(step):
+    if have >= SCHEMA_VERSION:
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for version, step in MIGRATIONS:
+            if have < version:
                 step(conn)
-            else:
-                conn.executescript(step)
-            have = version
-    conn.execute("PRAGMA user_version=%d" % max(have, SCHEMA_VERSION))
+                have = version
+        conn.execute("PRAGMA user_version=%d" % max(have, SCHEMA_VERSION))
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
 
 
 class TransitionError(ValueError):

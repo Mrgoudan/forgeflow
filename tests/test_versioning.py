@@ -179,6 +179,57 @@ class MigrationTest(unittest.TestCase):
         self.assertEqual(run["model"], "m")
         self.assertIsNone(run["wall_ms"])
 
+    def test_crash_between_schema_and_stamp_self_heals(self):
+        """The chaos-test find: a process killed after executescript(SCHEMA)
+        but before the user_version stamp leaves latest-shape tables with
+        version 0. The next open must repair (idempotent migrations), not
+        die on a duplicate-column ALTER."""
+        path = tmpdir() / "crash.db"
+        conn = sqlite3.connect(str(path))
+        conn.executescript(db.SCHEMA)          # tables at the LATEST shape
+        conn.commit()
+        conn.close()                           # ...killed before the stamp
+
+        conn = db.connect(path)                # must not raise
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                         db.SCHEMA_VERSION)
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+        self.assertIn("def_hash", cols)
+        # and it is actually usable
+        from forgeflow import queue
+        tid = queue.enqueue(conn, "k", {"x": 1})
+        self.assertEqual(queue.claim(conn)["id"], tid)
+
+    def test_partial_schema_creation_self_heals(self):
+        """Killed mid-executescript: some tables exist, some don't, no
+        stamp. The next open fills the gaps and migrates the rest."""
+        path = tmpdir() / "partial.db"
+        conn = sqlite3.connect(str(path))
+        # only the tasks table, at the OLD (v1) shape — worst mix
+        conn.executescript("""
+            CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY, kind TEXT NOT NULL, item_id INTEGER,
+                payload TEXT NOT NULL, payload_hash TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0, error_class TEXT,
+                park_reason TEXT, next_attempt TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+        """)
+        conn.commit()
+        conn.close()
+
+        conn = db.connect(path)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0],
+                         db.SCHEMA_VERSION)
+        tables = {r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertLessEqual({"runs", "join_groups", "join_members", "events"},
+                             tables)
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+        self.assertIn("def_hash", cols)
+
 
 if __name__ == "__main__":
     unittest.main()

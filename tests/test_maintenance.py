@@ -135,10 +135,12 @@ class MigrateTest(unittest.TestCase):
         c = sqlite3.connect(str(p)); c.execute("PRAGMA user_version=0"); c.close()
         old_v, old_m = db.SCHEMA_VERSION, db.MIGRATIONS
         try:
-            db.SCHEMA_VERSION = 2
-            db.MIGRATIONS = [(2, "CREATE TABLE mig_marker(x);")]
+            db.SCHEMA_VERSION = 99
+            db.MIGRATIONS = old_m + [
+                (99, lambda c: c.execute(
+                    "CREATE TABLE IF NOT EXISTS mig_marker(x)"))]
             conn = db.connect(p)                     # existing -> migrate
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 99)
             self.assertTrue(conn.execute("SELECT 1 FROM sqlite_master WHERE"
                                          " name='mig_marker'").fetchone())
         finally:

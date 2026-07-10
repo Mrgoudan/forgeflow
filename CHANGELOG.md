@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.1 — 2026-07-11
+
+### Fixed
+- **Init crash window (found by the chaos test in CI)**: a process killed
+  between schema creation and the `user_version` stamp left latest-shape
+  tables with version 0; the next open re-ran the v2 migration and died on
+  a duplicate-column ALTER, bricking the root. Migrations are now
+  idempotent (column/table-guarded callables) and run — with the stamp —
+  in one transaction, so a `kill -9` anywhere during first start
+  self-heals on the next open. Two regression tests pin the exact window.
+
 ## 0.3.0 — 2026-07-11
 
 The LLM-experience release. Schema: v3 (`runs.wall_ms`, `runs.reasks`) —
