@@ -204,13 +204,42 @@ in published production results):
 2,000 distractors, six adversarial categories — and CI asserts the floors.
 Zero-setup (`hashing`): **100% recall@1** on exact-lexical, identifier
 (camelCase↔words), recency, importance, and scoped categories; **paraphrase
-0% @1 / 17% @5** — hashing is lexical, synonyms are invisible to it, and
-that is stated as a contract, not hidden. Plugging a synonym-aware
-embedding model into the *same corpus* (one `embed_with:` line): paraphrase
-**100% @1**, overall **98% @1 / 100% @5**. Latency (pure-stdlib brute
+0%** — hashing is lexical, synonyms are invisible to it, and that is
+stated as a contract, not hidden. Plugging a synonym-aware embedding model
+into the *same corpus* (one `embed_with:` line): paraphrase **100% @1**,
+overall **98% @1 / 100% @5**. Latency (pure-stdlib brute
 force, warm): ~0.04s/query at 1k rows, ~0.19s at 5k, ~0.75s at 20k — the
 practical comfort zone is corpora up to a few tens of thousands of rows;
 use `filter:` to pre-scope large tables.
+
+### From relevant to useful (the construction stage)
+
+Ranking finds what is *similar*; the model needs what is *useful for this
+task*. After fusion, selection runs the construction pipeline the
+coding-agent industry converged on (Copilot's documented flow is exactly
+select → prioritize → filter → assemble):
+
+- **Multi-query fusion** — `query:` accepts a list
+  (`["{payload.title}", "{payload.error}"]`); each query votes per
+  relevance channel at weight/n, so the task's different facets each get
+  a say (the RAG-fusion pattern).
+- **Dedup** — an identical text never occupies two of the k slots; the
+  better-ranked twin wins (with recency/prior channels, that IS the
+  newer/heavier copy). Collapsed count reported as `deduped`.
+- **Diversity (MMR)** — each next pick trades relevance against
+  redundancy with what is already picked (`diversify:` default 0.5 ≈ the
+  classic λ 0.67 relevance-leaning balance; 0 = pure ranked order), so k
+  slots cover the task's ground instead of repeating the top hit five
+  ways.
+- **Budget packing** — `max_bytes:` packs entries in final order and
+  reports `dropped:` — a slot that didn't fit is counted, never silent.
+- **Outcome-learned utility** — the engine records what every task was
+  shown (`context_uses`); a `utility` channel then ranks rows by how
+  often they co-occurred with *done* vs *failed* tasks of the same kind
+  (Laplace-smoothed, neutral for cold rows, abstains without history).
+  This is the acceptance-signal feedback loop production systems use —
+  auto-labelled from the engine's own ledger, no annotation, and preview
+  calls (`llm show`, ad-hoc) never pollute it.
 
 Vectors live in the engine's `corpus_embeddings` table and are maintained
 incrementally at query time: a row is (re)embedded only when new or when

@@ -226,6 +226,23 @@ CREATE TABLE IF NOT EXISTS corpus_embeddings (
 
 
 
+-- What each task was SHOWN from each corpus (written by the select:
+-- provider). Joined against tasks.state at query time, this is the
+-- outcome-learned utility signal: rows that co-occur with done tasks of
+-- the same kind earn rank, rows that co-occur with failures lose it —
+-- auto-labelled from the ledger, no human annotation.
+CREATE TABLE IF NOT EXISTS context_uses (
+    task_id       INTEGER NOT NULL REFERENCES tasks(id),
+    kind          TEXT NOT NULL,         -- task kind (utility is per-kind)
+    corpus        TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    at            TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (task_id, corpus, key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_context_uses_lookup
+    ON context_uses(corpus, kind, key);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_claim
     ON tasks(state, next_attempt) WHERE state IN ('pending','retry_wait');
 CREATE INDEX IF NOT EXISTS idx_items_state ON items(state);
@@ -293,11 +310,26 @@ def _mig_v4(conn):
     )""")
 
 
-SCHEMA_VERSION = 4
+def _mig_v5(conn):
+    """v5 (0.5.0): selection ledger for outcome-learned utility."""
+    conn.execute("""CREATE TABLE IF NOT EXISTS context_uses (
+        task_id       INTEGER NOT NULL REFERENCES tasks(id),
+        kind          TEXT NOT NULL,
+        corpus        TEXT NOT NULL,
+        key           TEXT NOT NULL,
+        at            TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (task_id, corpus, key)
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_context_uses_lookup"
+                 " ON context_uses(corpus, kind, key)")
+
+
+SCHEMA_VERSION = 5
 MIGRATIONS: list = [
     (2, _mig_v2),
     (3, _mig_v3),
     (4, _mig_v4),
+    (5, _mig_v5),
 ]       # [(version, callable(conn))] — idempotent single statements only
         #   (they must compose into _migrate's one transaction)
 

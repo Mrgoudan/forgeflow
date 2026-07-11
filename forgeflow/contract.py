@@ -336,17 +336,18 @@ _ctx_retrieval.check_spec = _check_retrieval_spec
 #   hashing embedder give a strong deterministic core; real embedding
 #   models plug in per corpus when wanted.
 
-SELECT_CHANNELS = ("lexical", "semantic", "recency", "prior", "boost")
+SELECT_CHANNELS = ("lexical", "semantic", "recency", "prior", "boost",
+                   "utility")
 _RRF_K = 60
 
 # Default channel weights: RELEVANCE channels (query/task-conditioned) vote
-# at full strength; PRIORS (recency, importance) modulate at 0.3 — enough
-# to decide among relevance ties (their job), not enough for a fresh-or-
-# important-but-irrelevant row to outvote an actual match (a failure mode
-# the recall evaluation demonstrated at equal weights). Override per step
-# via weights:.
+# at full strength; PRIORS (recency, importance, learned utility) modulate
+# at 0.3 — enough to decide among relevance ties (their job), not enough
+# for a fresh-or-important-but-irrelevant row to outvote an actual match
+# (a failure mode the recall evaluation demonstrated at equal weights).
+# Override per step via weights:.
 SELECT_WEIGHTS = {"lexical": 1.0, "semantic": 1.0, "boost": 1.0,
-                  "recency": 0.3, "prior": 0.3}
+                  "recency": 0.3, "prior": 0.3, "utility": 0.3}
 
 
 def _rank_desc(scored, keys):
@@ -386,9 +387,14 @@ def _ctx_select(env, task, spec):
     corpus_name = spec["corpus"]
     corpus = env.pack.corpora[corpus_name]
     payload_map = {"payload": task.get("payload") or {}}
-    query = _template(spec["query"], payload_map)
+    raw_q = spec["query"]
+    queries = [_template(q, payload_map)
+               for q in (raw_q if isinstance(raw_q, list) else [raw_q])]
     k = int(spec.get("k", 5))
     max_chars = int(spec.get("max_chars", 2000))
+    # MMR redundancy penalty; 0.5 =~ lambda 0.67 in classic MMR terms (the
+    # standard relevance-leaning balance). 0 restores pure ranked order.
+    diversify = float(spec.get("diversify", 0.5))
 
     # ---- candidates: metadata pre-filter pushed into SQL
     table = corpus["table"]
@@ -438,7 +444,9 @@ def _ctx_select(env, task, spec):
             e["channels"] = channels
         return e
 
-    out = {"corpus": corpus_name, "query": query, "considered": len(cands)}
+    out = {"corpus": corpus_name,
+           "query": queries if len(queries) > 1 else queries[0],
+           "considered": len(cands)}
 
     # ---- small corpus: don't rank, include everything (declared opt-in)
     all_under = spec.get("include_all_under")
@@ -446,67 +454,185 @@ def _ctx_select(env, task, spec):
                          for c in cands) <= int(all_under):
         out["included_all"] = True
         out["entries"] = [entry(c) for c in cands]
+        _log_uses(conn, task, corpus_name, [c["key"] for c in cands])
         return out
     out["included_all"] = False
 
-    # ---- channels -> rankings (each may abstain when signal-free)
-    ranks = {}
-    qtok = set(localmodel.split_identifiers(query))
-    ranks["lexical"] = _rank_desc(
-        {c["key"]: float(len(qtok & set(localmodel.split_identifiers(c["text"]))))
-         for c in cands}, keys)
+    # ---- channels -> voters. A channel may abstain when signal-free;
+    # query-conditioned channels vote ONCE PER QUERY (multi-query fusion:
+    # the task's title and its error text each get a say), each vote
+    # carrying weight/nq so a channel's total influence is constant.
+    voters = []                             # (channel, weight_fraction, ranks)
+    weights = dict(SELECT_WEIGHTS)
+    weights.update(spec.get("weights") or {})
+    nq = float(len(queries))
+
+    for q in queries:
+        qtok = set(localmodel.split_identifiers(q))
+        r = _rank_desc(
+            {c["key"]: float(len(qtok
+                                 & set(localmodel.split_identifiers(c["text"]))))
+             for c in cands}, keys)
+        if r is not None:
+            voters.append(("lexical", weights["lexical"] / nq, r))
 
     if corpus.get("embed_with"):
-        qvec, vectors = _corpus_vectors(env, corpus_name, corpus, cands, query)
-        ranks["semantic"] = _rank_desc(
-            {kk: localmodel.cosine(qvec, vec) for kk, vec in vectors.items()},
-            keys)
-    else:
-        ranks["semantic"] = None
+        qvecs, vectors = _corpus_vectors(env, corpus_name, corpus, cands,
+                                         queries)
+        for qvec in qvecs:
+            r = _rank_desc({kk: localmodel.cosine(qvec, vec)
+                            for kk, vec in vectors.items()}, keys)
+            if r is not None:
+                voters.append(("semantic", weights["semantic"] / nq, r))
 
     if corpus.get("ts"):
         norm = _comparable({c["key"]: c["ts"] for c in cands
                             if c["ts"] is not None})
-        ranks["recency"] = _rank_desc(norm, keys) if norm else None
-    else:
-        ranks["recency"] = None
+        r = _rank_desc(norm, keys) if norm else None
+        if r is not None:
+            voters.append(("recency", weights["recency"], r))
 
     if corpus.get("weight"):
-        vals = {c["key"]: c["weight"] for c in cands
+        vals = {c["key"]: float(c["weight"]) for c in cands
                 if isinstance(c["weight"], (int, float))
                 and not isinstance(c["weight"], bool)}
-        ranks["prior"] = _rank_desc({kk: float(v) for kk, v in vals.items()},
-                                    keys) if vals else None
-    else:
-        ranks["prior"] = None
+        r = _rank_desc(vals, keys) if vals else None
+        if r is not None:
+            voters.append(("prior", weights["prior"], r))
 
     if boost_spec:
         want = [_template(boost_spec[col], payload_map)
                 for col in sorted(boost_spec)]
-        ranks["boost"] = _rank_desc(
+        r = _rank_desc(
             {c["key"]: float(sum(1 for got, w in zip(c["boost"], want)
                                  if got is not None and str(got) == str(w)))
              for c in cands}, keys)
-    else:
-        ranks["boost"] = None
+        if r is not None:
+            voters.append(("boost", weights["boost"], r))
 
-    # ---- Reciprocal Rank Fusion over the channels that voted
-    weights = dict(SELECT_WEIGHTS)
-    weights.update(spec.get("weights") or {})
-    fused = {}
-    for kk in keys:
-        s = 0.0
-        for ch in SELECT_CHANNELS:
-            if ranks[ch] is not None and weights[ch] > 0:
-                s += weights[ch] / (_RRF_K + ranks[ch][kk])
-        fused[kk] = s
-    top = sorted(keys, key=lambda kk: (-fused[kk], kk))[:k]
+    r = _utility_ranks(conn, task, corpus_name, keys)
+    if r is not None:
+        voters.append(("utility", weights["utility"], r))
+
+    # ---- Reciprocal Rank Fusion over the voters
+    fused = {kk: sum(w / (_RRF_K + ranks[kk]) for _, w, ranks in voters
+                     if w > 0)
+             for kk in keys}
+
+    # ---- construction: ranked list -> USEFUL set.
+    # 1) dedup: an identical text never occupies two slots — the
+    #    better-ranked twin wins (with the recency/prior channels, that IS
+    #    the newer/heavier one).
+    ordered = sorted(keys, key=lambda kk: (-fused[kk], kk))
+    seen_sha, pool, deduped = set(), [], 0
+    from .util import sha256_text as _sha
+    for kk in ordered:
+        tsha = _sha(by_key[kk]["text"])
+        if tsha in seen_sha:
+            deduped += 1
+            continue
+        seen_sha.add(tsha)
+        pool.append(kk)
+        if len(pool) >= max(50, 4 * k):   # MMR pool cap (cost bound)
+            break
+    out["deduped"] = deduped
+
+    # 2) diversity (MMR): each next pick trades relevance against
+    #    redundancy with what is already picked, so k slots cover the
+    #    task's ground instead of repeating the top hit. diversify=0
+    #    restores pure ranked order.
+    if diversify > 0 and len(pool) > 1 and k > 1:
+        lo = min(fused[kk] for kk in pool)
+        hi = max(fused[kk] for kk in pool)
+        rel = {kk: (fused[kk] - lo) / (hi - lo) if hi > lo else 1.0
+               for kk in pool}
+        dvec = {kk: localmodel.hash_embed(by_key[kk]["text"]) for kk in pool}
+        picked = [pool[0]]
+        remaining = pool[1:]
+        while remaining and len(picked) < k:
+            best = min(remaining, key=lambda kk: (
+                -(rel[kk] - diversify * max(localmodel.cosine(dvec[kk], dvec[p])
+                                            for p in picked)),
+                -fused[kk], kk))
+            picked.append(best)
+            remaining.remove(best)
+        chosen = picked
+    else:
+        chosen = pool[:k]
+
+    # 3) budget: pack in chosen order until max_bytes; dropped is COUNTED,
+    #    never silent.
+    max_bytes = spec.get("max_bytes")
+    final, used, dropped = [], 0, 0
+    for kk in chosen:
+        size = len(by_key[kk]["text"][:max_chars].encode("utf-8", "replace"))
+        if max_bytes is not None and final and used + size > int(max_bytes):
+            dropped += 1
+            continue
+        final.append(kk)
+        used += size
+    out["dropped"] = dropped
+
+    per_channel = {}
+    for ch, _, ranks_d in voters:
+        cur = per_channel.setdefault(ch, {})
+        for kk in final:
+            cur[kk] = min(cur.get(kk, ranks_d[kk]), ranks_d[kk])
     out["entries"] = [
         entry(by_key[kk], fused[kk],
-              {ch: round(ranks[ch][kk], 1) for ch in SELECT_CHANNELS
-               if ranks[ch] is not None})
-        for kk in top]
+              {ch: round(per_channel[ch][kk], 1) for ch in per_channel})
+        for kk in final]
+    _log_uses(conn, task, corpus_name, final)
     return out
+
+
+def _log_uses(conn, task, corpus_name, keys):
+    """Record what this task was SHOWN (the utility ledger). Only real
+    tasks log — previews (llm show, ad-hoc calls) have no tasks row and
+    must not pollute the learned signal."""
+    task_id = task.get("id")
+    if not keys or task_id is None:
+        return
+    row = conn.execute("SELECT kind FROM tasks WHERE id=?",
+                       (task_id,)).fetchone()
+    if row is None:
+        return
+    kind = task.get("kind") or row["kind"]
+    with tx(conn):
+        for kk in keys:
+            conn.execute(
+                "INSERT OR IGNORE INTO context_uses(task_id, kind, corpus, key)"
+                " VALUES (?,?,?,?)", (task_id, kind, corpus_name, kk))
+
+
+def _utility_ranks(conn, task, corpus_name, keys):
+    """Outcome-learned usefulness: rows previously shown to SAME-KIND tasks
+    that reached done earn rank; co-occurrence with failed loses it.
+    Laplace-smoothed ((done+1)/(done+failed+2)); rows with no history sit
+    at the neutral 0.5, so cold rows are neither punished nor promoted.
+    Abstains until history actually differentiates. Auto-labelled from the
+    engine's own ledger — no annotation, ever."""
+    task_id = task.get("id")
+    row = conn.execute("SELECT kind FROM tasks WHERE id=?",
+                       (task_id,)).fetchone() if task_id is not None else None
+    kind = task.get("kind") or (row["kind"] if row else None)
+    if kind is None:
+        return None
+    hist = {}
+    for r in conn.execute(
+            "SELECT u.key,"
+            " sum(CASE WHEN t.state='done' THEN 1 ELSE 0 END) d,"
+            " sum(CASE WHEN t.state='failed' THEN 1 ELSE 0 END) f"
+            " FROM context_uses u JOIN tasks t ON t.id = u.task_id"
+            " WHERE u.corpus=? AND u.kind=? AND u.task_id != ?"
+            "   AND t.state IN ('done','failed')"
+            " GROUP BY u.key", (corpus_name, kind, task_id or -1)):
+        hist[r["key"]] = (r["d"], r["f"])
+    scored = {}
+    for kk in keys:
+        d, f = hist.get(kk, (0, 0))
+        scored[kk] = (d + 1.0) / (d + f + 2.0)
+    return _rank_desc(scored, keys)
 
 
 def _comparable(vals):
@@ -519,10 +645,10 @@ def _comparable(vals):
         return {kk: str(v) for kk, v in vals.items()}
 
 
-def _corpus_vectors(env, corpus_name, corpus, cands, query):
+def _corpus_vectors(env, corpus_name, corpus, cands, queries):
     """Ensure every candidate row has a vector for the corpus's embedder;
     embed only rows that are new or whose text changed (text_sha pin).
-    Returns (query_vector, {key: vector})."""
+    Returns ([query_vector, ...], {key: vector})."""
     from . import localmodel
     from .util import canonical_json, sha256_text
     conn = env.conn
@@ -577,7 +703,7 @@ def _corpus_vectors(env, corpus_name, corpus, cands, query):
                     (corpus_name, c["key"], model_sha, tsha, len(vec),
                      json.dumps(vec)))
                 vectors[c["key"]] = vec
-    return embed_fn(query), vectors
+    return [embed_fn(q) for q in queries], vectors
 
 
 def _check_select_spec(spec, pack):
@@ -585,13 +711,22 @@ def _check_select_spec(spec, pack):
     if not spec.get("corpus") or spec["corpus"] not in corpora:
         return ("select needs 'corpus' naming a pack corpora entry "
                 "(defined: %s)" % (sorted(corpora) or "none"))
-    if not spec.get("query") or not isinstance(spec["query"], str):
-        return "select needs a string 'query'"
-    for f in ("k", "max_chars", "include_all_under"):
+    q = spec.get("query")
+    if isinstance(q, list):
+        if not q or not all(isinstance(x, str) and x for x in q):
+            return "select 'query' list must hold non-empty strings"
+    elif not q or not isinstance(q, str):
+        return "select needs a string 'query' (or a list of them)"
+    for f in ("k", "max_chars", "include_all_under", "max_bytes"):
         v = spec.get(f)
         if v is not None and (isinstance(v, bool) or not isinstance(v, int)
                               or v < 1):
             return "select '%s' must be a positive integer" % f
+    dv = spec.get("diversify")
+    if dv is not None and (isinstance(dv, bool)
+                           or not isinstance(dv, (int, float))
+                           or not (0 <= dv <= 1)):
+        return "select 'diversify' must be a number in 0..1"
     for f in ("filter", "boost"):
         v = spec.get(f)
         if v is not None and (not isinstance(v, dict) or not all(

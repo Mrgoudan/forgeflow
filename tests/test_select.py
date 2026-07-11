@@ -137,8 +137,8 @@ class SelectProviderTest(unittest.TestCase):
             "INSERT OR REPLACE INTO notes_tbl(id, body, created_at, conf, repo)"
             " VALUES (?,?,?,?,?)", (id, body, ts, conf, repo))
 
-    def _select(self, spec, payload=None):
-        task = {"id": 1, "attempts": 0, "payload": payload or {}}
+    def _select(self, spec, payload=None, task_id=1):
+        task = {"id": task_id, "attempts": 0, "payload": payload or {}}
         return SELECT(self.eng.env, task, spec)
 
     def _keys(self, out):
@@ -258,6 +258,99 @@ class SelectProviderTest(unittest.TestCase):
             self._select({"corpus": "notes", "query": "x",
                           "filter": {"ghost": "1"}})
 
+    def test_multi_query_fusion(self):
+        self._row("title_hit", "checker rejects the verdict schema gate")
+        self._row("error_hit", "segmentation violation inside include parser")
+        self._row("noise", "quarterly billing invoice rollup")
+        out = self._select({"corpus": "notes",
+                            "query": ["verdict schema gate rejected",
+                                      "segmentation violation include"],
+                            "k": 2})
+        self.assertEqual(sorted(self._keys(out)), ["error_hit", "title_hit"])
+        # a single query only reaches its own side
+        out1 = self._select({"corpus": "notes",
+                             "query": "verdict schema gate rejected", "k": 1})
+        self.assertEqual(self._keys(out1), ["title_hit"])
+
+    def test_dedup_identical_text_never_takes_two_slots(self):
+        self._row("twin_lo", "parser crash in intake", conf=0.1)
+        self._row("twin_hi", "parser crash in intake", conf=0.9)
+        self._row("other", "parser crash elsewhere entirely", conf=0.5)
+        out = self._select({"corpus": "notes", "query": "parser crash in intake",
+                            "k": 2})
+        keys = self._keys(out)
+        self.assertEqual(out["deduped"], 1)
+        self.assertIn("twin_hi", keys)          # the better twin won its slot
+        self.assertNotIn("twin_lo", keys)
+        self.assertIn("other", keys)            # the freed slot adds coverage
+
+    def test_diversity_admits_complementary_row(self):
+        # a realistic pool: noise below, four near-identical top hits, one
+        # complementary relevant row. Default MMR must spend a slot on the
+        # complement instead of a third copy; diversify: 0 must not.
+        import random
+        rng = random.Random(7)
+        filler = ("table queue batch record service daemon file check "
+                  "task result").split()
+        for i in range(20):
+            self._row("noise%02d" % i,
+                      " ".join(rng.choice(filler) for _ in range(8)))
+        for tag in ("one", "two", "three", "four"):
+            self._row("copy_%s" % tag,
+                      "parser crash in intake stage copy %s" % tag)
+        self._row("complement",
+                  "parser crash with memory heap spike in intake")
+        spec = {"corpus": "notes", "query": "parser crash in intake stage",
+                "k": 3}
+        with_div = self._keys(self._select(spec))          # default 0.5
+        self.assertIn("complement", with_div)
+        without = self._keys(self._select(dict(spec, diversify=0)))
+        self.assertNotIn("complement", without)   # pure rank = three copies
+
+    def test_budget_drops_are_counted(self):
+        self._row("a", "parser crash " + "a" * 120)
+        self._row("b", "parser crash " + "b" * 120)
+        self._row("c", "parser crash " + "c" * 120)
+        out = self._select({"corpus": "notes", "query": "parser crash",
+                            "k": 3, "max_bytes": 150})
+        self.assertEqual(len(out["entries"]), 1)
+        self.assertEqual(out["dropped"], 2)
+
+    def test_utility_learns_from_outcomes(self):
+        """The acceptance-signal loop: a row shown to a task that reached
+        done outranks its equal shown to a task that failed — learned from
+        the ledger alone, no labels."""
+        from forgeflow import queue
+        self._row("good", "approach one for the parser crash")
+        self._row("bad", "approach two for the parser crash")
+        # history: task shown 'good' succeeds, task shown 'bad' fails
+        t1 = queue.enqueue(self.conn, "jobkind", {"n": 1})
+        self._select({"corpus": "notes",
+                      "query": "approach one parser crash", "k": 1},
+                     task_id=t1)
+        queue.complete(self.conn, t1)
+        t2 = queue.enqueue(self.conn, "jobkind", {"n": 2})
+        self._select({"corpus": "notes",
+                      "query": "approach two parser crash", "k": 1},
+                     task_id=t2)
+        queue.fail(self.conn, t2, "workspace_dirty")     # consume -> failed
+        # a fresh same-kind task with a NEUTRAL query: utility decides
+        t3 = queue.enqueue(self.conn, "jobkind", {"n": 3})
+        out = self._select({"corpus": "notes", "query": "parser crash",
+                            "k": 2}, task_id=t3)
+        self.assertEqual(self._keys(out), ["good", "bad"])
+        self.assertIn("utility", out["entries"][0]["channels"])
+        # the ledger recorded what t3 was shown, too
+        n = self.conn.execute("SELECT count(*) FROM context_uses"
+                              " WHERE task_id=?", (t3,)).fetchone()[0]
+        self.assertEqual(n, 2)
+
+    def test_preview_tasks_never_pollute_the_ledger(self):
+        self._row("a", "parser crash")
+        self._select({"corpus": "notes", "query": "parser crash", "k": 1})
+        n = self.conn.execute("SELECT count(*) FROM context_uses").fetchone()[0]
+        self.assertEqual(n, 0)          # task id 1 has no tasks row -> no log
+
     def test_check_spec(self):
         pack = self.eng.pack
         check = contract._check_select_spec
@@ -271,6 +364,14 @@ class SelectProviderTest(unittest.TestCase):
                              "weights": {"ghost": 1}}, pack))
         self.assertIn("mapping", check({"corpus": "notes", "query": "q",
                                         "filter": [1]}, pack))
+        self.assertIsNone(check({"corpus": "notes", "query": ["a", "b"],
+                                 "diversify": 0.5, "max_bytes": 4096}, pack))
+        self.assertIn("non-empty", check({"corpus": "notes", "query": []},
+                                         pack))
+        self.assertIn("0..1", check({"corpus": "notes", "query": "q",
+                                     "diversify": 2}, pack))
+        self.assertIn("positive", check({"corpus": "notes", "query": "q",
+                                         "max_bytes": 0}, pack))
 
 
 if __name__ == "__main__":

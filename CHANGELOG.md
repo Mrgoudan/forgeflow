@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.5.0 — 2026-07-11
+
+From relevant to USEFUL: selection now runs the construction pipeline the
+coding-agent industry converged on (select → prioritize → filter →
+assemble). Schema: v5 (`context_uses`) — existing roots migrate
+automatically.
+
+### Added
+- **Multi-query fusion**: `query:` accepts a list; each query votes per
+  relevance channel at weight/n (RAG-fusion pattern) — the task's title
+  and its error text each get a say.
+- **Dedup**: identical texts never occupy two slots; the better-ranked
+  twin wins; collapsed count reported (`deduped`).
+- **Diversity (MMR)**: `diversify:` (default 0.5 ≈ classic λ 0.67) trades
+  relevance against redundancy so k slots cover the task's ground instead
+  of repeating the top hit; 0 restores pure ranked order.
+- **Budget packing**: `max_bytes:` packs entries in final order;
+  `dropped:` counted, never silent.
+- **Outcome-learned utility channel**: the engine records what each task
+  was shown (`context_uses`); rows co-occurring with `done` tasks of the
+  same kind outrank rows co-occurring with `failed` (Laplace-smoothed,
+  neutral cold start, abstains without history, previews never pollute
+  the ledger). The acceptance-signal loop, auto-labelled from the engine's
+  own audit trail.
+
 ## 0.4.1 — 2026-07-11
 
 ### Fixed (found by the new recall calibration suite)
