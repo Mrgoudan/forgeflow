@@ -161,7 +161,7 @@ def _ctx_select(env, task, spec):
         out["included_all"] = True
         out["entries"] = [entry(c) for c in cands]
         out["funnel"] = {"gathered": len(cands), "packed": len(cands)}
-        if not _previewing(env):
+        if not _previewing(env) and corpus.get("track", True):
             _log_uses(conn, task, corpus_name, [c["key"] for c in cands])
         return out
     out["included_all"] = False
@@ -218,7 +218,8 @@ def _ctx_select(env, task, spec):
         if r is not None:
             voters.append(("boost", weights["boost"], r))
 
-    r = _utility_ranks(conn, task, corpus_name, keys)
+    r = (_utility_ranks(conn, task, corpus_name, keys)
+         if corpus.get("track", True) else None)
     if r is not None:
         voters.append(("utility", weights["utility"], r))
 
@@ -253,15 +254,17 @@ def _ctx_select(env, task, spec):
     # ---- construction: ranked list -> USEFUL set.
     # 1) dedup: an identical text never occupies two slots — the
     #    better-ranked twin wins (with the recency/prior channels, that IS
-    #    the newer/heavier one).
+    #    the newer/heavier one). dedup: false switches it off.
+    dedup_on = spec.get("dedup", True)
     seen_sha, pool, deduped = set(), [], 0
     from .util import sha256_text as _sha
     for kk in ordered:
-        tsha = _sha(by_key[kk]["text"])
-        if tsha in seen_sha:
-            deduped += 1
-            continue
-        seen_sha.add(tsha)
+        if dedup_on:
+            tsha = _sha(by_key[kk]["text"])
+            if tsha in seen_sha:
+                deduped += 1
+                continue
+            seen_sha.add(tsha)
         pool.append(kk)
         if len(pool) >= max(50, 4 * k):   # MMR pool cap (cost bound)
             break
@@ -353,7 +356,7 @@ def _ctx_select(env, task, spec):
                      "deduped": deduped, "pool": len(pool),
                      "chosen": len(chosen), "packed": len(final),
                      "dropped": dropped}
-    if not _previewing(env):
+    if not _previewing(env) and corpus.get("track", True):
         _log_uses(conn, task, corpus_name, final)
     return out
 
@@ -587,6 +590,9 @@ def _check_select_spec(spec, pack):
         if v is not None and (isinstance(v, bool) or not isinstance(v, int)
                               or v < 1):
             return "select '%s' must be a positive integer" % f
+    dd = spec.get("dedup")
+    if dd is not None and not isinstance(dd, bool):
+        return "select 'dedup' must be a boolean"
     dv = spec.get("diversify")
     if dv is not None and (isinstance(dv, bool)
                            or not isinstance(dv, (int, float))

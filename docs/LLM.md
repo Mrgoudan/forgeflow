@@ -321,6 +321,27 @@ its text changed (`text_sha` pin). Startup checks the whole chain: a
 corpus naming a missing table/column, an `embed_with` or `summarize_with`
 that doesn't resolve, refuses to start with the exact field named.
 
+### Every stage has an off switch
+
+The governance rule for the whole selection surface: **each stage is
+individually configurable, nothing is coupled** — and the zero-config path
+always works. The kill-switch table:
+
+| stage | disable / tune |
+|---|---|
+| candidate scoping | omit `filter:` (whole corpus considered) |
+| lexical / semantic / recency / prior / boost / utility channel | `weights: {channel: 0}` (or omit the corpus column / `embed_with`) |
+| multi-query | pass one string instead of a list |
+| dedup | `dedup: false` |
+| diversity (MMR) | `diversify: 0` |
+| LLM rerank | omit `rerank:` |
+| summaries | omit `summarize_with` on the corpus |
+| per-entry size | `max_chars:` (default 2000) |
+| section byte budget | omit `max_bytes:` |
+| total context budget | omit `max_context_bytes` |
+| ranking itself | `include_all_under:` (small corpus goes in whole) |
+| selection-history recording | `track: false` on the corpus — no `context_uses` writes, utility abstains (data governance: usage of that table is never recorded) |
+
 ### The payload, reviewable
 
 Every agent run writes a **context manifest** beside its archived

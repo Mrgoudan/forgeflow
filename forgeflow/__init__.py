@@ -8,4 +8,4 @@ from __future__ import annotations
 # The ONE version definition: pyproject.toml reads it via
 # [tool.setuptools.dynamic], the CLI serves it via --version, and a test
 # guards that no second copy reappears. Bump here, nowhere else.
-__version__ = "0.7.0"
+__version__ = "0.7.1"

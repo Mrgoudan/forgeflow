@@ -295,7 +295,7 @@ def load_pack(pack_dir) -> Pack:
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CORPUS_KEYS = {"table", "text", "key", "ts", "weight", "embed_with",
-                "summarize_with"}
+                "summarize_with", "track"}
 
 
 def _parse_corpora(entries, models, agents, _fail) -> dict:
@@ -334,6 +334,11 @@ def _parse_corpora(entries, models, agents, _fail) -> dict:
         if ew is not None and ew != "hashing" and ew not in models:
             _fail("%s: embed_with '%s' is neither 'hashing' nor a models: "
                   "entry (defined: %s)" % (where, ew, sorted(models) or "none"))
+        tr = spec.get("track")
+        if tr is not None and not isinstance(tr, bool):
+            _fail("%s: 'track' must be a boolean (false = never record "
+                  "selection history for this corpus; utility abstains)"
+                  % where)
         sw = spec.get("summarize_with")
         if sw is not None and sw not in agents:
             _fail("%s: summarize_with '%s' is not an agents: role "

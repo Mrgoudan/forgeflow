@@ -346,11 +346,44 @@ class SelectProviderTest(unittest.TestCase):
                               " WHERE task_id=?", (t3,)).fetchone()[0]
         self.assertEqual(n, 2)
 
+    def test_track_false_disables_the_ledger_and_utility(self):
+        """Data governance: a corpus with track: false never records what
+        tasks were shown, and the utility channel abstains."""
+        from forgeflow import queue
+        base = tmpdir()
+        repo = make_target_repo(base)
+        pack_dir = make_pack(base, repo, extra=CORPUS_YAML.replace(
+            "    embed_with: hashing\n",
+            "    embed_with: hashing\n    track: false\n"))
+        (pack_dir / "schema.sql").write_text(CORPUS_SQL)
+        eng = make_engine(base, pack_dir=pack_dir)
+        eng.conn.execute(
+            "INSERT INTO notes_tbl(id, body, created_at, conf, repo)"
+            " VALUES ('a','parser crash','2026-01-01',0.5,'alpha')")
+        tid = queue.enqueue(eng.conn, "jobkind", {"n": 1})   # a REAL task
+        out = SELECT(eng.env, {"id": tid, "attempts": 0, "payload": {}},
+                     {"corpus": "notes", "query": "parser crash", "k": 1})
+        self.assertEqual(len(out["entries"]), 1)
+        self.assertNotIn("utility", out["entries"][0]["channels"])
+        self.assertEqual(eng.conn.execute(
+            "SELECT count(*) FROM context_uses").fetchone()[0], 0)
+
     def test_preview_tasks_never_pollute_the_ledger(self):
         self._row("a", "parser crash")
         self._select({"corpus": "notes", "query": "parser crash", "k": 1})
         n = self.conn.execute("SELECT count(*) FROM context_uses").fetchone()[0]
         self.assertEqual(n, 0)          # task id 1 has no tasks row -> no log
+
+    def test_dedup_has_an_off_switch(self):
+        self._row("twin_a", "parser crash in intake", conf=0.1)
+        self._row("twin_b", "parser crash in intake", conf=0.9)
+        spec = {"corpus": "notes", "query": "parser crash in intake", "k": 2}
+        self.assertEqual(len(self._keys(self._select(spec))), 1)   # default on
+        out = self._select(dict(spec, dedup=False))
+        self.assertEqual(sorted(self._keys(out)), ["twin_a", "twin_b"])
+        self.assertEqual(out["deduped"], 0)
+        self.assertIn("boolean", select_mod._check_select_spec(
+            {"corpus": "notes", "query": "q", "dedup": 1}, self.eng.pack))
 
     def test_funnel_telemetry(self):
         """Every selection reports the cascade as numbers — where a

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.7.1 — 2026-07-11
+
+Individually configurable, verified. Two stages lacked an off switch:
+
+### Added
+- `dedup: false` on a select step (identical texts may then occupy
+  multiple slots; default stays on).
+- `track: false` on a corpus — selection history is never recorded for
+  that table (`context_uses` untouched, utility channel abstains): the
+  data-governance switch.
+- docs/LLM.md: the kill-switch table — every selection stage and how to
+  disable or tune it independently.
+
 ## 0.7.0 — 2026-07-11
 
 Payload assembly, governed and reviewable. No schema change.
