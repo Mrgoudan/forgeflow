@@ -5,4 +5,7 @@ processes (whatever they are) live in packs: YAML workflows + plugin blocks.
 """
 from __future__ import annotations
 
-__version__ = "0.1.0"
+# The ONE version definition: pyproject.toml reads it via
+# [tool.setuptools.dynamic], the CLI serves it via --version, and a test
+# guards that no second copy reappears. Bump here, nowhere else.
+__version__ = "0.5.0"

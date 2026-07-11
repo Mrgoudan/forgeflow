@@ -484,7 +484,10 @@ def cmd_doctor(args):
 
 
 def main(argv=None):
+    from . import __version__
     p = argparse.ArgumentParser(prog="forgeflow", description=__doc__.split("\n")[0])
+    p.add_argument("--version", action="version",
+                   version="forgeflow %s" % __version__)
     p.add_argument("--root", default=".",
                    help="state root (holds state/, data/, workspaces/)")
     p.add_argument("--pack", default=None, help="pack directory (project.yaml)")
