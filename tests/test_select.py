@@ -351,6 +351,29 @@ class SelectProviderTest(unittest.TestCase):
         n = self.conn.execute("SELECT count(*) FROM context_uses").fetchone()[0]
         self.assertEqual(n, 0)          # task id 1 has no tasks row -> no log
 
+    def test_funnel_telemetry(self):
+        """Every selection reports the cascade as numbers — where a
+        candidate died is a lookup, not guesswork."""
+        self._row("twin_a", "parser crash in intake", conf=0.1)
+        self._row("twin_b", "parser crash in intake", conf=0.9)
+        self._row("c", "parser crash " + "c" * 200)
+        self._row("d", "unrelated billing rollup")
+        out = self._select({"corpus": "notes", "query": "parser crash",
+                            "k": 3, "max_bytes": 250, "max_chars": 220})
+        f = out["funnel"]
+        self.assertEqual(f["gathered"], 4)
+        self.assertEqual(f["deduped"], 1)          # twin collapsed
+        self.assertEqual(f["pool"], 3)
+        self.assertEqual(f["reranked"], 0)         # no judge configured
+        self.assertEqual(f["chosen"], 3)
+        self.assertEqual(f["packed"], len(out["entries"]))
+        self.assertEqual(f["dropped"], out["dropped"])
+        self.assertEqual(f["chosen"], f["packed"] + f["dropped"])
+        # include_all path reports its (shorter) funnel too
+        out2 = self._select({"corpus": "notes", "query": "x",
+                             "include_all_under": 10 ** 6, "k": 1})
+        self.assertEqual(out2["funnel"], {"gathered": 4, "packed": 4})
+
     def test_check_spec(self):
         pack = self.eng.pack
         check = contract._check_select_spec

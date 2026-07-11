@@ -151,6 +151,22 @@ context:
       boost:  { component: "{payload.component}" }   # soft: same-component rows rise
 ```
 
+Selection is a **recommender-system cascade** — the industry's
+compute-inversely-to-candidate-count funnel, stage for stage:
+
+| cascade stage | forgeflow | cost |
+|---|---|---|
+| candidate generation | `filter:` — SQL metadata pre-scope | free |
+| coarse ranking | channel voters + RRF over the FULL pool | cheap arithmetic |
+| fine ranking | `rerank:` — local LLM judge on the top window | one bounded call |
+| re-ranking / business layer | dedup → MMR diversity → `max_bytes` packing | cheap |
+| feedback loop | `utility` — shown-to-done vs shown-to-failed, auto-labelled | free |
+
+Every response carries the funnel as numbers
+(`funnel: {gathered, reranked, deduped, pool, chosen, packed, dropped}`),
+so "where did the right row die — the filter, the window, or the budget?"
+is a lookup, not guesswork.
+
 How ranking works — and why it is built this way (each choice is grounded
 in published production results):
 

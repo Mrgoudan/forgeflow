@@ -471,6 +471,7 @@ def _ctx_select(env, task, spec):
                          for c in cands) <= int(all_under):
         out["included_all"] = True
         out["entries"] = [entry(c) for c in cands]
+        out["funnel"] = {"gathered": len(cands), "packed": len(cands)}
         _log_uses(conn, task, corpus_name, [c["key"] for c in cands])
         return out
     out["included_all"] = False
@@ -652,6 +653,15 @@ def _ctx_select(env, task, spec):
             e["rerank"] = rr_scores[kk]
         entries.append(e)
     out["entries"] = entries
+    # the cascade, as numbers: where candidates died is a lookup, not
+    # guesswork (gathered = SQL filter; reranked = judge window, 0 = judge
+    # skipped/failed; pool = post-dedup MMR pool; chosen = post-MMR/k;
+    # packed = post-budget).
+    out["funnel"] = {"gathered": len(cands),
+                     "reranked": len(window) if out.get("reranked") else 0,
+                     "deduped": deduped, "pool": len(pool),
+                     "chosen": len(chosen), "packed": len(final),
+                     "dropped": dropped}
     _log_uses(conn, task, corpus_name, final)
     return out
 
