@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.6.0 — 2026-07-11
+
+A local model in the selection loop (the Anthropic-cookbook patterns:
+summary-indexed retrieval, contextual enrichment, rerank). Schema: v6
+(`corpus_summaries`) — existing roots migrate automatically.
+
+### Added
+- **`summarize_with:` on a corpus** — an agents: role (typically a local
+  Ollama/llama.cpp model) condenses rows longer than the step's
+  `max_chars` instead of blind truncation (`summarized: true`); cached by
+  `text_sha`, generated lazily for selected rows only, and fed into the
+  lexical channel so long rows stay findable. Engine-supplied contract —
+  no pack prompt needed.
+- **`rerank: {llm, window?, timeout_s?}` on a select step** — a bounded
+  judge call scores the top window for usefulness-to-this-task and
+  reorders it before dedup/MMR/budget; per-entry scores ride in the
+  output. Falls back to fused order on any failure (`reranked: false` +
+  `rerank_error`), never fails the step.
+- Both paths run through `run_agent`: pinned, archived, visible in
+  `llm runs`/`metrics`. Previews (`llm show`) never trigger model calls.
+
 ## 0.5.0 — 2026-07-11
 
 From relevant to USEFUL: selection now runs the construction pipeline the

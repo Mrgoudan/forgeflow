@@ -226,6 +226,20 @@ CREATE TABLE IF NOT EXISTS corpus_embeddings (
 
 
 
+-- Model-written condensations of long corpus rows (corpus summarize_with:).
+-- Cached by text_sha: a row is summarized once per binding until its text
+-- changes. Summaries REPLACE blind truncation at injection and feed the
+-- lexical match, so long rows stay findable. Claims, never decisions.
+CREATE TABLE IF NOT EXISTS corpus_summaries (
+    corpus        TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    binding       TEXT NOT NULL,         -- the agent role that wrote it
+    text_sha      TEXT NOT NULL,         -- staleness pin on the source text
+    summary       TEXT NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (corpus, key, binding)
+);
+
 -- What each task was SHOWN from each corpus (written by the select:
 -- provider). Joined against tasks.state at query time, this is the
 -- outcome-learned utility signal: rows that co-occur with done tasks of
@@ -324,12 +338,26 @@ def _mig_v5(conn):
                  " ON context_uses(corpus, kind, key)")
 
 
-SCHEMA_VERSION = 5
+def _mig_v6(conn):
+    """v6 (0.6.0): cached model-written summaries of long corpus rows."""
+    conn.execute("""CREATE TABLE IF NOT EXISTS corpus_summaries (
+        corpus        TEXT NOT NULL,
+        key           TEXT NOT NULL,
+        binding       TEXT NOT NULL,
+        text_sha      TEXT NOT NULL,
+        summary       TEXT NOT NULL,
+        created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (corpus, key, binding)
+    )""")
+
+
+SCHEMA_VERSION = 6
 MIGRATIONS: list = [
     (2, _mig_v2),
     (3, _mig_v3),
     (4, _mig_v4),
     (5, _mig_v5),
+    (6, _mig_v6),
 ]       # [(version, callable(conn))] — idempotent single statements only
         #   (they must compose into _migrate's one transaction)
 

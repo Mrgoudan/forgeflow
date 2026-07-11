@@ -270,7 +270,7 @@ def load_pack(pack_dir) -> Pack:
 
     schedule = _parse_schedule(doc.get("schedule"), _fail)
     http = _parse_http(doc.get("http"), _fail)
-    corpora = _parse_corpora(doc.get("corpora"), models, _fail)
+    corpora = _parse_corpora(doc.get("corpora"), models, agents, _fail)
 
     workspace_root = doc.get("workspace_root")
     if workspace_root:
@@ -294,15 +294,18 @@ def load_pack(pack_dir) -> Pack:
 
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_CORPUS_KEYS = {"table", "text", "key", "ts", "weight", "embed_with"}
+_CORPUS_KEYS = {"table", "text", "key", "ts", "weight", "embed_with",
+                "summarize_with"}
 
 
-def _parse_corpora(entries, models, _fail) -> dict:
-    """corpora: {name: {table, text, key?, ts?, weight?, embed_with?}}.
-    table/columns are SQL identifiers (validated as such — they are later
-    quoted into statements); embed_with is 'hashing' or a models: entry.
-    Existence of the table/columns is checked at engine start, after the
-    pack's own schema files have been applied."""
+def _parse_corpora(entries, models, agents, _fail) -> dict:
+    """corpora: {name: {table, text, key?, ts?, weight?, embed_with?,
+    summarize_with?}}. table/columns are SQL identifiers (validated as
+    such — they are later quoted into statements); embed_with is 'hashing'
+    or a models: entry; summarize_with is an agents: role (typically a
+    local model) that condenses long rows. Existence of the table/columns
+    is checked at engine start, after the pack's own schema files have
+    been applied."""
     if entries is None:
         return {}
     if not isinstance(entries, dict):
@@ -331,6 +334,10 @@ def _parse_corpora(entries, models, _fail) -> dict:
         if ew is not None and ew != "hashing" and ew not in models:
             _fail("%s: embed_with '%s' is neither 'hashing' nor a models: "
                   "entry (defined: %s)" % (where, ew, sorted(models) or "none"))
+        sw = spec.get("summarize_with")
+        if sw is not None and sw not in agents:
+            _fail("%s: summarize_with '%s' is not an agents: role "
+                  "(defined: %s)" % (where, sw, sorted(agents) or "none"))
         out[name] = dict(spec)
     return out
 

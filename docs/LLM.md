@@ -241,11 +241,65 @@ select → prioritize → filter → assemble):
   auto-labelled from the engine's own ledger, no annotation, and preview
   calls (`llm show`, ad-hoc) never pollute it.
 
+### A local model in the loop (summaries + rerank)
+
+The heavier retrieval patterns from Anthropic's cookbooks — summary-indexed
+retrieval (`capabilities/retrieval_augmented_generation`), contextual
+enrichment at index time (`capabilities/contextual-embeddings`), and a
+rerank stage (measured there at a 67% cut in retrieval failures) — all
+need a model in the indexing loop. In forgeflow that model can be a LOCAL
+one: point an agents: role at Ollama/llama.cpp/vLLM and rows never leave
+the machine. (This is the smart-dispatch shape: a cheap local model for
+the frequent mechanical calls; your strong model only for the real work.)
+
+```yaml
+agents:
+  cheap: { backend: openai-compat, base_url: "http://127.0.0.1:11434/v1",
+           model: qwen3, params: { temperature: 0 } }
+corpora:
+  incidents:
+    table: incidents
+    text: body
+    embed_with: hashing
+    summarize_with: cheap        # long rows get condensed, not chopped
+```
+
+```yaml
+- select:
+    corpus: incidents
+    query: "{payload.error}"
+    k: 5
+    rerank: { llm: cheap, window: 20 }   # local judge scores usefulness
+```
+
+- **`summarize_with`** — a row longer than the step's `max_chars` is
+  condensed by the binding instead of blindly truncated (entries carry
+  `summarized: true`). Summaries are cached by `text_sha` (one call per
+  row per text version, generated lazily for selected rows only) and feed
+  the lexical channel, so a 40KB log stays *findable* by its content.
+  No pack prompt needed — the engine supplies the contract.
+- **`rerank`** — the top `window` candidates go to the binding with the
+  task payload; integer usefulness scores reorder the window before
+  dedup/MMR/budget. Per-entry scores ride in the output (`rerank: 7`).
+- **Both degrade, never break**: any failure (endpoint down, timeout,
+  contract fumbled) logs loudly, sets `reranked: false` / falls back to
+  truncation, and the step proceeds — reduced yield, never reduced
+  integrity. Both run through `run_agent`, so every call is pinned,
+  archived under `data/runs/`, and visible in `llm runs`/`metrics` like
+  any agent step. Preview calls (`llm show`, ad-hoc) never trigger model
+  calls or write the caches.
+
+Determinism note: cached summaries are stable (pinned by `text_sha`), so
+selection stays reproducible once written; a rerank is a fresh model call
+per execution and is therefore the one deliberately non-deterministic
+stage — use it where usefulness matters more than replayable ordering,
+and leave it off for corpora where determinism is the point.
+
 Vectors live in the engine's `corpus_embeddings` table and are maintained
 incrementally at query time: a row is (re)embedded only when new or when
 its text changed (`text_sha` pin). Startup checks the whole chain: a
-corpus naming a missing table/column, or an `embed_with` that doesn't
-resolve, refuses to start with the exact field named.
+corpus naming a missing table/column, an `embed_with` or `summarize_with`
+that doesn't resolve, refuses to start with the exact field named.
 
 ## Operating it
 

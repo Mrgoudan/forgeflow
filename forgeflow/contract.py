@@ -435,6 +435,23 @@ def _ctx_select(env, task, spec):
     keys = [c["key"] for c in cands]
     by_key = {c["key"]: c for c in cands}
 
+    # cached model-written summaries (corpus summarize_with:) — they feed
+    # the lexical match (long rows stay findable) and replace blind
+    # truncation at injection. Only summaries whose text_sha still matches
+    # the row count; stale ones are ignored (and rewritten on selection).
+    summaries = {}
+    sum_binding = corpus.get("summarize_with")
+    if sum_binding and keys:
+        from .util import sha256_text as _sha_t
+        ph = ",".join("?" * len(keys))
+        for r in conn.execute(
+                "SELECT key, text_sha, summary FROM corpus_summaries"
+                " WHERE corpus=? AND binding=? AND key IN (%s)" % ph,
+                [corpus_name, sum_binding] + keys):
+            if r["key"] in by_key and \
+                    r["text_sha"] == _sha_t(by_key[r["key"]]["text"]):
+                summaries[r["key"]] = r["summary"]
+
     def entry(c, score=None, channels=None):
         e = {"key": c["key"], "text": c["text"][:max_chars]}
         if len(c["text"]) > max_chars:
@@ -470,8 +487,8 @@ def _ctx_select(env, task, spec):
     for q in queries:
         qtok = set(localmodel.split_identifiers(q))
         r = _rank_desc(
-            {c["key"]: float(len(qtok
-                                 & set(localmodel.split_identifiers(c["text"]))))
+            {c["key"]: float(len(qtok & set(localmodel.split_identifiers(
+                c["text"] + " " + summaries.get(c["key"], "")))))
              for c in cands}, keys)
         if r is not None:
             voters.append(("lexical", weights["lexical"] / nq, r))
@@ -519,11 +536,33 @@ def _ctx_select(env, task, spec):
                      if w > 0)
              for kk in keys}
 
+    # ---- optional LLM rerank of the top window (a local judge scoring
+    # usefulness-to-THIS-task; the cookbook-verified stage). Failure of
+    # any kind falls back to the fused order — the model may reduce yield,
+    # never integrity. Preview tasks (no tasks row) skip it.
+    ordered = sorted(keys, key=lambda kk: (-fused[kk], kk))
+    rr = spec.get("rerank")
+    rr_scores = {}
+    if rr:
+        out["reranked"] = False
+        if _task_row(conn, task) is not None:
+            window = ordered[:int(rr.get("window", max(20, 2 * k)))]
+            try:
+                rr_scores = _rerank_scores(env, task, rr, window, by_key,
+                                           summaries)
+                window.sort(key=lambda kk: (-rr_scores.get(kk, -1),
+                                            -fused[kk], kk))
+                ordered = window + ordered[len(window):]
+                out["reranked"] = True
+            except Exception as e:
+                out["rerank_error"] = "%s: %s" % (type(e).__name__, e)
+                print("select: rerank via '%s' failed (%s) — using fused "
+                      "order" % (rr.get("llm"), e), file=sys.stderr)
+
     # ---- construction: ranked list -> USEFUL set.
     # 1) dedup: an identical text never occupies two slots — the
     #    better-ranked twin wins (with the recency/prior channels, that IS
     #    the newer/heavier one).
-    ordered = sorted(keys, key=lambda kk: (-fused[kk], kk))
     seen_sha, pool, deduped = set(), [], 0
     from .util import sha256_text as _sha
     for kk in ordered:
@@ -560,12 +599,34 @@ def _ctx_select(env, task, spec):
     else:
         chosen = pool[:k]
 
-    # 3) budget: pack in chosen order until max_bytes; dropped is COUNTED,
+    # 3) injection text: a row longer than max_chars gets a model-written
+    #    SUMMARY when the corpus declares summarize_with (cached by
+    #    text_sha; generated lazily here — at most the k chosen rows per
+    #    call, each bounded). No binding, or generation fails -> plain
+    #    truncation with the explicit flag, as before.
+    display = {}
+    for kk in chosen:
+        text = by_key[kk]["text"]
+        if len(text) <= max_chars:
+            display[kk] = (text, None)
+            continue
+        s = summaries.get(kk)
+        if s is None and sum_binding and _task_row(conn, task) is not None:
+            s = _gen_summary(env, task, corpus_name, sum_binding, kk, text,
+                             max_chars)
+            if s is not None:
+                summaries[kk] = s
+        if s is not None:
+            display[kk] = (s[:max_chars], "summarized")
+        else:
+            display[kk] = (text[:max_chars], "truncated")
+
+    # 4) budget: pack in chosen order until max_bytes; dropped is COUNTED,
     #    never silent.
     max_bytes = spec.get("max_bytes")
     final, used, dropped = [], 0, 0
     for kk in chosen:
-        size = len(by_key[kk]["text"][:max_chars].encode("utf-8", "replace"))
+        size = len(display[kk][0].encode("utf-8", "replace"))
         if max_bytes is not None and final and used + size > int(max_bytes):
             dropped += 1
             continue
@@ -578,23 +639,37 @@ def _ctx_select(env, task, spec):
         cur = per_channel.setdefault(ch, {})
         for kk in final:
             cur[kk] = min(cur.get(kk, ranks_d[kk]), ranks_d[kk])
-    out["entries"] = [
-        entry(by_key[kk], fused[kk],
-              {ch: round(per_channel[ch][kk], 1) for ch in per_channel})
-        for kk in final]
+    entries = []
+    for kk in final:
+        text, mode = display[kk]
+        e = {"key": kk, "text": text,
+             "score": round(fused[kk], 6),
+             "channels": {ch: round(per_channel[ch][kk], 1)
+                          for ch in per_channel}}
+        if mode:
+            e[mode] = True
+        if kk in rr_scores:
+            e["rerank"] = rr_scores[kk]
+        entries.append(e)
+    out["entries"] = entries
     _log_uses(conn, task, corpus_name, final)
     return out
 
 
-def _log_uses(conn, task, corpus_name, keys):
-    """Record what this task was SHOWN (the utility ledger). Only real
-    tasks log — previews (llm show, ad-hoc calls) have no tasks row and
-    must not pollute the learned signal."""
+def _task_row(conn, task):
+    """The tasks row behind this task dict, or None for PREVIEW tasks
+    (llm show, ad-hoc calls) — previews never log to the utility ledger,
+    never trigger model calls, never pin runs rows."""
     task_id = task.get("id")
-    if not keys or task_id is None:
-        return
-    row = conn.execute("SELECT kind FROM tasks WHERE id=?",
-                       (task_id,)).fetchone()
+    if task_id is None:
+        return None
+    return conn.execute("SELECT id, kind FROM tasks WHERE id=?",
+                        (task_id,)).fetchone()
+
+
+def _log_uses(conn, task, corpus_name, keys):
+    """Record what this task was SHOWN (the utility ledger)."""
+    row = _task_row(conn, task) if keys else None
     if row is None:
         return
     kind = task.get("kind") or row["kind"]
@@ -602,7 +677,80 @@ def _log_uses(conn, task, corpus_name, keys):
         for kk in keys:
             conn.execute(
                 "INSERT OR IGNORE INTO context_uses(task_id, kind, corpus, key)"
-                " VALUES (?,?,?,?)", (task_id, kind, corpus_name, kk))
+                " VALUES (?,?,?,?)", (task["id"], kind, corpus_name, kk))
+
+
+_RERANK_PROMPT = (
+    "You are ranking knowledge-base entries by how USEFUL they are for the "
+    "task below. Score every entry key from 0 (useless) to 10 (essential). "
+    "Judge usefulness for THIS task, not general quality.")
+
+_RERANK_SCHEMA = {"type": "object", "required": ["scores"],
+                  "properties": {"scores": {"type": "object"}},
+                  "additionalProperties": False}
+
+
+def _rerank_scores(env, task, rr, window, by_key, summaries):
+    """One bounded call to the rerank binding (typically a local model):
+    the task payload + the window's entries in, integer scores out. Runs
+    through run_agent, so it is pinned, archived, and visible in
+    `llm runs` like any agent call. Raises on any failure — the caller
+    falls back to the fused order."""
+    from . import runner
+    binding = env.pack.agents[rr["llm"]]
+    entries = [{"key": kk,
+                "text": (summaries.get(kk) or by_key[kk]["text"])[:400]}
+               for kk in window]
+    verdict = runner.run_agent(
+        env.conn, task, binding, _RERANK_PROMPT, _RERANK_SCHEMA,
+        data_dir=env.data_dir, pack_rev=env.pack.rev,
+        timeout_s=int(rr.get("timeout_s", 60)),
+        context_slice={"task": task.get("payload") or {},
+                       "entries": entries})
+    scores = {}
+    for kk, v in (verdict.get("scores") or {}).items():
+        if kk in by_key and isinstance(v, (int, float)) \
+                and not isinstance(v, bool):
+            scores[kk] = max(0, min(10, int(v)))
+    return scores
+
+
+_SUMMARIZE_PROMPT = (
+    "Condense the RECORD below. Preserve identifiers, error strings, "
+    "numbers, paths, and decisions verbatim where possible; drop "
+    "boilerplate. Stay under the character limit given in the context.")
+
+_SUMMARIZE_SCHEMA = {"type": "object", "required": ["summary"],
+                     "properties": {"summary": {"type": "string"}},
+                     "additionalProperties": False}
+
+
+def _gen_summary(env, task, corpus_name, sum_binding, key, text, max_chars):
+    """Summarize one long row via the corpus's binding and cache it by
+    text_sha. Returns the summary, or None on any failure (the caller
+    truncates instead — reduced yield, never a failed step)."""
+    from . import runner
+    from .util import sha256_text
+    try:
+        verdict = runner.run_agent(
+            env.conn, task, env.pack.agents[sum_binding],
+            _SUMMARIZE_PROMPT, _SUMMARIZE_SCHEMA,
+            data_dir=env.data_dir, pack_rev=env.pack.rev, timeout_s=60,
+            context_slice={"record": text, "limit_chars": max_chars})
+        summary = verdict.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            return None
+    except Exception as e:
+        print("select: summarize via '%s' failed for %s/%s (%s) — "
+              "truncating" % (sum_binding, corpus_name, key, e),
+              file=sys.stderr)
+        return None
+    with tx(env.conn):
+        env.conn.execute(
+            "INSERT OR REPLACE INTO corpus_summaries"
+            " (corpus, key, binding, text_sha, summary) VALUES (?,?,?,?,?)",
+            (corpus_name, key, sum_binding, sha256_text(text), summary))
+    return summary
 
 
 def _utility_ranks(conn, task, corpus_name, keys):
@@ -727,6 +875,22 @@ def _check_select_spec(spec, pack):
                            or not isinstance(dv, (int, float))
                            or not (0 <= dv <= 1)):
         return "select 'diversify' must be a number in 0..1"
+    rr = spec.get("rerank")
+    if rr is not None:
+        if not isinstance(rr, dict):
+            return "select 'rerank' must be a mapping {llm, window?, timeout_s?}"
+        unknown = set(rr) - {"llm", "window", "timeout_s"}
+        if unknown:
+            return "select rerank: unknown keys %s" % sorted(unknown)
+        agents = getattr(pack, "agents", None) or {}
+        if not rr.get("llm") or rr["llm"] not in agents:
+            return ("select rerank needs 'llm' naming an agents: role "
+                    "(defined: %s)" % (sorted(agents) or "none"))
+        for f in ("window", "timeout_s"):
+            v = rr.get(f)
+            if v is not None and (isinstance(v, bool) or not isinstance(v, int)
+                                  or v < 1):
+                return "select rerank '%s' must be a positive integer" % f
     for f in ("filter", "boost"):
         v = spec.get(f)
         if v is not None and (not isinstance(v, dict) or not all(
