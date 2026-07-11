@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.3 — 2026-07-12
+
+### Fixed
+- **JSON-mode endpoint compatibility** (found driving a local qwen2.5-coder
+  via Ollama): `extract_verdict` now accepts a raw-JSON response body, not
+  only a ```json fenced block. Models run with
+  `response_format: {type: json_object}` return bare JSON — the reliable
+  way to get structured output from small local models — which previously
+  failed as `agent_invalid`. Fenced blocks still win when present (agentic
+  CLIs narrate around them); a bare ``` wrapper is also tolerated.
+
+
 ## 0.7.1 — 2026-07-11
 
 Individually configurable, verified. Two stages lacked an off switch:

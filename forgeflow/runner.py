@@ -271,12 +271,30 @@ def assemble_prompt(base_prompt, context_slice, schema):
 
 
 def extract_verdict(text, schema):
-    """LAST ```json fenced block, parsed and schema-validated. Raises
-    ValueError/SchemaError — the caller turns that into a re-ask."""
+    """The schema-valid verdict from the model text. Prefers the LAST
+    ```json fenced block (agentic CLIs narrate around it); falls back to
+    the WHOLE stripped response as JSON when there is no fence — that is
+    what a JSON-mode endpoint (response_format: json_object) returns, and
+    it is now first-class. Raises ValueError/SchemaError — the caller
+    turns that into a re-ask."""
     blocks = _FENCE_RE.findall(text or "")
-    if not blocks:
-        raise ValueError("no ```json fenced block in output")
-    verdict = json.loads(blocks[-1])
+    if blocks:
+        verdict = json.loads(blocks[-1])
+    else:
+        stripped = (text or "").strip()
+        # tolerate a bare ``` ... ``` wrapper (some models fence without a
+        # language tag) before giving up
+        if stripped.startswith("```") and stripped.endswith("```"):
+            stripped = stripped[3:-3].strip()
+            if stripped.startswith("json"):
+                stripped = stripped[4:].strip()
+        if not stripped:
+            raise ValueError("empty model output")
+        try:
+            verdict = json.loads(stripped)
+        except ValueError:
+            raise ValueError("no ```json fenced block and the response is "
+                             "not itself JSON")
     validate_schema(verdict, schema)
     return verdict
 

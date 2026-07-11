@@ -311,3 +311,32 @@ class PerStepLlmAndNotesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExtractVerdictModesTest(unittest.TestCase):
+    """extract_verdict must accept a fenced block (agentic CLI) AND a raw
+    JSON body (JSON-mode endpoints) — found driving a local model."""
+    SCHEMA = {"type": "object", "required": ["verdict"],
+              "properties": {"verdict": {"enum": ["DONE"]}}}
+
+    def test_fenced_block(self):
+        v = runner.extract_verdict('narration\n```json\n{"verdict":"DONE"}\n```',
+                                   self.SCHEMA)
+        self.assertEqual(v["verdict"], "DONE")
+
+    def test_raw_json_body(self):                 # JSON-mode endpoint
+        v = runner.extract_verdict('{"verdict": "DONE"}', self.SCHEMA)
+        self.assertEqual(v["verdict"], "DONE")
+
+    def test_bare_fence_without_lang(self):
+        v = runner.extract_verdict('```\n{"verdict":"DONE"}\n```', self.SCHEMA)
+        self.assertEqual(v["verdict"], "DONE")
+
+    def test_still_rejects_prose(self):
+        with self.assertRaises(ValueError):
+            runner.extract_verdict("I could not do it, sorry.", self.SCHEMA)
+
+    def test_still_schema_validates(self):
+        from forgeflow.util import SchemaError
+        with self.assertRaises(SchemaError):
+            runner.extract_verdict('{"verdict": "NOPE"}', self.SCHEMA)
