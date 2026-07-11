@@ -339,25 +339,38 @@ _ctx_retrieval.check_spec = _check_retrieval_spec
 SELECT_CHANNELS = ("lexical", "semantic", "recency", "prior", "boost")
 _RRF_K = 60
 
-
-def _channel_ranks(ordered, universe):
-    """Ranking from a best->worst key list; keys the channel could not
-    score rank behind everything it could."""
-    ranks = {kk: i + 1 for i, kk in enumerate(ordered)}
-    worst = len(universe) + 1
-    for kk in universe:
-        ranks.setdefault(kk, worst)
-    return ranks
+# Default channel weights: RELEVANCE channels (query/task-conditioned) vote
+# at full strength; PRIORS (recency, importance) modulate at 0.3 — enough
+# to decide among relevance ties (their job), not enough for a fresh-or-
+# important-but-irrelevant row to outvote an actual match (a failure mode
+# the recall evaluation demonstrated at equal weights). Override per step
+# via weights:.
+SELECT_WEIGHTS = {"lexical": 1.0, "semantic": 1.0, "boost": 1.0,
+                  "recency": 0.3, "prior": 0.3}
 
 
 def _rank_desc(scored, keys):
-    """Keys ordered by score desc, ties by key (deterministic forever).
-    Returns None when the channel carries no signal (all scores equal) —
-    an uninformative channel must not vote."""
+    """Fractional (average-rank) ranking, best score first. TIES SHARE the
+    mean of their positions — a block of 2000 rows tied at zero dilutes to
+    a deep rank instead of handing whichever row sorts first an excellent
+    one (a real bug the recall evaluation caught: key-order tie-breaks let
+    arbitrary distractors outvote true matches through RRF). Keys the
+    channel could not score rank behind everything it could. Returns None
+    when the channel carries no signal (all scores equal) — an
+    uninformative channel must not vote."""
     if not scored or len({v for v in scored.values()}) <= 1:
         return None
-    return _channel_ranks(
-        sorted(scored, key=lambda kk: (-scored[kk], kk)), keys)
+    counts = {}
+    for v in scored.values():
+        counts[v] = counts.get(v, 0) + 1
+    rank_of = {}
+    seen = 0
+    for v in sorted(counts, reverse=True):        # values, best first
+        rank_of[v] = seen + (counts[v] + 1) / 2.0  # mean of the tied block
+        seen += counts[v]
+    worst = float(len(keys) + 1)
+    return {kk: rank_of[scored[kk]] if kk in scored else worst
+            for kk in keys}
 
 
 @context_provider("select")
@@ -454,12 +467,7 @@ def _ctx_select(env, task, spec):
     if corpus.get("ts"):
         norm = _comparable({c["key"]: c["ts"] for c in cands
                             if c["ts"] is not None})
-        if norm and len(set(norm.values())) > 1:
-            ordered = sorted(norm, key=lambda kk: (norm[kk], kk))
-            ordered.reverse()             # newest first, ties by key
-            ranks["recency"] = _channel_ranks(ordered, keys)
-        else:
-            ranks["recency"] = None
+        ranks["recency"] = _rank_desc(norm, keys) if norm else None
     else:
         ranks["recency"] = None
 
@@ -483,7 +491,7 @@ def _ctx_select(env, task, spec):
         ranks["boost"] = None
 
     # ---- Reciprocal Rank Fusion over the channels that voted
-    weights = {ch: 1.0 for ch in SELECT_CHANNELS}
+    weights = dict(SELECT_WEIGHTS)
     weights.update(spec.get("weights") or {})
     fused = {}
     for kk in keys:
@@ -495,7 +503,7 @@ def _ctx_select(env, task, spec):
     top = sorted(keys, key=lambda kk: (-fused[kk], kk))[:k]
     out["entries"] = [
         entry(by_key[kk], fused[kk],
-              {ch: ranks[ch][kk] for ch in SELECT_CHANNELS
+              {ch: round(ranks[ch][kk], 1) for ch in SELECT_CHANNELS
                if ranks[ch] is not None})
         for kk in top]
     return out

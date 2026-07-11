@@ -184,11 +184,33 @@ in published production results):
   whole filtered corpus verbatim when it fits — below a real threshold,
   retrieval infrastructure is pure overhead (Anthropic's guidance:
   small knowledge bases belong in the prompt directly).
+- **Priors modulate, relevance decides.** Default weights: lexical /
+  semantic / boost 1.0, recency / prior **0.3** — enough to decide among
+  relevance ties (their job), not enough for a fresh-or-important-but-
+  irrelevant row to outvote an actual match. Ties within a channel share
+  a fractional (average) rank, so a block of thousands of equal-score
+  rows dilutes itself instead of handing arbitrary rows strong votes.
+  Both rules exist because the recall calibration below caught the
+  opposite behaviors as real ranking bugs. Override per step: `weights:`.
 - **Explainable and deterministic.** Every selected entry carries its
   fused score and per-channel ranks in the injected context; identical db
   state yields identical selection forever (fixed tie-breaks), so replay
   and regression tests stay honest. Oversized entries are truncated with
   a `truncated: true` flag — never silently.
+
+### Measured recall (the calibration suite)
+
+`tests/test_recall.py` freezes a golden set — 56-query version run against
+2,000 distractors, six adversarial categories — and CI asserts the floors.
+Zero-setup (`hashing`): **100% recall@1** on exact-lexical, identifier
+(camelCase↔words), recency, importance, and scoped categories; **paraphrase
+0% @1 / 17% @5** — hashing is lexical, synonyms are invisible to it, and
+that is stated as a contract, not hidden. Plugging a synonym-aware
+embedding model into the *same corpus* (one `embed_with:` line): paraphrase
+**100% @1**, overall **98% @1 / 100% @5**. Latency (pure-stdlib brute
+force, warm): ~0.04s/query at 1k rows, ~0.19s at 5k, ~0.75s at 20k — the
+practical comfort zone is corpora up to a few tens of thousands of rows;
+use `filter:` to pre-scope large tables.
 
 Vectors live in the engine's `corpus_embeddings` table and are maintained
 incrementally at query time: a row is (re)embedded only when new or when

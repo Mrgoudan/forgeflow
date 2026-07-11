@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.1 — 2026-07-11
+
+### Fixed (found by the new recall calibration suite)
+- **Tie ranking**: equal scores within a channel now share a fractional
+  (average) rank. Previously ties broke by key order, letting arbitrary
+  distractors inherit strong ranks and outvote true matches through RRF.
+- **Prior weighting**: recency/importance channels default to weight 0.3
+  (relevance channels stay 1.0) — priors decide among relevance ties but
+  can no longer lift fresh-or-important-but-irrelevant rows over matches.
+
+### Added
+- `tests/test_recall.py`: frozen golden-set recall calibration (six
+  adversarial categories, distractor sea) asserting recall floors in CI —
+  including the honest expectation that the hashing embedder fails pure
+  paraphrase and that a semantic model plugged into the same corpus
+  recovers it. Measured results documented in docs/LLM.md.
+
 ## 0.4.0 — 2026-07-11
 
 Context selection over your own data. Schema: v4 (`corpus_embeddings`) —
