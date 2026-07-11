@@ -21,13 +21,13 @@ The YAML layer is also insurance: workflow definitions are engine-agnostic.
 ```yaml
 # forgeflow/workflows/defs/fix.yaml  (built-in; packs may ship their own)
 workflow: fix
-consumes:                       # what starts me (events = finding/task facts)
-  - finding.triaged
+consumes:                       # what starts me (events = item/task facts)
+  - item.triaged
   - comment.fix_request
 emits:                          # what I may cause (checked: no undeclared emits)
-  - finding.pr_open
-  - finding.deferred
-  - finding.failed
+  - item.pr_open
+  - item.deferred
+  - item.failed
 
 steps:
   - name: workspace
@@ -55,13 +55,13 @@ steps:
       timeout: failed
 
   - name: verify                # evidence gate — no llm, no context, no trust
-    block: evidence.suite       # branch_advanced + build + probes + corpus
-    params: { checks: [branch_advanced, build, probe_sweep, corpus, path_allowlist] }
-    outcomes: { green: publish, red_retryable: candidate, red: deferred }
+    block: check.suite          # verify commands in order, exit codes only
+    params: { checks: [{ name: build, cmd: [...] }, { name: probes, cmd: [...] }] }
+    outcomes: { green: publish, red_retryable: candidate, red: deferred, timeout: failed }
 
   - name: publish
-    block: publish.pr           # fold-one-commit, push --force-with-lease,
-    outcomes: { ok: done, forge_auth: parked, forge_server: parked }
+    block: forge.publish_pr     # PACK-SUPPLIED egress block (leak scan +
+    outcomes: { ok: done, forge_auth: parked, forge_server: parked }   # body-sha idempotency per ENGINE.md)
 ```
 
 Loader guarantees (all at startup, none at runtime):
@@ -81,6 +81,16 @@ A step gets EXACTLY what it declares — the runner assembles it, pins it
 the db ad hoc; a block's function signature is `(ctx_slice, task, prev)`.
 That makes steps testable in isolation (feed a dict, assert the outcome)
 and makes "what did this step know?" a db lookup instead of archaeology.
+
+The engine ships these providers (packs register more, like blocks):
+
+| provider | injects |
+|---|---|
+| `payload` | the task's event payload |
+| `pack` | the pack's params mapping |
+| `notes` | declared files, verbatim (missing file = loud failure) |
+| `select` | ranked useful rows from a declared corpus — hybrid channels, RRF, dedup/MMR/budget construction, outcome-learned utility (docs/LLM.md) |
+| `retrieval` | k-nearest code objects by embedding (the code-comprehension layer) |
 
 ## Fan-out / join in YAML
 
@@ -120,19 +130,19 @@ read named keys only and must not fabricate these:
 ## How workflows interact: events, not calls
 
 Workflows never invoke each other. `record_transition()` is the event bus:
-a transition event (e.g. `finding.merged`) is matched against every enabled
+a transition event (e.g. `item.merged`) is matched against every enabled
 workflow's `consumes:` list; matches enqueue tasks — in the same db
 transaction, so interaction is atomic, replayable, and visible as data.
 
 The cross-triggers become pure configuration:
 
 ```yaml
-# bughunt.yaml
-consumes: [finding.merged]        # variant-hunt on every merged fix
+# hunt.yaml
+consumes: [item.merged]           # variant-hunt on every merged fix
 # review.yaml
 consumes: [pr.opened, pr.updated]
-# autofix.yaml
-consumes: [finding.triaged, comment.fix_request]
+# fix.yaml
+consumes: [item.triaged, comment.fix_request]
 ```
 
 Adding an interaction = adding one line to a `consumes:` list. Removing a
@@ -142,16 +152,22 @@ workflow can't strand others — unconsumed events are simply facts in the log.
 
 | block | class | outcomes |
 |---|---|---|
-| `worktree.create` / `worktree.drop` | local | ok, dirty |
-| `agent.run` | llm (agentic or text by binding) | schema enums + agent_limit/agent_invalid/timeout |
-| `evidence.suite` / `evidence.check` | local | green, red_retryable, red |
-| `publish.pr` / `publish.comment` | egress | ok, forge_auth, forge_server, leak_blocked |
-| `db.upsert_finding` / `db.transition` | state | ok |
+| `shell.run` | local | ok, nonzero, mismatch, timeout |
+| `worktree.create` / `worktree.drop` | local | ok, dirty/error, timeout |
+| `git.branch` / `git.fold_commit` / `git.branch_advanced` | local | ok/…, error, timeout |
+| `agent.run` | llm (agentic or text by binding) | schema enums + agent_limit/agent_invalid/agent_backend/timeout |
+| `check.suite` | local | green, red_retryable, red, timeout |
+| `check.recheck` | local | confirmed, refuted, timeout |
+| `db.upsert_item` / `db.transition` | state | ok |
 | `event.emit` | state | ok |
 | `fanout.emit` | state | ok, empty |
 | `join.collect` | state | ok |
-| `scan.grep_rules` | local, no-AI | ok(candidates) |
-| `oracle.reproduce` | local | confirmed, refuted |
+| `scan.grep_rules` | local, no-AI | ok, timeout |
+| `model.embed` / `model.classify` | local | ok(/error) |
+
+(Forge egress blocks — PR/comment posting with leak scanning and body-sha
+idempotency — are pack-supplied; the ENGINE.md egress mechanics section
+defines the contract they must follow.)
 
 New capability = new block (Python, tested once) → immediately available to
 every workflow YAML. New process = new YAML → no Python at all.

@@ -40,6 +40,12 @@ through **events**. You never write orchestration code.
   real model, then `--replay-from` answers every agent step from the
   recording — token-free tests that fail loudly on prompt drift. Built into
   the engine, not bolted on: every run already archives its verdict.
+- **It picks the right context from your data — and learns.** Declare any
+  table as a corpus; steps select the most *useful* rows per task: hybrid
+  ranking (RRF-fused), MMR diversity, budget packing, and an
+  outcome-learned utility signal (rows that helped tasks succeed outrank
+  rows that co-occurred with failures — auto-labelled from the audit
+  trail). Zero-setup local embedder; recall floors frozen in CI.
 - **Edit workflows without fear.** Every task is stamped with the hash of
   the definition it runs under; a YAML edit under a mid-flight task parks it
   for a clean re-run — never replays old state through a new graph. (The
@@ -64,6 +70,7 @@ through **events**. You never write orchestration code.
 | every outcome must be handled | **checked at load** | no | no | no | no | no |
 | LLM answer constrained by schema | **yes** | — | — | — | — | manual |
 | deterministic replay of LLM runs in CI | **yes** | — | — | — | — | no |
+| ranked context selection from your tables, learned from outcomes | **built in** | — | — | — | — | assemble yourself |
 | edit definitions with work in flight | **park + clean re-run** | n/a | n/a | undefined | `patched()` calls | undefined |
 | multi-machine scale-out | no | no | yes | yes | **yes** | no |
 | full on-disk audit of every step | **yes** | no | no | partial | event history | no |
@@ -389,10 +396,7 @@ python3 -m forgeflow --root R llm runs                    # verdicts, latency, r
 ```
 
 And the model sees the *right* rows from your own data. Declare any table
-as a **corpus**, and a step selects the most relevant/important rows for
-its task — hybrid ranking (lexical + optional embeddings + recency + your
-importance column), fused with Reciprocal Rank Fusion, deterministic, with
-per-row score breakdowns injected alongside the content:
+as a **corpus**, and a step constructs the useful context for its task:
 
 ```yaml
 corpora:
@@ -400,14 +404,26 @@ corpora:
 ```
 ```yaml
 context:
-  - select: { corpus: lessons, query: "{payload.title}", k: 5 }
+  - select:
+      corpus: lessons
+      query: ["{payload.title}", "{payload.error}"]   # each facet gets a vote
+      k: 5
+      filter: { repo: "{payload.repo}" }
 ```
 
-The default `hashing` embedder needs no model, no network, no setup — your
-rows never leave the machine to become searchable. The design follows
-published production-RAG evidence (why RRF, why brute-force scoring, why
-embeddings are optional): see the selection section of
-[docs/LLM.md](docs/LLM.md).
+Under the hood, per the published production-RAG evidence: hybrid ranking
+channels (identifier-aware lexical, optional embeddings, recency, your
+importance column, link boost) fused with **Reciprocal Rank Fusion**, then
+a construction stage — dedup, **MMR diversity** (k slots cover the task's
+ground instead of repeating the top hit), byte-budget packing with counted
+drops — and an **outcome-learned utility channel**: the engine records
+what every task was shown, and rows that historically led same-kind tasks
+to `done` outrank rows that co-occurred with `failed`. Auto-labelled from
+the audit trail; no annotation. Everything is deterministic and
+explainable (per-row score + channel ranks ride along), with recall floors
+frozen in CI. The default `hashing` embedder needs no model, no network,
+no setup — your rows never leave the machine to become searchable. Full
+rationale with sources: the selection sections of [docs/LLM.md](docs/LLM.md).
 
 Setup recipes for **Ollama, vLLM, llama.cpp, LM Studio, gateways, the
 Claude CLI, and record/replay** — plus the error-class troubleshooting
@@ -547,12 +563,12 @@ beyond loopback without one is refused at startup.
 | block | outcomes | what it does |
 |---|---|---|
 | `shell.run` | ok, nonzero, mismatch, timeout | run any command; optionally compare its output to an expected file |
-| `evidence.suite` | green, red_retryable, red, timeout | run verify commands in order; classify by exit codes only |
-| `oracle.reproduce` | confirmed, refuted, timeout | "does this bug still reproduce?" — exit code + file comparison |
+| `check.suite` | green, red_retryable, red, timeout | run verify commands in order; classify by exit codes only |
+| `check.recheck` | confirmed, refuted, timeout | "does this still reproduce?" — exit code + file comparison |
 | `scan.grep_rules` | ok, timeout | run regex rules over a tree, collect hits as candidates |
 | `worktree.create` / `drop` | ok, dirty/error, timeout | isolated git worktree per task (never touches your checkout) |
 | `git.branch` / `git.fold_commit` / `git.branch_advanced` | ok/…, error, timeout | branch mechanics |
-| `db.upsert_finding` / `db.transition` | ok | record/advance a tracked finding (this is what fires `finding.*` events) |
+| `db.upsert_item` / `db.transition` | ok | record/advance a tracked item (this is what fires `item.*` events) |
 | `event.emit` | ok | send a declared event to other workflows |
 | `fanout.emit` | ok, empty | one event per list item + a join event when ALL spawned tasks finish |
 | `join.collect` | ok | read a join group's member roster (ids, states, counts) |
@@ -599,7 +615,8 @@ Every feature documented above is composed at scale in its `packs/bsc/`.
 ## Tests & docs
 
 ```bash
-python3 -m unittest discover -s tests    # 169 tests, stdlib only — incl. kill -9 chaos runs
+python3 -m unittest discover -s tests    # 218 tests, stdlib only — incl. kill -9 chaos
+                                         # runs and a frozen recall calibration suite
 ./scripts/check_generic.sh               # proves the engine has no domain leaks
 ```
 

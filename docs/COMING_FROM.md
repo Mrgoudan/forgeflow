@@ -61,6 +61,7 @@ forgeflow is: durable state, bounded retries, parking, audit.
 | prompt assembled somewhere in code | `context:` declares exactly what the model sees; the assembled prompt is hashed BEFORE the call and archived |
 | rate limits = your try/except | `agent_limit` parks the task; health-gated auto-unpark |
 | "works in the demo" tests | record once against the real model, `--replay-from` in CI — deterministic, token-free, loud on prompt drift |
+| RAG glue you assemble yourself (splitter + vector store + retriever + reranker) | declare any table as a corpus; `select:` does hybrid ranking (RRF), dedup/MMR/budget construction, and outcome-learned utility — zero-setup local embedder, recall floors frozen in CI |
 | framework API churn | workflows are YAML; the engine's four contracts are documented and versioned |
 
 You give up: in-process streaming/token-level control and Python-native

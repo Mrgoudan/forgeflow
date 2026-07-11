@@ -11,7 +11,7 @@ db row references is garbage by definition (collectable).
 |---|---|---|---|
 | `forgeflow/`, `schemas/`, `packs/`, `scripts/`, `systemd/`, `*.md` | git (gitcode) | humans | the platform; versioned, reviewed |
 | `vault/` | own private git repo (ignored by parent) | humans + `learn` workflow (lessons append only) | method assets: probes, code_notes, prompts, knowledge. Every run pins `vault_rev`. |
-| `state/` | no | `forgeflow/db.py` ONLY | `forgeflow.db` (WAL) — the single source of truth. Backed up. Never hand-edited. |
+| `state/` | no | `forgeflow/db.py` ONLY | `forgeflow.db` (WAL) — the single source of truth. Backed up. Never hand-edited. Includes the engine's derived stores: `corpus_embeddings` (text_sha-pinned vectors over declared corpora; rebuildable at query time, loss ≠ broken) and `context_uses` (what each task was shown — the learned-utility ledger; loss resets learning, nothing else). |
 | `data/` | no | runner/egress/evidence helpers ONLY | generated artifacts, addressed by id: `data/runs/<run_id>/` (prompt snapshot, raw agent output), `data/egress/<id>.md` (exact posted bodies), `data/evidence/<transition_id>/` (build logs, probe outcomes). Append-only; referenced by db rows. |
 | `workspaces/` | no | runner | ephemeral git worktrees, one per task; deleted on task completion. Always safe to `rm -rf`. |
 | `legacy/` | no | nobody (frozen) | read-only snapshots of the predecessor systems (autofix, pr_monitor, autotest sem_tests) kept for reference and as `import_legacy.py` input. Never executed, never edited. |

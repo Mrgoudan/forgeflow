@@ -9,11 +9,11 @@ source of truth; one daemon process is the single writer.
 
 - One daemon per state dir, enforced by `flock` on `state/daemon.lock` at
   startup (second `run` exits 0 with a message). One-shot CLI commands
-  (`hunt`/`fix --finding`/`review --pr`) run WITHOUT the lock: they enqueue
+  (`emit --drive`, `once`) run WITHOUT the lock: they enqueue
   and then drive the claim loop until their own task tree is terminal, using
   the same code paths. SIGTERM: finish the current step, persist, exit;
   never kill mid-transaction.
-- SQLite: WAL mode, `busy_timeout >= 5000ms`, `foreign_keys=ON`. The board
+- SQLite: WAL mode, `busy_timeout >= 5000ms`, `foreign_keys=ON`. The http server
   and one-shot commands open their own connections; WAL makes concurrent
   reads safe; writes serialize via `BEGIN IMMEDIATE`.
 
@@ -63,13 +63,13 @@ Per step, in order:
    MUST pass `timeout_s` to subprocess and let `TimeoutExpired` escape;
    the engine maps it to the step's `timeout` outcome. Pure-Python blocks
    are expected to be fast; the engine additionally records wall time and
-   flags (log, board) any step exceeding its budget.
+   flags (log, dashboard) any step exceeding its budget.
 3. **Classify**: the returned outcome must be in the step's declared set —
    anything else, and any uncaught exception, fails the task loudly with
    error_class 'framework_bug' (this is a bug in a block, not in a model).
 4. **Persist the boundary** (one transaction): INSERT task_steps(task_id,
    attempt, step, outcome, result_json, wall_ms) + any rows the block
-   staged (findings, readings, egress, runs updates) + the dispatch
+   staged (items, readings, events, embeddings) + the dispatch
    decision. Only after COMMIT does the next step start.
 5. **Dispatch**: `dispatch[(step, outcome)]` → next step, or a terminal
    task state. Terminal → finalize (below).
@@ -196,11 +196,11 @@ startup; a task in 'pending'/'retry_wait' keeps its worktree.
 
 ## Events & subscriptions
 
-- `record_transition(finding, to_state, event, evidence, run_id)` — inside
-  its transaction: UPDATE finding, INSERT transitions row, then fan-out:
-  for each workflow whose `consumes:` includes `finding.<to_state>`,
+- `record_transition(item, to_state, event, evidence, run_id)` — inside
+  its transaction: UPDATE item, INSERT transitions row, then fan-out:
+  for each workflow whose `consumes:` includes `item.<to_state>`,
   enqueue a task (same transaction — interaction is atomic).
-- Non-finding events (`pr.opened`, `comment.fix_request`) are emitted by
+- Non-item events (`pr.opened`, `comment.fix_request`) are emitted by
   intake() through the same `emit_event(conn, name, payload)` helper.
 - Enqueue idempotency key: `(kind, sha256(canonical_json(payload)))` —
   UNIQUE index; a replayed event cannot double-enqueue. Canonical JSON =
@@ -268,6 +268,6 @@ a match means it was already sent; return the recorded id (safe replay).
 | schedule firing | window arithmetic vs the persisted cursor watermark |
 | join firing | member terminal states + guarded fired_at claim |
 | agent answer under replay | prompt_sha lookup in the recorded runs table |
-| context selection (select:) | per-channel ranks + RRF over the FULL filtered pool; fixed tie-breaks; text_sha-pinned incremental vectors (semantics in docs/LLM.md) |
+| context selection (select:) | per-channel ranks (multi-query voters) + RRF over the FULL filtered pool; construction = dedup -> MMR -> budget, all counted; utility learned from the context_uses ledger x task outcomes; fixed tie-breaks; text_sha-pinned incremental vectors (semantics in docs/LLM.md) |
 | clock | single `now` per transaction, from the db (`datetime('now')`) |
 ```

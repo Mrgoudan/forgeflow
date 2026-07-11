@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for looking! forgeflow is small on purpose (~4k lines, stdlib +
+Thanks for looking! forgeflow is small on purpose (~5.6k lines, stdlib +
 pyyaml) and guards that smallness aggressively. The bar for a change is:
 it keeps every startup guarantee, it ships with tests, and the generic
 core stays generic.
