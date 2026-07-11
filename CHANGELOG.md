@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.7.0 — 2026-07-11
+
+Payload assembly, governed and reviewable. No schema change.
+
+### Added
+- **Steps are bounded end to end**: context assembly (providers may call
+  models) is deducted from the block's budget; assembly alone overrunning
+  `timeout_s` is the step's `timeout` outcome; provider-side model calls
+  (rerank, summaries, API embeddings) cap themselves against the step's
+  remaining budget.
+- **Context manifest**: every agent run writes `context.json` beside its
+  archived prompt — per-section provider, spec, bytes, sha.
+- **Total context budget**: `params: { max_context_bytes: N }` on llm
+  steps; breach fails loudly with per-section sizes, before any model
+  call; validated at load.
+- **`llm show --task ID [--step NAME]`**: full-fidelity payload preview —
+  every declared provider resolved against live db state, manifest and
+  budget check printed, in preview mode (`env.preview`: no ledger writes,
+  no model calls — real tasks stay clean).
+
+### Changed
+- The selection cascade moved to its own module (`forgeflow/select.py`);
+  `contract.py` again holds only the execution contract.
+
 ## 0.6.0 — 2026-07-11
 
 A local model in the selection loop (the Anthropic-cookbook patterns:

@@ -8,6 +8,7 @@ import unittest
 from helpers import make_engine, make_pack, make_target_repo, tmpdir
 
 from forgeflow import config, contract, localmodel
+from forgeflow import select as select_mod
 
 SELECT = contract.CONTEXT_PROVIDERS["select"]
 
@@ -376,7 +377,7 @@ class SelectProviderTest(unittest.TestCase):
 
     def test_check_spec(self):
         pack = self.eng.pack
-        check = contract._check_select_spec
+        check = select_mod._check_select_spec
         self.assertIsNone(check({"corpus": "notes", "query": "q"}, pack))
         self.assertIn("corpus", check({"query": "q"}, pack))
         self.assertIn("query", check({"corpus": "notes"}, pack))

@@ -307,7 +307,7 @@ def _parse_envelope(stdout_path):
 def run_agent(conn, task, binding, base_prompt, schema, *, data_dir,
               pack_rev, cwd=None, timeout_s=3600, context_slice=None,
               vault_rev=None, probe_rev=None, base_sha=None, build_id=None,
-              secrets=None):
+              secrets=None, context_manifest=None):
     """Execute one agent step. Returns the schema-valid verdict dict.
     Raises RunnerError('agent_backend' | 'agent_limit' |
     'agent_invalid_output') for the workflow to dispatch on."""
@@ -330,6 +330,10 @@ def run_agent(conn, task, binding, base_prompt, schema, *, data_dir,
              prompt_sha, pack_rev, vault_rev, probe_rev, base_sha, build_id))
         run_id = cur.lastrowid
     run_dir = Path(data_dir) / "runs" / str(run_id)
+    if context_manifest is not None:
+        # what composed the prompt, as data — beside the archived prompt
+        from .util import atomic_write
+        atomic_write(run_dir / "context.json", canonical_json(context_manifest))
 
     ask = prompt
     session = None

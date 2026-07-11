@@ -350,8 +350,11 @@ def _llm_check(args):
 def _llm_show(args):
     """Render EXACTLY what a step using this binding would send: base
     prompt + context sections + output contract, plus the sha that the
-    runs table would pin. Payload context only — steps may declare more
-    (notes/retrieval), which resolve against live task state."""
+    runs table would pin. With --task, the assembly runs against the REAL
+    task and live db state (every declared provider, preview-mode: no
+    model calls, no ledger writes); without it, payload context only."""
+    if args.task is not None:
+        return _llm_show_task(args)
     from . import runner
     from .util import sha256_text
     pack = config.load_pack(args.pack) if args.pack else None
@@ -359,6 +362,9 @@ def _llm_show(args):
         print("llm show needs --pack", file=sys.stderr)
         return 2
     role = args.role
+    if role is None:
+        print("llm show needs a ROLE (or --task ID)", file=sys.stderr)
+        return 2
     if role not in pack.agents:
         print("no agent role '%s' (defined: %s)"
               % (role, sorted(pack.agents) or "none"), file=sys.stderr)
@@ -392,6 +398,74 @@ def _llm_show(args):
     print("# prompt_sha=%s" % sha256_text(prompt))
     print("# note: payload context only — steps may declare more"
           " (notes/retrieval), resolved against live task state")
+    print(prompt)
+    return 0
+
+
+def _llm_show_task(args):
+    """The full-fidelity preview: assemble the context an llm step of an
+    EXISTING task would receive — every declared provider (select, notes,
+    ...) resolved against live db state — plus the manifest and total
+    size vs any declared budget. Preview mode: nothing is written, no
+    model is called."""
+    from . import runner
+    from .contract import CONTEXT_PROVIDERS
+    from .util import canonical_json, sha256_text
+    eng = _build_engine(args)
+    if eng.pack is None:
+        print("llm show --task needs --pack", file=sys.stderr)
+        return 2
+    row = eng.conn.execute("SELECT * FROM tasks WHERE id=?",
+                           (args.task,)).fetchone()
+    if row is None:
+        print("no task %d" % args.task, file=sys.stderr)
+        return 1
+    wf = eng.workflows.get(row["kind"])
+    if wf is None:
+        print("no workflow handles kind '%s'" % row["kind"], file=sys.stderr)
+        return 1
+    llm_steps = [s for s in wf.steps if s.llm]
+    if not llm_steps:
+        print("workflow '%s' has no llm steps" % wf.kind, file=sys.stderr)
+        return 1
+    if args.step:
+        step = next((s for s in llm_steps if s.name == args.step), None)
+        if step is None:
+            print("no llm step '%s' (choices: %s)"
+                  % (args.step, ", ".join(s.name for s in llm_steps)),
+                  file=sys.stderr)
+            return 2
+    else:
+        step = llm_steps[0]
+    task = dict(row)
+    task["payload"] = json.loads(task["payload"])
+    eng.env.preview = True                     # no writes, no model calls
+    context_slice, sections = {}, []
+    for cname, cspec in step.context:
+        value = CONTEXT_PROVIDERS[cname](eng.env, task, cspec)
+        context_slice[cname] = value
+        blob = canonical_json(value)
+        sections.append((cname, len(blob.encode("utf-8")),
+                         sha256_text(blob)[:12]))
+    base = Path(eng.pack.prompts[step.llm]).read_text()
+    prompt = runner.assemble_prompt(base, context_slice,
+                                    eng.pack.schemas[step.schema])
+    binding = eng.pack.agents[step.llm]
+    print("# task=%d kind=%s step=%s llm=%s backend=%s model=%s schema=%s"
+          % (task["id"], task["kind"], step.name, step.llm,
+             binding.get("backend"), binding.get("model", "(default)"),
+             step.schema))
+    print("# prompt_sha=%s" % sha256_text(prompt))
+    print("# context manifest (provider, bytes, sha12):")
+    total = 0
+    for cname, nbytes, sha12 in sections:
+        total += nbytes
+        print("#   %-12s %8d  %s" % (cname, nbytes, sha12))
+    budget = step.params.get("max_context_bytes")
+    print("#   %-12s %8d%s" % ("TOTAL", total,
+                               ("  (budget %d%s)" % (budget,
+                                " — OVER" if total > budget else ""))
+                               if budget else ""))
     print(prompt)
     return 0
 
@@ -535,11 +609,17 @@ def main(argv=None):
     plc.add_argument("role", nargs="*", help="probe only these roles/models")
     plc.add_argument("--timeout", default=60, help="per-probe timeout (s)")
     plw = pls.add_parser("show", help="render the exact assembled prompt +"
-                                      " sha for a role")
-    plw.add_argument("role")
+                                      " sha for a role, or for a real task")
+    plw.add_argument("role", nargs="?", default=None)
     plw.add_argument("--data", default="{}", help="JSON payload for context")
     plw.add_argument("--schema", default=None,
                      help="pack schema name (default: the only one)")
+    plw.add_argument("--task", type=int, default=None,
+                     help="render the assembly for this EXISTING task"
+                          " against live db state (preview: no model calls,"
+                          " no ledger writes)")
+    plw.add_argument("--step", default=None,
+                     help="with --task: which llm step (default: the first)")
     plr = pls.add_parser("runs", help="recent agent runs: verdict, latency,"
                                       " re-asks")
     plr.add_argument("--limit", default=20, help="rows to show")

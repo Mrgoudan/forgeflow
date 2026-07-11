@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from helpers import make_engine, make_pack, make_target_repo, tmpdir
 
 from forgeflow import config, contract, queue
+from forgeflow import select as select_mod
 
 SELECT = contract.CONTEXT_PROVIDERS["select"]
 
@@ -174,7 +175,7 @@ class EnrichTest(unittest.TestCase):
             config.load_pack(pack_dir)
 
     def test_check_spec_rerank(self):
-        check = contract._check_select_spec
+        check = select_mod._check_select_spec
         pack = self.eng.pack
         self.assertIsNone(check({"corpus": "notes", "query": "q",
                                  "rerank": {"llm": "cheap", "window": 10}},

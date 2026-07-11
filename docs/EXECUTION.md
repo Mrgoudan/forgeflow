@@ -12,7 +12,10 @@ undefined states, corrupted rows, skipped audit records).
 Enforced by `forgeflow/contract.py` — workflows are written as steps; the
 step runner refuses anything that can't satisfy these:
 
-1. **Bounded** — every step has a timeout and an attempt cap. Agent re-asks
+1. **Bounded** — every step has a timeout and an attempt cap, and the
+   budget covers the step END TO END: context assembly (providers may
+   call models) is deducted from the block's budget, and assembly alone
+   overrunning it is the step's `timeout` outcome. Agent re-asks
    are bounded (≤2). Rounds are bounded (K dry). Retries are bounded
    (queue.POLICY). There is no unbounded loop anywhere whose exit condition
    depends on LLM output.

@@ -14,6 +14,10 @@ forgeflow --pack P --root R llm check    # LIVE: one probe round-trip per agent
                                          # binding and per embedding model
 forgeflow --pack P --root R llm show fix --data '{"bug": "demo"}'
                                          # the EXACT prompt a step would send + its sha
+forgeflow --pack P --root R llm show --task 42        # FULL-fidelity: every declared
+                                         # provider resolved against live db state,
+                                         # + the manifest (per-section bytes/sha) —
+                                         # preview mode: no model calls, no writes
 ```
 
 `validate` (and engine start) catches structure and environment: unknown
@@ -316,6 +320,19 @@ incrementally at query time: a row is (re)embedded only when new or when
 its text changed (`text_sha` pin). Startup checks the whole chain: a
 corpus naming a missing table/column, an `embed_with` or `summarize_with`
 that doesn't resolve, refuses to start with the exact field named.
+
+### The payload, reviewable
+
+Every agent run writes a **context manifest** beside its archived
+prompt — `data/runs/<id>/context.json`: per section, the provider, the
+spec, byte size, and content sha. "What composed this prompt and how
+big was each part" is data, not archaeology. An optional per-step
+`params: { max_context_bytes: N }` bounds the TOTAL assembled context;
+a breach fails loudly (with per-section sizes named) before any model
+call. And `llm show --task ID [--step NAME]` renders the exact
+assembly for a real task — every provider against live db state, in
+preview mode (no ledger writes, no model calls) — with the manifest
+and budget check printed above the prompt.
 
 ## Operating it
 

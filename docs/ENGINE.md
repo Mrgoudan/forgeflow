@@ -59,19 +59,27 @@ Per step, in order:
 
 1. **Resume check**: `task_steps` rows tell which steps already completed
    for this task attempt — skip them (crash resume lands here).
-2. **Run** the block fn. Timeout enforcement: blocks that spawn processes
+2. **Assemble context** (declared providers) INSIDE the step budget:
+   assembly time is deducted from the block's `_timeout_s`, providers
+   cap their own model/network calls against `env.provider_deadline`,
+   and `env.preview` (llm show) suppresses ledger writes and model
+   calls. For llm steps the assembled slice is written as a MANIFEST
+   (`data/runs/<id>/context.json`: per-section provider, spec, bytes,
+   sha) and checked against the optional `max_context_bytes` budget —
+   a breach fails loudly before any model call.
+3. **Run** the block fn. Timeout enforcement: blocks that spawn processes
    MUST pass `timeout_s` to subprocess and let `TimeoutExpired` escape;
    the engine maps it to the step's `timeout` outcome. Pure-Python blocks
    are expected to be fast; the engine additionally records wall time and
    flags (log, dashboard) any step exceeding its budget.
-3. **Classify**: the returned outcome must be in the step's declared set —
+4. **Classify**: the returned outcome must be in the step's declared set —
    anything else, and any uncaught exception, fails the task loudly with
    error_class 'framework_bug' (this is a bug in a block, not in a model).
-4. **Persist the boundary** (one transaction): INSERT task_steps(task_id,
+5. **Persist the boundary** (one transaction): INSERT task_steps(task_id,
    attempt, step, outcome, result_json, wall_ms) + any rows the block
    staged (items, readings, events, embeddings) + the dispatch
    decision. Only after COMMIT does the next step start.
-5. **Dispatch**: `dispatch[(step, outcome)]` → next step, or a terminal
+6. **Dispatch**: `dispatch[(step, outcome)]` → next step, or a terminal
    task state. Terminal → finalize (below).
 
 ### task_steps (add to schema)

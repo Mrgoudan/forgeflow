@@ -371,6 +371,33 @@ def agent_run(ctx, task, prev):
     base_prompt = Path(pack.prompts[step.llm]).read_text()
     declared = {name for name, _ in step.context}
     context_slice = {k: ctx[k] for k in declared if k in ctx}
+    # the context MANIFEST: per-section provider, spec, size, sha — written
+    # beside the run's archived prompt (data/runs/<id>/context.json), so
+    # "what composed this prompt, and how big was each part" is data. The
+    # optional total budget (params max_context_bytes) is enforced HERE,
+    # before any model call — a breach is a loud configuration failure.
+    from .util import canonical_json, sha256_text
+    sections = []
+    for cname, cspec in step.context:
+        if cname not in context_slice:
+            continue
+        blob = canonical_json(context_slice[cname])
+        sections.append({"provider": cname, "spec": cspec,
+                         "bytes": len(blob.encode("utf-8")),
+                         "sha256": sha256_text(blob)})
+    budget = ctx.get("max_context_bytes")
+    if budget:
+        total = sum(s["bytes"] for s in sections)
+        if total > int(budget):
+            raise RuntimeError(
+                "agent.run: assembled context is %d bytes, over "
+                "max_context_bytes=%d (sections: %s)"
+                % (total, int(budget),
+                   ", ".join("%s=%d" % (s["provider"], s["bytes"])
+                             for s in sections)))
+    manifest = {"llm": step.llm, "schema": step.schema,
+                "base_prompt_sha": sha256_text(base_prompt),
+                "sections": sections}
     cwd = ctx.get("cwd") or (prev or {}).get("path")
     if cwd:
         cwd = _tpl(ctx, task, prev, cwd)
@@ -379,7 +406,8 @@ def agent_run(ctx, task, prev):
             ctx["_conn"], task, binding, base_prompt, schema,
             data_dir=ctx["_data_dir"], pack_rev=pack.rev, cwd=cwd,
             timeout_s=ctx["_timeout_s"], context_slice=context_slice,
-            base_sha=(prev or {}).get("base_sha"))
+            base_sha=(prev or {}).get("base_sha"),
+            context_manifest=manifest)
     except runner.RunnerError as e:
         outcome = ("agent_invalid" if e.error_class == "agent_invalid_output"
                    else e.error_class)

@@ -187,6 +187,14 @@ def load_workflow_file(path, pack=None) -> Workflow:
             _die(swhere, "block '%s' requires params %s"
                  % (blk.name, sorted(missing_params)))
 
+        # llm steps: the optional total context budget must be sane NOW —
+        # a malformed budget failing mid-run defeats its purpose.
+        if blk.exec_class == "llm":
+            mcb = params.get("max_context_bytes")
+            if mcb is not None and (isinstance(mcb, bool)
+                                    or not isinstance(mcb, int) or mcb < 1):
+                _die(swhere, "max_context_bytes must be a positive integer")
+
         # event.emit steps: the event they stage is an EMIT — declared
         # names only, well-formed only (no undeclared emits, ever).
         if blk.name == "event.emit":
