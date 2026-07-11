@@ -268,5 +268,6 @@ a match means it was already sent; return the recorded id (safe replay).
 | schedule firing | window arithmetic vs the persisted cursor watermark |
 | join firing | member terminal states + guarded fired_at claim |
 | agent answer under replay | prompt_sha lookup in the recorded runs table |
+| context selection (select:) | per-channel ranks + RRF over the FULL filtered pool; fixed tie-breaks; text_sha-pinned incremental vectors (semantics in docs/LLM.md) |
 | clock | single `now` per transaction, from the db (`datetime('now')`) |
 ```

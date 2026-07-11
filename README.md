@@ -388,6 +388,27 @@ python3 -m forgeflow --root R --pack P llm show fix \
 python3 -m forgeflow --root R llm runs                    # verdicts, latency, re-asks
 ```
 
+And the model sees the *right* rows from your own data. Declare any table
+as a **corpus**, and a step selects the most relevant/important rows for
+its task — hybrid ranking (lexical + optional embeddings + recency + your
+importance column), fused with Reciprocal Rank Fusion, deterministic, with
+per-row score breakdowns injected alongside the content:
+
+```yaml
+corpora:
+  lessons: { table: lessons, text: summary, ts: created_at, embed_with: hashing }
+```
+```yaml
+context:
+  - select: { corpus: lessons, query: "{payload.title}", k: 5 }
+```
+
+The default `hashing` embedder needs no model, no network, no setup — your
+rows never leave the machine to become searchable. The design follows
+published production-RAG evidence (why RRF, why brute-force scoring, why
+embeddings are optional): see the selection section of
+[docs/LLM.md](docs/LLM.md).
+
 Setup recipes for **Ollama, vLLM, llama.cpp, LM Studio, gateways, the
 Claude CLI, and record/replay** — plus the error-class troubleshooting
 table — live in [docs/LLM.md](docs/LLM.md).

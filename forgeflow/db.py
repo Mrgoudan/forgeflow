@@ -205,6 +205,21 @@ CREATE TABLE IF NOT EXISTS embeddings (           -- local-model vectors, pinned
     PRIMARY KEY (object_id, model_sha)
 );
 
+-- Vectors for corpus rows (the select: context provider). Maintained
+-- incrementally at query time: a row is (re)embedded only when no vector
+-- exists for (corpus, key, model_sha) or its text_sha changed. Generic:
+-- 'corpus' names a pack corpora: entry over ANY table.
+CREATE TABLE IF NOT EXISTS corpus_embeddings (
+    corpus        TEXT NOT NULL,
+    key           TEXT NOT NULL,         -- the row's stable id (declared key column)
+    model_sha     TEXT NOT NULL,
+    text_sha      TEXT NOT NULL,         -- sha of the text embedded (staleness pin)
+    dim           INTEGER NOT NULL,
+    vector        TEXT NOT NULL,         -- JSON float array
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (corpus, key, model_sha)
+);
+
 
 
 
@@ -263,12 +278,28 @@ def _mig_v3(conn):
     _add_column(conn, "runs", "reasks", "INTEGER")
 
 
-SCHEMA_VERSION = 3
+def _mig_v4(conn):
+    """v4 (0.4.0): generic corpus selection — vectors over arbitrary
+    pack-declared tables."""
+    conn.execute("""CREATE TABLE IF NOT EXISTS corpus_embeddings (
+        corpus        TEXT NOT NULL,
+        key           TEXT NOT NULL,
+        model_sha     TEXT NOT NULL,
+        text_sha      TEXT NOT NULL,
+        dim           INTEGER NOT NULL,
+        vector        TEXT NOT NULL,
+        created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (corpus, key, model_sha)
+    )""")
+
+
+SCHEMA_VERSION = 4
 MIGRATIONS: list = [
     (2, _mig_v2),
     (3, _mig_v3),
-]       # [(version, callable(conn))] — single statements only (they must
-        #   compose into _migrate's one transaction; executescript commits)
+    (4, _mig_v4),
+]       # [(version, callable(conn))] — idempotent single statements only
+        #   (they must compose into _migrate's one transaction)
 
 
 def _migrate(conn, fresh):

@@ -69,6 +69,7 @@ class Engine:
         self._lowdisk = False           # resource guard: pause claiming when set
         self._check_schedule()
         self._check_agents()
+        self._check_corpora()
         self._recover()
 
     # ------------------------------------------------------------ startup
@@ -98,6 +99,33 @@ class Engine:
             err = runner.check_binding(name, binding, secrets)
             if err:
                 raise ConfigError("agents.%s: %s" % (name, err))
+
+    def _check_corpora(self):
+        """Environment checks for corpora: the declared table and columns
+        must exist in THIS db (the pack's schema files were applied above).
+        A select: step against a phantom table is a startup error, never a
+        3am runtime surprise."""
+        if not self.pack or not self.pack.corpora:
+            return
+        from .config import ConfigError
+        for name, spec in self.pack.corpora.items():
+            row = self.conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type IN ('table','view')"
+                " AND name=?", (spec["table"],)).fetchone()
+            if row is None:
+                raise ConfigError(
+                    "corpora.%s: table '%s' does not exist in the state db "
+                    "(declare it in the pack's schema: files)"
+                    % (name, spec["table"]))
+            cols = {r["name"] for r in self.conn.execute(
+                'PRAGMA table_info("%s")' % spec["table"])}
+            for field_name in ("text", "key", "ts", "weight"):
+                col = spec.get(field_name)
+                if col is not None and col not in cols:
+                    raise ConfigError(
+                        "corpora.%s: %s column '%s' not in table '%s' "
+                        "(columns: %s)" % (name, field_name, col,
+                                           spec["table"], ", ".join(sorted(cols))))
 
     def _recover(self):
         """Crash recovery: orphaned 'running' tasks -> pending (their

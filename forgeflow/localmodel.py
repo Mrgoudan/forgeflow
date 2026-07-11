@@ -83,6 +83,49 @@ def cosine(a, b):
     return num / (da * db)
 
 
+# --------------------------------------------------------- hashing embedder
+
+HASHING_VERSION = 1        # bump = new model_sha = clean re-embed everywhere
+HASHING_DEFAULT_DIM = 256
+
+
+def split_identifiers(text):
+    """Tokens with identifier splitting: camelCase and snake_case both
+    yield their parts, so 'flagSkipReason' and 'flag_skip_reason' share
+    tokens with a query about 'skip'. Deterministic forever."""
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text or "")
+    return [t for t in _TOKEN_RE.findall(text.lower().replace("_", " "))
+            if len(t) >= 2]
+
+
+def hash_embed(text, dim=HASHING_DEFAULT_DIM):
+    """The zero-setup embedder: signed feature hashing of tokens + bigrams
+    into a fixed-dim L2-normalized vector. No weights file, no network —
+    identical text maps to identical vectors, token-sharing text to nearby
+    ones. It is a lexical-strength signal wearing a vector interface: good
+    enough to make selection useful out of the box, honest about not being
+    a semantic model (swap in real weights or an API per corpus for that)."""
+    toks = split_identifiers(text)
+    feats = toks + [a + "_" + b for a, b in zip(toks, toks[1:])]
+    acc = [0.0] * dim
+    for f in feats:
+        h = int.from_bytes(
+            hashlib.sha256(f.encode("utf-8")).digest()[:9], "big")
+        idx = h % dim
+        acc[idx] += 1.0 if (h >> 63) & 1 else -1.0   # signed: fewer collisions
+    norm = math.sqrt(sum(x * x for x in acc))
+    if norm == 0.0:
+        return acc
+    return [x / norm for x in acc]
+
+
+def hashing_model_sha(dim):
+    """Stable fingerprint standing in for a weights hash: pins algorithm
+    version + dim, so existing vectors are reused only while both match."""
+    return hashlib.sha256(
+        ("hashing:v%d:dim=%d" % (HASHING_VERSION, dim)).encode()).hexdigest()
+
+
 def classify(text, weights):
     """Nearest centroid by cosine; ties break lexicographically by label
     (stable forever). Returns (label, score, margin)."""

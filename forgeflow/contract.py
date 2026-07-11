@@ -322,6 +322,291 @@ def _check_retrieval_spec(spec, pack):
 _ctx_retrieval.check_spec = _check_retrieval_spec
 
 
+# ---- select: generic ranked selection over any pack-declared corpus ------
+#
+# Design grounded in production-RAG evidence (docs/LLM.md cites sources):
+# - hybrid beats pure-vector -> independent channels (lexical, semantic,
+#   recency, prior, boost) fused by Reciprocal Rank Fusion. RRF because
+#   calibrating linear score weights needs labeled queries per corpus;
+#   rank fusion is the robust untuned default.
+# - recency and priors must score the FULL filtered pool, never re-rank a
+#   narrow top-K cosine cut — at this engine's scale (thousands to low
+#   hundreds of thousands of rows) brute force is the correct architecture.
+# - embeddings are OPTIONAL: the lexical channel plus the zero-setup
+#   hashing embedder give a strong deterministic core; real embedding
+#   models plug in per corpus when wanted.
+
+SELECT_CHANNELS = ("lexical", "semantic", "recency", "prior", "boost")
+_RRF_K = 60
+
+
+def _channel_ranks(ordered, universe):
+    """Ranking from a best->worst key list; keys the channel could not
+    score rank behind everything it could."""
+    ranks = {kk: i + 1 for i, kk in enumerate(ordered)}
+    worst = len(universe) + 1
+    for kk in universe:
+        ranks.setdefault(kk, worst)
+    return ranks
+
+
+def _rank_desc(scored, keys):
+    """Keys ordered by score desc, ties by key (deterministic forever).
+    Returns None when the channel carries no signal (all scores equal) —
+    an uninformative channel must not vote."""
+    if not scored or len({v for v in scored.values()}) <= 1:
+        return None
+    return _channel_ranks(
+        sorted(scored, key=lambda kk: (-scored[kk], kk)), keys)
+
+
+@context_provider("select")
+def _ctx_select(env, task, spec):
+    """Pick the most relevant/important rows of a declared corpus for THIS
+    task: SQL metadata pre-filter, per-channel ranking, RRF fusion, top-k.
+    Deterministic end to end; every selected entry carries its fused score
+    and per-channel ranks, so 'why did the model see this' is data."""
+    from . import localmodel
+    from .util import sha256_text
+    from .util import template as _template
+    conn = env.conn
+    corpus_name = spec["corpus"]
+    corpus = env.pack.corpora[corpus_name]
+    payload_map = {"payload": task.get("payload") or {}}
+    query = _template(spec["query"], payload_map)
+    k = int(spec.get("k", 5))
+    max_chars = int(spec.get("max_chars", 2000))
+
+    # ---- candidates: metadata pre-filter pushed into SQL
+    table = corpus["table"]
+    cols = {r["name"] for r in conn.execute('PRAGMA table_info("%s")' % table)}
+    key_col = corpus.get("key")
+    sel = [('"%s"' % key_col if key_col else "rowid") + " AS _key",
+           '"%s" AS _text' % corpus["text"]]
+    if corpus.get("ts"):
+        sel.append('"%s" AS _ts' % corpus["ts"])
+    if corpus.get("weight"):
+        sel.append('"%s" AS _weight' % corpus["weight"])
+    boost_spec = spec.get("boost") or {}
+    for i, col in enumerate(sorted(boost_spec)):
+        if col not in cols:
+            raise RuntimeError("select: boost column '%s' not in table '%s'"
+                               % (col, table))
+        sel.append('"%s" AS _b%d' % (col, i))
+    where, args = [], []
+    for col in sorted(spec.get("filter") or {}):
+        if col not in cols:
+            raise RuntimeError("select: filter column '%s' not in table '%s'"
+                               % (col, table))
+        where.append('"%s" = ?' % col)
+        args.append(_template(spec["filter"][col], payload_map))
+    sql = 'SELECT %s FROM "%s"' % (", ".join(sel), table)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    cands = []
+    for r in conn.execute(sql, args):
+        cands.append({
+            "key": str(r["_key"]),
+            "text": "" if r["_text"] is None else str(r["_text"]),
+            "ts": r["_ts"] if corpus.get("ts") else None,
+            "weight": r["_weight"] if corpus.get("weight") else None,
+            "boost": [r["_b%d" % i] for i in range(len(boost_spec))],
+        })
+    cands.sort(key=lambda c: c["key"])
+    keys = [c["key"] for c in cands]
+    by_key = {c["key"]: c for c in cands}
+
+    def entry(c, score=None, channels=None):
+        e = {"key": c["key"], "text": c["text"][:max_chars]}
+        if len(c["text"]) > max_chars:
+            e["truncated"] = True         # never a silent cut
+        if score is not None:
+            e["score"] = round(score, 6)
+            e["channels"] = channels
+        return e
+
+    out = {"corpus": corpus_name, "query": query, "considered": len(cands)}
+
+    # ---- small corpus: don't rank, include everything (declared opt-in)
+    all_under = spec.get("include_all_under")
+    if all_under and sum(len(c["text"].encode("utf-8", "replace"))
+                         for c in cands) <= int(all_under):
+        out["included_all"] = True
+        out["entries"] = [entry(c) for c in cands]
+        return out
+    out["included_all"] = False
+
+    # ---- channels -> rankings (each may abstain when signal-free)
+    ranks = {}
+    qtok = set(localmodel.split_identifiers(query))
+    ranks["lexical"] = _rank_desc(
+        {c["key"]: float(len(qtok & set(localmodel.split_identifiers(c["text"]))))
+         for c in cands}, keys)
+
+    if corpus.get("embed_with"):
+        qvec, vectors = _corpus_vectors(env, corpus_name, corpus, cands, query)
+        ranks["semantic"] = _rank_desc(
+            {kk: localmodel.cosine(qvec, vec) for kk, vec in vectors.items()},
+            keys)
+    else:
+        ranks["semantic"] = None
+
+    if corpus.get("ts"):
+        norm = _comparable({c["key"]: c["ts"] for c in cands
+                            if c["ts"] is not None})
+        if norm and len(set(norm.values())) > 1:
+            ordered = sorted(norm, key=lambda kk: (norm[kk], kk))
+            ordered.reverse()             # newest first, ties by key
+            ranks["recency"] = _channel_ranks(ordered, keys)
+        else:
+            ranks["recency"] = None
+    else:
+        ranks["recency"] = None
+
+    if corpus.get("weight"):
+        vals = {c["key"]: c["weight"] for c in cands
+                if isinstance(c["weight"], (int, float))
+                and not isinstance(c["weight"], bool)}
+        ranks["prior"] = _rank_desc({kk: float(v) for kk, v in vals.items()},
+                                    keys) if vals else None
+    else:
+        ranks["prior"] = None
+
+    if boost_spec:
+        want = [_template(boost_spec[col], payload_map)
+                for col in sorted(boost_spec)]
+        ranks["boost"] = _rank_desc(
+            {c["key"]: float(sum(1 for got, w in zip(c["boost"], want)
+                                 if got is not None and str(got) == str(w)))
+             for c in cands}, keys)
+    else:
+        ranks["boost"] = None
+
+    # ---- Reciprocal Rank Fusion over the channels that voted
+    weights = {ch: 1.0 for ch in SELECT_CHANNELS}
+    weights.update(spec.get("weights") or {})
+    fused = {}
+    for kk in keys:
+        s = 0.0
+        for ch in SELECT_CHANNELS:
+            if ranks[ch] is not None and weights[ch] > 0:
+                s += weights[ch] / (_RRF_K + ranks[ch][kk])
+        fused[kk] = s
+    top = sorted(keys, key=lambda kk: (-fused[kk], kk))[:k]
+    out["entries"] = [
+        entry(by_key[kk], fused[kk],
+              {ch: ranks[ch][kk] for ch in SELECT_CHANNELS
+               if ranks[ch] is not None})
+        for kk in top]
+    return out
+
+
+def _comparable(vals):
+    """Coerce a {key: ts} mapping to uniformly comparable values: all
+    numeric if every value parses as a number, else all strings (ISO
+    timestamps compare correctly lexicographically)."""
+    try:
+        return {kk: float(v) for kk, v in vals.items()}
+    except (TypeError, ValueError):
+        return {kk: str(v) for kk, v in vals.items()}
+
+
+def _corpus_vectors(env, corpus_name, corpus, cands, query):
+    """Ensure every candidate row has a vector for the corpus's embedder;
+    embed only rows that are new or whose text changed (text_sha pin).
+    Returns (query_vector, {key: vector})."""
+    from . import localmodel
+    from .util import canonical_json, sha256_text
+    conn = env.conn
+    model_name = corpus["embed_with"]
+    if model_name == "hashing":
+        dim = localmodel.HASHING_DEFAULT_DIM
+        model_sha = localmodel.hashing_model_sha(dim)
+        embed_fn = lambda t: localmodel.hash_embed(t, dim)  # noqa: E731
+    else:
+        mspec = env.pack.models[model_name]
+        if "hashing" in mspec:
+            dim = mspec["hashing"]["dim"]
+            model_sha = localmodel.hashing_model_sha(dim)
+            embed_fn = lambda t: localmodel.hash_embed(t, dim)  # noqa: E731
+        elif "path" in mspec:
+            weights, model_sha = localmodel.load_model(
+                mspec["path"], expected_sha=mspec["sha256"])
+            embed_fn = lambda t: localmodel.embed(t, weights)  # noqa: E731
+        else:
+            from . import runner
+            model_sha = sha256_text(canonical_json(
+                {"base_url": mspec["base_url"], "model": mspec["model"]}))
+            out_dir = Path(env.data_dir) / "corpus-embed" / corpus_name
+            embed_fn = lambda t: runner.embed_api(  # noqa: E731
+                mspec, t, timeout_s=60, out_dir=out_dir)
+    existing = {}
+    keys = [c["key"] for c in cands]
+    if keys:
+        ph = ",".join("?" * len(keys))
+        for r in conn.execute(
+                "SELECT key, text_sha, vector FROM corpus_embeddings"
+                " WHERE corpus=? AND model_sha=? AND key IN (%s)" % ph,
+                [corpus_name, model_sha] + keys):
+            existing[r["key"]] = (r["text_sha"], json.loads(r["vector"]))
+    vectors = {}
+    stale = []
+    for c in cands:
+        tsha = sha256_text(c["text"])
+        got = existing.get(c["key"])
+        if got is not None and got[0] == tsha:
+            vectors[c["key"]] = got[1]
+        else:
+            stale.append((c, tsha))
+    if stale:
+        with tx(conn):
+            for c, tsha in stale:
+                vec = embed_fn(c["text"])
+                conn.execute(
+                    "INSERT OR REPLACE INTO corpus_embeddings"
+                    " (corpus, key, model_sha, text_sha, dim, vector)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (corpus_name, c["key"], model_sha, tsha, len(vec),
+                     json.dumps(vec)))
+                vectors[c["key"]] = vec
+    return embed_fn(query), vectors
+
+
+def _check_select_spec(spec, pack):
+    corpora = getattr(pack, "corpora", None) or {}
+    if not spec.get("corpus") or spec["corpus"] not in corpora:
+        return ("select needs 'corpus' naming a pack corpora entry "
+                "(defined: %s)" % (sorted(corpora) or "none"))
+    if not spec.get("query") or not isinstance(spec["query"], str):
+        return "select needs a string 'query'"
+    for f in ("k", "max_chars", "include_all_under"):
+        v = spec.get(f)
+        if v is not None and (isinstance(v, bool) or not isinstance(v, int)
+                              or v < 1):
+            return "select '%s' must be a positive integer" % f
+    for f in ("filter", "boost"):
+        v = spec.get(f)
+        if v is not None and (not isinstance(v, dict) or not all(
+                isinstance(kk, str) for kk in v)):
+            return "select '%s' must be a mapping of column -> value" % f
+    w = spec.get("weights")
+    if w is not None:
+        if not isinstance(w, dict):
+            return "select 'weights' must be a mapping"
+        bad = set(w) - set(SELECT_CHANNELS)
+        if bad:
+            return ("select weights: unknown channels %s (known: %s)"
+                    % (sorted(bad), list(SELECT_CHANNELS)))
+        for ch, val in w.items():
+            if isinstance(val, bool) or not isinstance(val, (int, float)) \
+                    or val < 0:
+                return "select weights.%s must be a number >= 0" % ch
+    return None
+
+
+_ctx_select.check_spec = _check_select_spec
+
+
 @dataclass
 class ExecEnv:
     conn: "object"

@@ -65,6 +65,11 @@ class Pack:
     # effective retry policy: queue.POLICY merged with the pack's retry:
     # overrides (queue.build_policy). Empty = engine defaults.
     policy: dict = field(default_factory=dict)
+    # corpora: named selectable tables for the select: context provider —
+    # {name: {table, text, key?, ts?, weight?, embed_with?}}. Structure is
+    # checked here; table/column existence at engine start (after the pack's
+    # schema files have been applied).
+    corpora: dict = field(default_factory=dict)
     # timed triggers: ({event, every_s, data}, ...) — the daemon emits each
     # event once per every_s window (see Engine._schedule_tick).
     schedule: tuple = ()
@@ -76,7 +81,8 @@ class Pack:
 _PACK_KEYS = {"name", "paths", "params", "workflows", "blocks", "schema",
               "tools", "agents", "prompts", "schemas", "models", "workspace_root",
               "idle_interval_s", "unpark_interval_s", "agent_health_url",
-              "concurrency", "min_free_disk_mb", "retry", "schedule", "http"}
+              "concurrency", "min_free_disk_mb", "retry", "schedule", "http",
+              "corpora"}
 
 
 def load_pack(pack_dir) -> Pack:
@@ -185,13 +191,27 @@ def load_pack(pack_dir) -> Pack:
         with open(p) as f:
             schemas[sname] = yaml.safe_load(f)
 
-    # models: local weights (pinned by sha256) OR an embedding API endpoint
-    # (a "BERT-like" local server, any /embeddings-speaking service)
+    # models: local weights (pinned by sha256), an embedding API endpoint
+    # (a "BERT-like" local server, any /embeddings-speaking service), OR the
+    # built-in zero-setup hashing embedder.
     from .util import sha256_file
     models = {}
     for mname, spec in (doc.get("models") or {}).items():
         spec = spec or {}
-        if "path" in spec:
+        if "hashing" in spec:
+            h = spec["hashing"] if isinstance(spec["hashing"], dict) else {}
+            if set(spec) - {"hashing"}:
+                _fail("models.%s: hashing model takes only 'hashing: {dim}'"
+                      % mname)
+            if set(h) - {"dim"}:
+                _fail("models.%s: hashing accepts only 'dim'" % mname)
+            dim = h.get("dim", 256)
+            if isinstance(dim, bool) or not isinstance(dim, int) \
+                    or not (8 <= dim <= 4096):
+                _fail("models.%s: hashing dim must be an integer 8..4096"
+                      % mname)
+            models[mname] = {"hashing": {"dim": dim}}
+        elif "path" in spec:
             if "sha256" not in spec:
                 _fail("models.%s: local weights need 'sha256' (pinned)" % mname)
             mp = Path(str(spec["path"])).expanduser()
@@ -233,8 +253,9 @@ def load_pack(pack_dir) -> Pack:
                              "api_key_ref": spec.get("api_key_ref"),
                              "params": spec.get("params") or {}}
         else:
-            _fail("models.%s: needs either path+sha256 (local weights) or "
-                  "base_url+model (embedding API)" % mname)
+            _fail("models.%s: needs path+sha256 (local weights), "
+                  "base_url+model (embedding API), or hashing: {dim} "
+                  "(built-in zero-setup embedder)" % mname)
 
     agents = doc.get("agents") or {}
     for aname, acfg in agents.items():
@@ -249,6 +270,7 @@ def load_pack(pack_dir) -> Pack:
 
     schedule = _parse_schedule(doc.get("schedule"), _fail)
     http = _parse_http(doc.get("http"), _fail)
+    corpora = _parse_corpora(doc.get("corpora"), models, _fail)
 
     workspace_root = doc.get("workspace_root")
     if workspace_root:
@@ -267,8 +289,50 @@ def load_pack(pack_dir) -> Pack:
         agent_health_url=doc.get("agent_health_url"),
         concurrency=doc.get("concurrency") or {},
         min_free_disk_mb=int(doc.get("min_free_disk_mb", 0)),
-        policy=policy, schedule=schedule, http=http,
+        policy=policy, schedule=schedule, http=http, corpora=corpora,
     )
+
+
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_CORPUS_KEYS = {"table", "text", "key", "ts", "weight", "embed_with"}
+
+
+def _parse_corpora(entries, models, _fail) -> dict:
+    """corpora: {name: {table, text, key?, ts?, weight?, embed_with?}}.
+    table/columns are SQL identifiers (validated as such — they are later
+    quoted into statements); embed_with is 'hashing' or a models: entry.
+    Existence of the table/columns is checked at engine start, after the
+    pack's own schema files have been applied."""
+    if entries is None:
+        return {}
+    if not isinstance(entries, dict):
+        _fail("corpora: must be a mapping of name -> {table, text, ...}")
+    out = {}
+    for name, spec in entries.items():
+        where = "corpora.%s" % name
+        if not isinstance(name, str) or not _IDENT_RE.match(name):
+            _fail("corpora: bad corpus name %r" % (name,))
+        if not isinstance(spec, dict):
+            _fail("%s: must be a mapping" % where)
+        unknown = set(spec) - _CORPUS_KEYS
+        if unknown:
+            _fail("%s: unknown keys %s (accepted: %s)"
+                  % (where, sorted(unknown), sorted(_CORPUS_KEYS)))
+        for req in ("table", "text"):
+            if req not in spec:
+                _fail("%s: needs '%s'" % (where, req))
+        for field_name in ("table", "text", "key", "ts", "weight"):
+            v = spec.get(field_name)
+            if v is not None and (not isinstance(v, str)
+                                  or not _IDENT_RE.match(v)):
+                _fail("%s: '%s' must be a plain SQL identifier, got %r"
+                      % (where, field_name, v))
+        ew = spec.get("embed_with")
+        if ew is not None and ew != "hashing" and ew not in models:
+            _fail("%s: embed_with '%s' is neither 'hashing' nor a models: "
+                  "entry (defined: %s)" % (where, ew, sorted(models) or "none"))
+        out[name] = dict(spec)
+    return out
 
 
 _EVERY_RE = re.compile(r"^(\d+)([smhd])$")

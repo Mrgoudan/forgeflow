@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.4.0 — 2026-07-11
+
+Context selection over your own data. Schema: v4 (`corpus_embeddings`) —
+existing roots migrate automatically.
+
+### Added
+- **Corpora**: declare any table/view as selectable
+  (`corpora: {name: {table, text, key?, ts?, weight?, embed_with?}}`);
+  table/column existence checked at engine start.
+- **`select:` context provider** — for each task, pick the most
+  relevant/important corpus rows: SQL metadata pre-filter (`filter:`),
+  independent ranking channels (identifier-aware lexical, optional
+  semantic, recency, importance prior, `boost:` link matching) fused with
+  Reciprocal Rank Fusion; channels with no signal abstain. Deterministic,
+  explainable (per-entry fused score + channel ranks), `include_all_under`
+  bypasses ranking for small corpora, oversized entries truncate with an
+  explicit flag. Design choices are grounded in published production-RAG
+  results — see docs/LLM.md.
+- **`hashing` embedder** (`models: {fast: {hashing: {dim: 256}}}` or
+  `embed_with: hashing`): deterministic, stdlib-only, zero-setup — rows
+  never leave the machine to become searchable. Real weights or an
+  `/embeddings` endpoint remain pluggable per corpus.
+- **Incremental vector maintenance**: rows are (re)embedded at query time
+  only when new or changed (`text_sha` pin), stored in `corpus_embeddings`.
+
 ## 0.3.1 — 2026-07-11
 
 ### Fixed

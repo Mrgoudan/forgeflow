@@ -121,6 +121,81 @@ a stale answer. `llm check` on a replay binding reports how many recorded
 verdicts the source holds. Per-role binding form:
 `agents: { fix: { backend: replay, source: /path/to/live-root } }`.
 
+## Selecting context from your own tables (corpora + select)
+
+You have a database of related knowledge — findings, lessons, docs, past
+results, any tables your pack ships. For each task, the engine can pick the
+most relevant/important rows and hand exactly those to the model:
+
+```yaml
+# project.yaml — map ANY table to the standard shape
+corpora:
+  lessons:
+    table: lessons          # any table or view (pack schema: files)
+    key: id                 # stable row id (default: rowid)
+    text: summary           # what gets matched
+    ts: created_at          # optional: recency signal
+    weight: confidence      # optional: your own importance column
+    embed_with: hashing     # zero-setup embedder; or a models: entry
+```
+
+```yaml
+# any agent step
+context:
+  - payload
+  - select:
+      corpus: lessons
+      query: "{payload.title}"
+      k: 5
+      filter: { repo: "{payload.repo}" }     # hard scope, pushed into SQL
+      boost:  { component: "{payload.component}" }   # soft: same-component rows rise
+```
+
+How ranking works — and why it is built this way (each choice is grounded
+in published production results):
+
+- **Independent channels, fused by Reciprocal Rank Fusion.** Lexical
+  (identifier-aware token overlap — `flagSkipReason` matches "skip
+  reason"), semantic (if `embed_with`), recency (if `ts`), prior (if
+  `weight`), boost. Hybrid lexical+vector consistently beats either alone
+  in production (Anthropic's contextual-retrieval benchmarks; Uber's Genie
+  runs BM25 beside dense search; Elastic measured RRF +18% NDCG over BM25
+  alone). RRF specifically because Elastic also showed *calibrated linear
+  score weights need ~40 labeled queries per dataset to beat it* — rank
+  fusion is the robust default when you have no labels, which is every
+  fresh corpus. A channel with no signal (all scores equal) abstains
+  rather than voting noise.
+- **The full filtered pool is scored, not a top-K-then-rerank.** Recency
+  and priors only work when applied over the whole candidate set (a
+  documented failure mode of narrow cosine cuts). Brute force is the
+  *correct* architecture at this scale: benchmarks put exhaustive SQLite
+  vector scan well under 100ms up to ~100K vectors, and embedded apps live
+  in the thousands-to-hundreds-of-thousands regime. No ANN index, no
+  index maintenance, perfect recall.
+- **Embeddings are optional — and local by default.** The industry's
+  coding agents moved *away* from mandatory embeddings (Sourcegraph
+  dropped them for Cody citing third-party data exposure, index upkeep,
+  and scaling; Copilot's biggest context win was deterministic
+  neighboring-tabs matching). forgeflow's default `hashing` embedder is
+  deterministic, dependency-free, and **your rows never leave the
+  machine** to be indexed. Point `embed_with` at pinned weights or an
+  `/embeddings` endpoint per corpus when you want true semantics.
+- **Small corpus? Don't rank.** `include_all_under: 65536` includes the
+  whole filtered corpus verbatim when it fits — below a real threshold,
+  retrieval infrastructure is pure overhead (Anthropic's guidance:
+  small knowledge bases belong in the prompt directly).
+- **Explainable and deterministic.** Every selected entry carries its
+  fused score and per-channel ranks in the injected context; identical db
+  state yields identical selection forever (fixed tie-breaks), so replay
+  and regression tests stay honest. Oversized entries are truncated with
+  a `truncated: true` flag — never silently.
+
+Vectors live in the engine's `corpus_embeddings` table and are maintained
+incrementally at query time: a row is (re)embedded only when new or when
+its text changed (`text_sha` pin). Startup checks the whole chain: a
+corpus naming a missing table/column, or an `embed_with` that doesn't
+resolve, refuses to start with the exact field named.
+
 ## Operating it
 
 ```bash
