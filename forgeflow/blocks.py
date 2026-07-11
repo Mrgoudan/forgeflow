@@ -260,6 +260,9 @@ def shell_run(ctx, task, prev):
     expected_exit = int(ctx.get("expected_exit", 0))
     code, out, err = _run(ctx, cmd, "cmd", deadline, cwd=cwd, env=env)
     result = {"exit_code": code, "stdout_path": out, "stderr_path": err}
+    if cwd:
+        result["path"] = cwd     # thread the working tree so later steps
+                                 # ({prev.path}, agent cwd pickup) keep it
     if code != expected_exit:
         return "nonzero", result
     if ctx.get("expected_file"):
@@ -333,18 +336,25 @@ def check_suite(ctx, task, prev):
     code is in that check's retryable_exits, else red."""
     deadline = _deadline(ctx)
     ran = []
+    step_cwd = _tpl(ctx, task, prev, ctx.get("cwd")) if ctx.get("cwd") else None
     for check in ctx["checks"]:
         cmd = [_tpl(ctx, task, prev, c) for c in check["cmd"]]
-        cwd = _tpl(ctx, task, prev, check.get("cwd") or ctx.get("cwd")) \
-            if (check.get("cwd") or ctx.get("cwd")) else None
+        cwd = _tpl(ctx, task, prev, check.get("cwd")) \
+            if check.get("cwd") else step_cwd
         code, out, err = _run(ctx, cmd, "check-%s" % check["name"], deadline, cwd=cwd)
         ran.append({"name": check["name"], "exit_code": code,
                     "stdout_path": out, "stderr_path": err})
         if code != 0:
             outcome = ("red_retryable"
                        if code in check.get("retryable_exits", ()) else "red")
-            return outcome, {"checks": ran, "failed": check["name"]}
-    return "green", {"checks": ran, "failed": None}
+            result = {"checks": ran, "failed": check["name"]}
+            if step_cwd:
+                result["path"] = step_cwd
+            return outcome, result
+    result = {"checks": ran, "failed": None}
+    if step_cwd:
+        result["path"] = step_cwd    # thread the working tree forward
+    return "green", result
 
 
 # -------------------------------------------------------------- llm block

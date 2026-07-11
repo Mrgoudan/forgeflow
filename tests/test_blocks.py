@@ -156,3 +156,28 @@ class BlocksTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CwdThreadingTest(unittest.TestCase):
+    def test_shell_run_threads_path(self):
+        import tempfile
+        from forgeflow.blocks import run_isolated
+        d = tempfile.mkdtemp()
+        outcome, result = run_isolated("shell.run",
+                                       ctx={"cmd": ["true"], "cwd": d})
+        self.assertEqual((outcome, result["path"]), ("ok", d))
+        outcome, result = run_isolated("shell.run", ctx={"cmd": ["true"]})
+        self.assertNotIn("path", result)          # no cwd -> nothing invented
+
+    def test_check_suite_threads_path(self):
+        import tempfile
+        from forgeflow.blocks import run_isolated
+        d = tempfile.mkdtemp()
+        outcome, result = run_isolated(
+            "check.suite",
+            ctx={"cwd": d, "checks": [{"name": "a", "cmd": ["true"]}]})
+        self.assertEqual((outcome, result["path"]), ("green", d))
+        outcome, result = run_isolated(
+            "check.suite",
+            ctx={"cwd": d, "checks": [{"name": "a", "cmd": ["false"]}]})
+        self.assertEqual((outcome, result["path"]), ("red", d))

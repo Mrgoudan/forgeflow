@@ -225,3 +225,25 @@ steps:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DuplicateContextProviderTest(unittest.TestCase):
+    def test_same_provider_twice_is_refused(self):
+        """ctx is keyed by provider name — a duplicate would silently
+        overwrite the first section (found porting a real pack)."""
+        import tempfile
+        from pathlib import Path as P
+        d = P(tempfile.mkdtemp())
+        (d / "w.yaml").write_text(
+            "workflow: duptest\n"
+            "steps:\n"
+            "  - name: s\n"
+            "    block: shell.run\n"
+            "    timeout_s: 10\n"
+            "    params: { cmd: [\"true\"] }\n"
+            "    context: [payload, payload]\n"
+            "    outcomes: { ok: done, nonzero: failed, mismatch: failed,"
+            " timeout: failed }\n")
+        from forgeflow import loader
+        with self.assertRaisesRegex(SystemExit, "declared twice"):
+            loader.load_workflow_file(d / "w.yaml")

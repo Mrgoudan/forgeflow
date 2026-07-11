@@ -150,8 +150,12 @@ def load_workflow_file(path, pack=None) -> Workflow:
                              % (sorted(phantom), blk.name, sorted(declared)))
             _die(swhere, "; ".join(parts))
 
-        # context: accepted by the block, known to the provider registry
+        # context: accepted by the block, known to the provider registry.
+        # A provider may appear ONCE per step — ctx is keyed by provider
+        # name, so a duplicate would silently overwrite the first (found
+        # porting a real pack; silent loss is never acceptable).
         context = []
+        seen_providers = set()
         for entry in s.get("context") or []:
             if isinstance(entry, str):
                 cname, spec = entry, {}
@@ -160,6 +164,11 @@ def load_workflow_file(path, pack=None) -> Workflow:
                 spec = spec or {}
             else:
                 _die(swhere, "malformed context entry %r" % entry)
+            if cname in seen_providers:
+                _die(swhere, "context provider '%s' declared twice — a step "
+                     "gets ONE section per provider (merge the specs, or use "
+                     "a different provider such as notes)" % cname)
+            seen_providers.add(cname)
             if "*" not in blk.accepts_context and cname not in blk.accepts_context:
                 _die(swhere, "context '%s' not accepted by block '%s' (accepts: %s)"
                      % (cname, blk.name, sorted(blk.accepts_context) or "nothing"))
