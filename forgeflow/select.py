@@ -75,7 +75,11 @@ def _ctx_select(env, task, spec):
     conn = env.conn
     corpus_name = spec["corpus"]
     corpus = env.pack.corpora[corpus_name]
-    payload_map = {"payload": task.get("payload") or {}}
+    # template scope: the task payload (fixed per task) AND the previous step's
+    # result (step state) — so a per-item loop can select by what its cursor
+    # picked ("{prev.summary}"), not just by the payload.
+    payload_map = {"payload": task.get("payload") or {},
+                   "prev": getattr(env, "step_prev", None) or {}}
     raw_q = spec["query"]
     queries = [_template(q, payload_map)
                for q in (raw_q if isinstance(raw_q, list) else [raw_q])]

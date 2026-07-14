@@ -336,6 +336,10 @@ class ExecEnv:
     provider_deadline: float = None  # monotonic deadline while context providers
                                      # run (set by _run_block); providers cap their
                                      # own model/network calls against it.
+    step_prev: dict = None       # the previous step's result while context
+                                 # providers run (set by _run_block) — lets a
+                                 # provider condition on step state, e.g. a
+                                 # select: query templated from "{prev.*}".
     preview: bool = False        # True = rendering context for a human (llm show):
                                  # providers must not write ledgers or call models.
 
@@ -488,6 +492,10 @@ def _run_block(env, step, task, prev):
     # providers run, env.provider_deadline lets them cap their own calls.
     assembly_started = time.monotonic()
     env.provider_deadline = assembly_started + step.timeout_s
+    # step state for providers: the previous step's result, so a provider (e.g.
+    # select:) can be conditioned on where the walk actually is — a loop step
+    # can query by the item its cursor picked, not just the task payload.
+    env.step_prev = prev or {}
     try:
         for provider_name, spec in step.context:
             provider = CONTEXT_PROVIDERS.get(provider_name)
@@ -497,6 +505,7 @@ def _run_block(env, step, task, prev):
             ctx[provider_name] = provider(env, task, spec)
     finally:
         env.provider_deadline = None
+        env.step_prev = None
     remaining = step.timeout_s - (time.monotonic() - assembly_started)
     if remaining <= 0:
         raise subprocess.TimeoutExpired(

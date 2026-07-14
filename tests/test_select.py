@@ -190,6 +190,33 @@ class SelectProviderTest(unittest.TestCase):
         self.assertEqual(out["considered"], 1)
         self.assertEqual(self._keys(out), ["b"])
 
+    def test_query_templates_from_step_prev(self):
+        # a per-item loop selects by what its cursor picked: the query
+        # templates from the PREVIOUS step's result via env.step_prev.
+        self._row("a", "append an element to the end of a growable array")
+        self._row("b", "billing invoice quarterly totals report")
+        self.eng.env.step_prev = {"summary": "append element growable array"}
+        try:
+            out = self._select({"corpus": "notes",
+                                "query": "{prev.summary}", "k": 1})
+        finally:
+            self.eng.env.step_prev = None
+        self.assertEqual(self._keys(out), ["a"])
+
+    def test_prev_missing_key_fails_loud(self):
+        # template semantics stay STRICT (same as payload): referencing a prev
+        # key the previous step did not produce is a loud error, not a silent
+        # empty query — so a select: over prev requires the feeding step to
+        # always carry that field.
+        self._row("a", "alpha")
+        self.eng.env.step_prev = {}
+        try:
+            with self.assertRaises(KeyError):
+                self._select({"corpus": "notes",
+                              "query": "x {prev.summary}", "k": 1})
+        finally:
+            self.eng.env.step_prev = None
+
     def test_boost_lifts_linked_rows(self):
         self._row("foreign", "parser include crash", repo="other",
                   ts="2026-01-01 00:00:00")
