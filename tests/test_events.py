@@ -13,11 +13,15 @@ class EventsTest(unittest.TestCase):
         self.conn = db.connect(self.dir / "t.db")
         self.subs = {"item.triaged": ["fix", "notify"],
                      "custom.ping": ["pong"]}
+        # the lifecycle is pack-declared now; tests declare a minimal one
+        self.states = {"found": {"triaged", "rejected"},
+                       "triaged": {"merged"}, "merged": set(),
+                       "rejected": set()}
 
     def test_fanout_enqueues_all_subscribers_atomically(self):
         fid = db.upsert_item(self.conn, "K", "t", "test", "r")
         db.record_transition(self.conn, fid, "triaged", "evidence:x",
-                             subscriptions=self.subs)
+                             subscriptions=self.subs, states=self.states)
         tasks = self.conn.execute(
             "SELECT kind, state FROM tasks ORDER BY id").fetchall()
         self.assertEqual([(t["kind"], t["state"]) for t in tasks],
@@ -34,7 +38,8 @@ class EventsTest(unittest.TestCase):
         try:
             with util.tx(self.conn):
                 db.record_transition(self.conn, fid, "triaged", "evidence:x",
-                                     subscriptions=self.subs)
+                                     subscriptions=self.subs,
+                                     states=self.states)
                 raise RuntimeError("boom mid-transaction")
         except RuntimeError:
             pass
@@ -61,12 +66,20 @@ class EventsTest(unittest.TestCase):
 
     def test_illegal_transition_refused(self):
         fid = db.upsert_item(self.conn, "K", "t", "test", "r")
-        with self.assertRaises(db.TransitionError):
-            db.record_transition(self.conn, fid, "merged", "nope")
-        with self.assertRaises(db.TransitionError):
-            db.record_transition(self.conn, fid, "not_a_state", "nope")
-        with self.assertRaises(db.TransitionError):
-            db.record_transition(self.conn, 999, "triaged", "nope")
+        with self.assertRaises(db.TransitionError):   # not reachable from found
+            db.record_transition(self.conn, fid, "merged", "nope",
+                                 states=self.states)
+        with self.assertRaises(db.TransitionError):   # not a declared state
+            db.record_transition(self.conn, fid, "not_a_state", "nope",
+                                 states=self.states)
+        with self.assertRaises(db.TransitionError):   # no such item
+            db.record_transition(self.conn, 999, "triaged", "nope",
+                                 states=self.states)
+
+    def test_no_declared_lifecycle_is_loud(self):
+        fid = db.upsert_item(self.conn, "K2", "t", "test", "r")
+        with self.assertRaisesRegex(db.TransitionError, "item_states"):
+            db.record_transition(self.conn, fid, "triaged", "nope")
 
     def test_unsubscribed_event_is_just_a_fact(self):
         db.emit_event(self.conn, "custom.unconsumed", {"x": 1}, self.subs)

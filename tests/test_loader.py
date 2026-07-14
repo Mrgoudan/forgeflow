@@ -28,7 +28,9 @@ steps:
 
 
 def fake_pack(**kw):
-    return SimpleNamespace(paths=kw.get("paths", {}), params={}, agents=kw.get("agents", {}))
+    return SimpleNamespace(paths=kw.get("paths", {}), params={},
+                           agents=kw.get("agents", {}),
+                           item_states=kw.get("item_states"))
 
 
 class LoaderTest(unittest.TestCase):
@@ -186,8 +188,18 @@ steps:
         p = self._write("w.yaml", "workflow: w\nconsumes: [item.polished]\nsteps:\n"
                                   "  - {name: a, block: db.transition, timeout_s: 5,\n"
                                   "     params: {to_state: triaged, event: e}, outcomes: {ok: done}}\n")
+        pack = fake_pack(item_states={"found": {"triaged"}, "triaged": set()})
         with self.assertRaisesRegex(SystemExit, "unknown item state 'polished'"):
-            loader.load_workflow_file(p)
+            loader.load_workflow_file(p, pack=pack)
+
+    def test_lifecycle_use_without_item_states_refused(self):
+        # a pack that stages transitions MUST declare its lifecycle
+        p = self._write("w.yaml", "workflow: w\nconsumes: [item.triaged]\nsteps:\n"
+                                  "  - {name: a, block: shell.run, timeout_s: 5,\n"
+                                  "     params: {cmd: [true]}, outcomes: {ok: done}}\n")
+        pack = fake_pack(item_states={})
+        with self.assertRaisesRegex(SystemExit, "declares no item_states"):
+            loader.load_workflow_file(p, pack=pack)
 
     def test_llm_binding_on_local_block_refused(self):
         p = self._write("w.yaml", """\

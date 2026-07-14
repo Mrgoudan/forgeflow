@@ -192,3 +192,25 @@ class QueueTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClockSkewClampTest(unittest.TestCase):
+    def test_far_future_next_attempt_is_clamped(self):
+        from helpers import tmpdir
+        conn = db.connect(tmpdir() / "t.db")
+        queue.enqueue(conn, "w", {"a": 1})
+        conn.execute("UPDATE tasks SET state='parked',"
+                     " next_attempt=datetime('now','+10 days')")
+        n = queue.clamp_clock_skew(conn)
+        self.assertEqual(n, 1)
+        row = conn.execute("SELECT next_attempt <= datetime('now','+3601 seconds') ok"
+                           " FROM tasks").fetchone()
+        self.assertEqual(row["ok"], 1)
+        self.assertEqual(queue.clamp_clock_skew(conn), 0)   # idempotent
+
+    def test_normal_backoff_untouched(self):
+        from helpers import tmpdir
+        conn = db.connect(tmpdir() / "t.db")
+        queue.enqueue(conn, "w", {"a": 1})
+        conn.execute("UPDATE tasks SET next_attempt=datetime('now','+300 seconds')")
+        self.assertEqual(queue.clamp_clock_skew(conn), 0)

@@ -564,7 +564,8 @@ def _apply_staged(env, ops, task):
             out["transition_id"] = dbmod.record_transition(
                 env.conn, op["item_id"], op["to_state"], op["event"],
                 evidence=op.get("evidence"), run_id=op.get("run_id"),
-                subscriptions=env.subscriptions)
+                subscriptions=env.subscriptions,
+                states=getattr(env.pack, "item_states", None) if env.pack else None)
         elif kind == "emit_event":
             out["event_id"] = dbmod.emit_event(
                 env.conn, op["name"], op["payload"], env.subscriptions)

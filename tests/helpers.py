@@ -53,6 +53,18 @@ def make_pack(base: Path, repo: Path, workflows_dir=None, extra="") -> Path:
         "  - %s\n"
         "tools:\n"
         "  git: { path: git, version_cmd: ['--version'] }\n"
+        # the lifecycle is pack-declared; the demo pack declares the classic one
+        "item_states:\n"
+        "  found:     [triaged, rejected]\n"
+        "  triaged:   [fixing, deferred]\n"
+        "  fixing:    [verifying, deferred, failed]\n"
+        "  verifying: [pr_open, fixing, deferred, failed]\n"
+        "  pr_open:   [in_review, merged, failed]\n"
+        "  in_review: [fixing, merged, deferred]\n"
+        "  merged:    []\n"
+        "  deferred:  [triaged]\n"
+        "  rejected:  []\n"
+        "  failed:    [triaged]\n"
         "%s" % (repo, outbox, wf, extra))
     return pack_dir
 

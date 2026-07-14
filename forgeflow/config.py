@@ -70,6 +70,12 @@ class Pack:
     # checked here; table/column existence at engine start (after the pack's
     # schema files have been applied).
     corpora: dict = field(default_factory=dict)
+    # item lifecycle — PACK-DECLARED: {state: [allowed next states]}. The
+    # engine core ships NO lifecycle (it defines only the initial state
+    # 'found' = "recorded"); what states exist and how they may move is
+    # domain vocabulary and belongs to the pack. Empty = this pack does not
+    # use item transitions at all (staging one is then a loud error).
+    item_states: dict = field(default_factory=dict)
     # timed triggers: ({event, every_s, data}, ...) — the daemon emits each
     # event once per every_s window (see Engine._schedule_tick).
     schedule: tuple = ()
@@ -82,7 +88,7 @@ _PACK_KEYS = {"name", "paths", "params", "workflows", "blocks", "schema",
               "tools", "agents", "prompts", "schemas", "models", "workspace_root",
               "idle_interval_s", "unpark_interval_s", "agent_health_url",
               "concurrency", "min_free_disk_mb", "retry", "schedule", "http",
-              "corpora"}
+              "corpora", "item_states"}
 
 
 def load_pack(pack_dir) -> Pack:
@@ -271,6 +277,7 @@ def load_pack(pack_dir) -> Pack:
     schedule = _parse_schedule(doc.get("schedule"), _fail)
     http = _parse_http(doc.get("http"), _fail)
     corpora = _parse_corpora(doc.get("corpora"), models, agents, _fail)
+    item_states = _parse_item_states(doc.get("item_states"), _fail)
 
     workspace_root = doc.get("workspace_root")
     if workspace_root:
@@ -290,7 +297,34 @@ def load_pack(pack_dir) -> Pack:
         concurrency=doc.get("concurrency") or {},
         min_free_disk_mb=int(doc.get("min_free_disk_mb", 0)),
         policy=policy, schedule=schedule, http=http, corpora=corpora,
+        item_states=item_states,
     )
+
+
+def _parse_item_states(doc, _fail):
+    """item_states: {state: [allowed next states]}. The pack owns the item
+    lifecycle; the engine only checks the map is well-formed: every successor
+    must itself be a declared state, and 'found' (the engine's sole built-in
+    initial state) must be declared whenever the map is non-empty."""
+    if not doc:
+        return {}
+    if not isinstance(doc, dict):
+        _fail("item_states must be a mapping of state -> [next states]")
+    states = {}
+    for k, v in doc.items():
+        if not isinstance(k, str) or not k:
+            _fail("item_states: state names must be non-empty strings")
+        nxt = v or []
+        if not isinstance(nxt, list) or not all(isinstance(x, str) for x in nxt):
+            _fail("item_states.%s must be a list of state names" % k)
+        states[k] = set(nxt)
+    if "found" not in states:
+        _fail("item_states must declare 'found' (items are created in it)")
+    for k, nxt in states.items():
+        for x in nxt:
+            if x not in states:
+                _fail("item_states.%s lists undeclared state '%s'" % (k, x))
+    return states
 
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")

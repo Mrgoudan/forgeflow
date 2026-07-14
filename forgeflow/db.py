@@ -3,10 +3,10 @@
 Single-writer (the daemon). WAL mode. No ORM — the schema IS the design.
 
 Two choke points live here:
-- record_transition() is the ONLY way item state changes. It enforces
-  ITEM_STATES, appends to the audit log, and fans the transition event
-  out to subscribed workflows — all inside the caller's transaction, so
-  workflow interaction is atomic.
+- record_transition() is the ONLY way item state changes. It enforces the
+  PACK-DECLARED lifecycle (project.yaml item_states:), appends to the audit
+  log, and fans the transition event out to subscribed workflows — all
+  inside the caller's transaction, so workflow interaction is atomic.
 - emit_event() is the ONLY way any event (item or otherwise) reaches
   the queue. Idempotency lives in queue.enqueue's payload-hash unique key.
 """
@@ -19,20 +19,11 @@ from pathlib import Path
 from . import queue
 from .util import ensure_tx
 
-# The item lifecycle. Transitions happen ONLY through record_transition(),
-# which enforces this map and appends to the audit log.
-ITEM_STATES = {
-    "found":     {"triaged", "rejected"},
-    "triaged":   {"fixing", "deferred"},
-    "fixing":    {"verifying", "deferred", "failed"},
-    "verifying": {"pr_open", "fixing", "deferred", "failed"},
-    "pr_open":   {"in_review", "merged", "failed"},
-    "in_review": {"fixing", "merged", "deferred"},  # fixing = review requested changes
-    "merged":    set(),
-    "deferred":  {"triaged"},   # human can un-defer
-    "rejected":  set(),
-    "failed":    {"triaged"},   # human can requeue
-}
+# The item lifecycle is PACK-DECLARED (project.yaml `item_states:`) — what
+# states exist and how they may move is domain vocabulary, not an engine
+# concept. The engine defines only the initial state 'found' ("recorded")
+# and the mechanism: record_transition() enforces whatever map the pack
+# declares and appends to the audit log.
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -46,8 +37,8 @@ CREATE TABLE IF NOT EXISTS items (
     severity      TEXT,
     repo          TEXT NOT NULL,
     base_sha      TEXT,
-    branch        TEXT,                  -- fix branch name once fixing
-    pr_number     INTEGER,
+    -- (no forge columns here: pr/branch bookkeeping is domain vocabulary.
+    --  A pack that needs it adds its own columns/table via its migration.)
     created_at    TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -388,7 +379,7 @@ def _migrate(conn, fresh):
 
 
 class TransitionError(ValueError):
-    """A transition outside ITEM_STATES. Always a caller bug — loud."""
+    """A transition outside the pack-declared item_states. Caller bug — loud."""
 
 
 def connect(path) -> sqlite3.Connection:
@@ -448,11 +439,17 @@ def emit_event(conn, name: str, payload: dict, subscriptions=None) -> int:
 
 
 def record_transition(conn, item_id: int, to_state: str, event: str,
-                      evidence=None, run_id=None, subscriptions=None) -> int:
-    """The ONLY way item state changes. Enforces ITEM_STATES, appends
-    the audit row, and fans out 'item.<to_state>' to subscribed workflows
-    in the SAME transaction. Returns the transition id."""
-    if to_state not in ITEM_STATES:
+                      evidence=None, run_id=None, subscriptions=None,
+                      states=None) -> int:
+    """The ONLY way item state changes. Enforces the pack-declared lifecycle
+    (`states` = pack.item_states), appends the audit row, and fans out
+    'item.<to_state>' to subscribed workflows in the SAME transaction.
+    Returns the transition id."""
+    if not states:
+        raise TransitionError(
+            "pack declares no item_states — the item lifecycle is "
+            "pack-defined; add item_states: to project.yaml")
+    if to_state not in states:
         raise TransitionError("unknown item state '%s'" % to_state)
     with ensure_tx(conn):
         row = conn.execute("SELECT state FROM items WHERE id=?",
@@ -460,7 +457,7 @@ def record_transition(conn, item_id: int, to_state: str, event: str,
         if row is None:
             raise TransitionError("item %s does not exist" % item_id)
         from_state = row["state"]
-        if to_state not in ITEM_STATES[from_state]:
+        if to_state not in states.get(from_state, ()):
             raise TransitionError(
                 "illegal transition %s -> %s for item %s (event %s)"
                 % (from_state, to_state, item_id, event))

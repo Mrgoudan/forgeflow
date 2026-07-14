@@ -455,3 +455,17 @@ def apply_fanout(conn, op: dict, task: dict, subscriptions) -> int:
             db.emit_event(conn, op["name"], payload, subscriptions)
         check_join_fire(conn, gid, subscriptions)
     return gid
+
+
+def clamp_clock_skew(conn, horizon_s=172800, to_s=3600):
+    """Wall-clock guard: next_attempt is wall-clock arithmetic (durable across
+    restarts — the right base for a queue), but a backward clock jump (NTP
+    correction) can leave timestamps absurdly far in the future, stranding
+    parked/backoff tasks. Any next_attempt beyond `horizon_s` from now is
+    treated as skew and clamped to now + `to_s`. Returns rows clamped."""
+    cur = conn.execute(
+        "UPDATE tasks SET next_attempt = datetime('now', '+' || ? || ' seconds')"
+        " WHERE next_attempt IS NOT NULL"
+        "   AND next_attempt > datetime('now', '+' || ? || ' seconds')",
+        (int(to_s), int(horizon_s)))
+    return cur.rowcount

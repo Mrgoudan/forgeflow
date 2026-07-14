@@ -27,7 +27,6 @@ import yaml
 
 from . import blocks as blocks_mod
 from .contract import CONTEXT_PROVIDERS, Workflow, WorkflowError
-from .db import ITEM_STATES
 from .util import EVENT_RE as _EVENT_RE
 from .util import template
 
@@ -61,9 +60,17 @@ def load_workflow_file(path, pack=None) -> Workflow:
             _die(where, "malformed event name %r (want e.g. 'item.triaged')" % ev)
         if ev.startswith("item."):
             state = ev.split(".", 1)[1]
-            if state not in ITEM_STATES:
-                _die(where, "event %r names unknown item state '%s' (known: %s)"
-                     % (ev, state, ", ".join(sorted(ITEM_STATES))))
+            # lifecycle checks need pack context; without one (standalone
+            # tooling loads) they defer to record_transition at runtime.
+            states = getattr(pack, "item_states", None) if pack is not None else None
+            if states is not None:
+                if not states:
+                    _die(where, "event %r uses the item lifecycle but the pack "
+                         "declares no item_states: (the lifecycle is "
+                         "pack-defined)" % ev)
+                if state not in states:
+                    _die(where, "event %r names unknown item state '%s' "
+                         "(known: %s)" % (ev, state, ", ".join(sorted(states))))
 
     steps = doc.get("steps")
     if not steps or not isinstance(steps, list):
@@ -241,8 +248,15 @@ def load_workflow_file(path, pack=None) -> Workflow:
         if blk.name == "db.transition":
             to_state = params.get("to_state")
             if isinstance(to_state, str) and "{" not in to_state:
-                if to_state not in ITEM_STATES:
-                    _die(swhere, "to_state '%s' is not a item state" % to_state)
+                states = getattr(pack, "item_states", None) if pack is not None else None
+                if states is not None:
+                    if not states:
+                        _die(swhere, "stages an item transition but the pack "
+                             "declares no item_states: (the lifecycle is "
+                             "pack-defined)")
+                    if to_state not in states:
+                        _die(swhere, "to_state '%s' is not a item state"
+                             % to_state)
                 implied = "item." + to_state
                 if implied not in emits:
                     _die(swhere, "stages transition to '%s' but 'emits:' does not "

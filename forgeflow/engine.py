@@ -307,6 +307,10 @@ class Engine:
                         self._beat()
                         last_beat = now
                     if now - last_unpark >= unpark_every:
+                        n = queue.clamp_clock_skew(self.conn)
+                        if n:
+                            print("engine: clock skew — clamped %d far-future"
+                                  " next_attempt(s)" % n)
                         self._unpark_tick()
                         last_unpark = now
                     self._schedule_tick()

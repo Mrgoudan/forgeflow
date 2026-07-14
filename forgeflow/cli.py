@@ -514,6 +514,20 @@ def cmd_doctor(args):
         dead = not alive
         if dead:
             issues.append("daemon heartbeat stale (%ds > %ds) — down or stuck" % (age, stale_s))
+        if age < -60:   # heartbeat FROM THE FUTURE: the clock jumped backwards
+            issues.append("clock skew: heartbeat %ds in the future — wall clock "
+                          "moved backwards (NTP jump?); backoff/park timings are "
+                          "suspect until it settles" % -age)
+
+    # wall-clock arithmetic guard: next_attempt far beyond any sane backoff
+    # means the clock jumped while timestamps were written (the daemon clamps
+    # these each unpark tick; doctor reports them between ticks).
+    skewed = conn.execute(
+        "SELECT count(*) c FROM tasks WHERE next_attempt IS NOT NULL"
+        " AND next_attempt > datetime('now','+172800 seconds')").fetchone()["c"]
+    if skewed:
+        issues.append("clock skew: %d task(s) with next_attempt >2 days out "
+                      "(daemon clamps these at the next unpark tick)" % skewed)
 
     running = conn.execute("SELECT count(*) c FROM tasks WHERE state='running'").fetchone()["c"]
     if running and dead:
