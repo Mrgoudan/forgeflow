@@ -383,7 +383,7 @@ def _task_page(conn, task_id, workflows, board, pack_name):
     parts.append("<h2>payload</h2><pre>%s</pre>"
                  % esc(json.dumps(payload, indent=1, sort_keys=True)[:4000]))
 
-    return _PAGE % {"title": esc("%s · task %d" % (pack_name, task_id)),
+    return _PAGE % {"title": esc(" · %s · task %d" % (pack_name, task_id)),
                     "beat": esc(t["state"]), "sections": _frame(parts)}
 
 
@@ -545,6 +545,6 @@ def _dashboard(conn, pack_name, board=None):
         age = int(time.time()) - st["daemon_heartbeat_epoch"]
         beat = ("daemon heartbeat %ds ago" % age) if age < 3600 else \
                "daemon heartbeat stale"
-    return _PAGE % {"title": esc(pack_name or ""),
+    return _PAGE % {"title": esc(" · " + pack_name if pack_name else ""),
                     "beat": esc(beat or "no heartbeat"),
                     "sections": _frame(parts)}
