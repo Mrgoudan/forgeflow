@@ -98,7 +98,7 @@ class HttpServerTest(unittest.TestCase):
 
         code, body = self._get(base + "/")
         self.assertEqual(code, 200)
-        self.assertIn("<h2>tasks</h2>", body)
+        self.assertIn("<h2>recent tasks</h2>", body)
 
         code, body = self._get(base + "/api/task/99999")
         self.assertEqual(code, 404)
@@ -166,3 +166,49 @@ class HttpServerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BoardTest(unittest.TestCase):
+    def test_board_parse_rejects_non_select(self):
+        from helpers import make_pack, tmpdir
+        from forgeflow import config
+        base = tmpdir()
+        pack_dir = make_pack(base, base, extra=(
+            "board:\n  task_panels:\n"
+            "    - { title: X, kind: table, sql: \"DELETE FROM tasks\" }\n"))
+        with self.assertRaisesRegex(SystemExit, "single SELECT"):
+            config.load_pack(pack_dir)
+
+    def test_task_page_and_panels(self):
+        import json as _json
+        import urllib.request
+        from helpers import make_pack, make_engine, tmpdir
+        from forgeflow import db, httpd, queue
+        base = tmpdir()
+        pack_dir = make_pack(base, base, extra=(
+            "board:\n  task_panels:\n"
+            "    - { title: Things, kind: table,\n"
+            "        sql: \"SELECT 'a' AS x, 1 AS n\" }\n"))
+        eng = make_engine(base, pack_dir)
+        queue.enqueue(eng.conn, "filebug", {"feature_key": "F"})
+        server = httpd.serve(base / "ff", eng.subscriptions,
+                             workflows=eng.workflows,
+                             board=eng.pack.board, pack_name="t")
+        httpd.serve_in_thread(server)
+        host, port = server.server_address
+        try:
+            page = urllib.request.urlopen(
+                "http://%s:%s/task/1" % (host, port)).read().decode()
+            self.assertIn("filebug", page)
+            self.assertIn("Things", page)          # the pack panel rendered
+            self.assertIn("walk", page)            # the step-graph section
+            body = urllib.request.urlopen(
+                "http://%s:%s/" % (host, port)).read().decode()
+            self.assertIn("/task/1", body)         # overview links tasks
+            r = urllib.request.urlopen(
+                "http://%s:%s/api/run/999/prompt" % (host, port))
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 404)          # artifact 404s safely
+        finally:
+            server.shutdown()
+            server.server_close()

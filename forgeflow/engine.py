@@ -357,7 +357,9 @@ class Engine:
         from . import httpd
         server = httpd.serve(self.root, self.subscriptions, host=spec["host"],
                              port=spec["port"], token=token,
-                             pack_name=self.pack.name)
+                             pack_name=self.pack.name,
+                             workflows=self.workflows,
+                             board=getattr(self.pack, "board", {}) or {})
         httpd.serve_in_thread(server)
         print("engine: http dashboard/api on %s:%d%s"
               % (server.server_address[0], server.server_address[1],

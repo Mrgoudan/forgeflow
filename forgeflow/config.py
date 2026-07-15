@@ -70,6 +70,12 @@ class Pack:
     # checked here; table/column existence at engine start (after the pack's
     # schema files have been applied).
     corpora: dict = field(default_factory=dict)
+    # board: pack-declared dashboard panels — read-only SELECTs rendered by
+    # the engine's generic widgets (table | status_grid | kv). The engine
+    # gains a MECHANISM, never domain: what a panel means belongs to the pack.
+    # {overview_panels: [...], task_panels: [...]}; task panels may bind SQL
+    # named params from the task payload via params: {sql_name: payload_key}.
+    board: dict = field(default_factory=dict)
     # item lifecycle — PACK-DECLARED: {state: [allowed next states]}. The
     # engine core ships NO lifecycle (it defines only the initial state
     # 'found' = "recorded"); what states exist and how they may move is
@@ -88,7 +94,7 @@ _PACK_KEYS = {"name", "paths", "params", "workflows", "blocks", "schema",
               "tools", "agents", "prompts", "schemas", "models", "workspace_root",
               "idle_interval_s", "unpark_interval_s", "agent_health_url",
               "concurrency", "min_free_disk_mb", "retry", "schedule", "http",
-              "corpora", "item_states"}
+              "corpora", "item_states", "board"}
 
 
 def load_pack(pack_dir) -> Pack:
@@ -278,6 +284,7 @@ def load_pack(pack_dir) -> Pack:
     http = _parse_http(doc.get("http"), _fail)
     corpora = _parse_corpora(doc.get("corpora"), models, agents, _fail)
     item_states = _parse_item_states(doc.get("item_states"), _fail)
+    board = _parse_board(doc.get("board"), _fail)
 
     workspace_root = doc.get("workspace_root")
     if workspace_root:
@@ -297,8 +304,52 @@ def load_pack(pack_dir) -> Pack:
         concurrency=doc.get("concurrency") or {},
         min_free_disk_mb=int(doc.get("min_free_disk_mb", 0)),
         policy=policy, schedule=schedule, http=http, corpora=corpora,
-        item_states=item_states,
+        item_states=item_states, board=board,
     )
+
+
+def _parse_board(doc, _fail):
+    """board: {overview_panels: [...], task_panels: [...]} — each panel
+    {title, kind: table|status_grid|kv, sql: SELECT..., params?: {name: key}}.
+    SELECT-only is enforced here (the board must never write)."""
+    if not doc:
+        return {}
+    if not isinstance(doc, dict):
+        _fail("board: must be a mapping")
+    unknown = set(doc) - {"overview_panels", "task_panels"}
+    if unknown:
+        _fail("board: unknown keys %s" % sorted(unknown))
+    out = {}
+    for section in ("overview_panels", "task_panels"):
+        panels = doc.get(section) or []
+        if not isinstance(panels, list):
+            _fail("board.%s must be a list" % section)
+        clean = []
+        for i, pn in enumerate(panels):
+            if not isinstance(pn, dict):
+                _fail("board.%s[%d] must be a mapping" % (section, i))
+            bad = set(pn) - {"title", "kind", "sql", "params"}
+            if bad:
+                _fail("board.%s[%d]: unknown keys %s" % (section, i, sorted(bad)))
+            title, kind, sql = pn.get("title"), pn.get("kind", "table"), pn.get("sql")
+            if not title or not isinstance(title, str):
+                _fail("board.%s[%d] needs a title" % (section, i))
+            if kind not in ("table", "status_grid", "kv"):
+                _fail("board.%s[%d]: kind must be table|status_grid|kv" % (section, i))
+            if not isinstance(sql, str) or not sql.strip().lower().startswith("select"):
+                _fail("board.%s[%d]: sql must be a single SELECT" % (section, i))
+            if ";" in sql.rstrip().rstrip(";"):
+                _fail("board.%s[%d]: one statement only" % (section, i))
+            params = pn.get("params") or {}
+            if not isinstance(params, dict) or not all(
+                    isinstance(k, str) and isinstance(v, str)
+                    for k, v in params.items()):
+                _fail("board.%s[%d]: params must map sql-name -> payload-key"
+                      % (section, i))
+            clean.append({"title": title, "kind": kind, "sql": sql,
+                          "params": params})
+        out[section] = clean
+    return out
 
 
 def _parse_item_states(doc, _fail):
