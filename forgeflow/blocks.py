@@ -530,6 +530,12 @@ def event_emit(ctx, task, prev):
     if not isinstance(data, dict):
         raise RuntimeError("event.emit: 'data' must be a mapping")
     name = _tpl(ctx, task, prev, ctx["name"])
+    if ctx.get("force"):
+        # re-trigger semantics: this emit must enqueue EVEN IF an identical
+        # payload was seen before (e.g. a re-validated spec must rebuild).
+        # Same mechanism as `emit --force` / POST /api/emit {"force": true}.
+        import time
+        data = dict(data, _force=time.time_ns())
     return "ok", {"_staged": [{"op": "emit_event", "name": name,
                                "payload": data}]}
 
