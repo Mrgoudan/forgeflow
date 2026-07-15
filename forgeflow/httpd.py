@@ -383,43 +383,121 @@ def _task_page(conn, task_id, workflows, board, pack_name):
     parts.append("<h2>payload</h2><pre>%s</pre>"
                  % esc(json.dumps(payload, indent=1, sort_keys=True)[:4000]))
 
-    import time
-    return _PAGE % {"title": esc(" · %s · task %d" % (pack_name, task_id)),
-                    "beat": "", "sections": "\n".join(parts)}
+    return _PAGE % {"title": esc("%s · task %d" % (pack_name, task_id)),
+                    "beat": esc(t["state"]), "sections": _frame(parts)}
 
 
 # ---------------------------------------------------------------- dashboard
 
 _PAGE = """<!doctype html>
-<html><head><meta charset="utf-8"><meta http-equiv="refresh" content="5">
+<html><head><meta charset="utf-8">
 <title>forgeflow%(title)s</title>
 <style>
- body { font: 14px/1.45 -apple-system, "Segoe UI", sans-serif; margin: 2rem;
-        color: #222; background: #fafafa; }
- h1 { font-size: 1.2rem; } h2 { font-size: 1rem; margin-top: 1.6rem; }
- table { border-collapse: collapse; min-width: 24rem; }
- th, td { text-align: left; padding: .25rem .8rem .25rem 0;
-          border-bottom: 1px solid #e3e3e3; }
- .state-done { color: #1a7f37; } .state-failed { color: #c0392b; }
- .state-parked { color: #b7791f; } .state-running { color: #1f6feb; }
- .muted { color: #888; } code { background: #f0f0f0; padding: 0 .3em; }
- .grid { line-height: 2.1; }
- .cell { display: inline-block; padding: .05rem .45rem; margin: .1rem;
-         border-radius: .6rem; border: 1px solid #ddd; background: #fff; }
- .cell.ok { border-color: #1a7f37; color: #1a7f37; }
- .cell.warn { border-color: #c0392b; color: #c0392b; }
- .cell.cur { border-color: #1f6feb; color: #1f6feb; font-weight: 600; }
- .cell.off { color: #aaa; }
- .cell sup { color: #b7791f; }
- pre { background: #f6f6f6; padding: .5rem; overflow-x: auto; max-width: 72rem; }
- details summary { cursor: pointer; color: #1f6feb; }
+ :root {
+   --bg: #101418; --card: #171d24; --card-edge: #232c36;
+   --ink: #d7dee6; --dim: #7d8a97; --faint: #4a545f;
+   --ember: #e8963a; --ok: #4cc38a; --bad: #e5534b; --run: #539bf5;
+   --wait: #d4a72c; --mono: ui-monospace, "SF Mono", "Cascadia Code",
+   Menlo, Consolas, monospace;
+ }
+ @media (prefers-color-scheme: light) {
+   :root { --bg:#f3f4f6; --card:#ffffff; --card-edge:#dfe3e8; --ink:#1f262e;
+           --dim:#5c6773; --faint:#9aa4af; --ember:#c26d10; --ok:#1a7f37;
+           --bad:#c73e36; --run:#0f62d6; --wait:#9a6700; }
+ }
+ * { box-sizing: border-box; }
+ body { margin: 0; background: var(--bg); color: var(--ink);
+        font: 14px/1.5 -apple-system, "Segoe UI", system-ui, sans-serif; }
+ a { color: var(--run); text-decoration: none; }
+ a:hover { text-decoration: underline; }
+ header { display: flex; align-items: baseline; gap: .8rem;
+          padding: .9rem 1.4rem; border-bottom: 1px solid var(--card-edge); }
+ header .name { font-family: var(--mono); font-weight: 700; font-size: 1rem;
+                color: var(--ember); letter-spacing: .02em; }
+ header .name a { color: inherit; }
+ header .beat { margin-left: auto; font-family: var(--mono); font-size: .75rem;
+                color: var(--dim); border: 1px solid var(--card-edge);
+                border-radius: 99px; padding: .15rem .7rem; }
+ main { max-width: 68rem; margin: 0 auto; padding: 1.1rem 1.4rem 3rem;
+        display: flex; flex-direction: column; gap: .9rem; }
+ section.card { background: var(--card); border: 1px solid var(--card-edge);
+                border-radius: 10px; padding: .9rem 1.1rem 1rem; }
+ h2 { margin: 0 0 .55rem; font-size: .72rem; font-weight: 600;
+      letter-spacing: .14em; text-transform: uppercase; color: var(--dim); }
+ table { border-collapse: collapse; width: 100%%; font-family: var(--mono);
+         font-size: .82rem; font-variant-numeric: tabular-nums; }
+ th { text-align: left; font: 600 .68rem/1.6 -apple-system, sans-serif;
+      letter-spacing: .1em; text-transform: uppercase; color: var(--faint);
+      padding: 0 .9rem .3rem 0; border-bottom: 1px solid var(--card-edge); }
+ td { padding: .34rem .9rem .34rem 0; border-bottom: 1px solid
+      color-mix(in srgb, var(--card-edge) 55%%, transparent); vertical-align: top; }
+ tr:last-child td { border-bottom: 0; }
+ tr:hover td { background: color-mix(in srgb, var(--run) 4%%, transparent); }
+ .muted { color: var(--dim); } code { font-family: var(--mono);
+   background: color-mix(in srgb, var(--card-edge) 60%%, transparent);
+   padding: .05em .4em; border-radius: 4px; }
+ .state-done, .state-pass { color: var(--ok); }
+ .state-failed { color: var(--bad); }
+ .state-parked, .state-retry_wait { color: var(--wait); }
+ .state-running, .state-pending { color: var(--run); }
+ .state-done::before, .state-failed::before, .state-parked::before,
+ .state-running::before, .state-pending::before, .state-retry_wait::before {
+   content: "\25CF\00A0"; font-size: .7em; vertical-align: .15em; }
+ .grid { display: flex; flex-wrap: wrap; gap: .3rem .35rem; align-items: center;
+         font-family: var(--mono); font-size: .78rem; }
+ .cell { padding: .16rem .55rem; border-radius: 6px; white-space: nowrap;
+         border: 1px solid var(--card-edge);
+         background: color-mix(in srgb, var(--card-edge) 35%%, transparent); }
+ .cell small { color: var(--dim); font-size: .85em; margin-left: .35em; }
+ .cell.ok   { border-color: color-mix(in srgb, var(--ok) 45%%, transparent);
+              color: var(--ok); }
+ .cell.warn { border-color: color-mix(in srgb, var(--bad) 50%%, transparent);
+              color: var(--bad); }
+ .cell.cur  { border-color: var(--ember); color: var(--ember);
+              box-shadow: 0 0 9px color-mix(in srgb, var(--ember) 35%%, transparent); }
+ .cell.off  { color: var(--faint); }
+ .cell sup  { color: var(--wait); }
+ .arrow { color: var(--faint); font-size: .8rem; }
+ pre { font-family: var(--mono); font-size: .78rem; line-height: 1.45;
+       background: color-mix(in srgb, var(--bg) 70%%, black 8%%);
+       border: 1px solid var(--card-edge); border-radius: 8px;
+       padding: .7rem .8rem; overflow-x: auto; max-width: 100%%; margin: .4rem 0 0; }
+ details summary { cursor: pointer; color: var(--run); font-family: var(--mono);
+                   font-size: .78rem; }
+ details summary a { margin-left: .4em; }
 </style></head><body>
-<h1>forgeflow%(title)s <span class="muted">%(beat)s</span></h1>
+<header><span class="name"><a href="/">forgeflow</a></span>
+<span class="muted">%(title)s</span>
+<span class="beat">%(beat)s</span></header>
+<main>
 %(sections)s
-<p class="muted">auto-refreshes every 5s · JSON: <code>/api/status</code>
-<code>/api/metrics</code> <code>/api/task/&lt;id&gt;</code> ·
-emit: <code>POST /api/emit {"name": ..., "data": {...}}</code></p>
+<p class="muted" style="font-size:.75rem">JSON <code>/api/status</code>
+<code>/api/metrics</code> <code>/api/task/&lt;id&gt;</code> · emit
+<code>POST /api/emit</code></p>
+</main>
+<script>
+setInterval(async () => {
+  if (document.querySelector("details[open]") || String(getSelection())) return;
+  try {
+    const r = await fetch(location.href, {cache: "no-store"});
+    const d = new DOMParser().parseFromString(await r.text(), "text/html");
+    document.querySelector("main").innerHTML = d.querySelector("main").innerHTML;
+    document.querySelector("header").innerHTML = d.querySelector("header").innerHTML;
+  } catch (e) {}
+}, 4000);
+</script>
 </body></html>"""
+
+
+def _frame(parts):
+    """Wrap each h2-led block in a card; pass bare paragraphs through."""
+    out = []
+    for part in parts:
+        if part.lstrip().startswith("<h2"):
+            out.append('<section class="card">%s</section>' % part)
+        else:
+            out.append(part)
+    return "\n".join(out)
 
 
 def _dashboard(conn, pack_name, board=None):
@@ -467,5 +545,6 @@ def _dashboard(conn, pack_name, board=None):
         age = int(time.time()) - st["daemon_heartbeat_epoch"]
         beat = ("daemon heartbeat %ds ago" % age) if age < 3600 else \
                "daemon heartbeat stale"
-    return _PAGE % {"title": esc(" · " + pack_name if pack_name else ""),
-                    "beat": esc(beat), "sections": "\n".join(parts)}
+    return _PAGE % {"title": esc(pack_name or ""),
+                    "beat": esc(beat or "no heartbeat"),
+                    "sections": _frame(parts)}
