@@ -646,13 +646,20 @@ def _dashboard(conn, pack_name, board=None):
     rows = []
     for r in conn.execute("SELECT id, kind, state, updated_at FROM tasks"
                           " ORDER BY updated_at DESC, id DESC LIMIT 15"):
+        at = ""
+        if r["state"] == "running":
+            st = conn.execute(
+                "SELECT step FROM task_steps WHERE task_id=?"
+                " ORDER BY rowid DESC LIMIT 1", (r["id"],)).fetchone()
+            at = st["step"] if st else ""
         rows.append("<tr><td><a href='/task/%d'>#%d</a></td><td>%s</td>"
-                    "<td class='state-%s'>%s</td><td class=muted>%s</td></tr>"
+                    "<td class='state-%s'>%s</td><td>%s</td>"
+                    "<td class=muted>%s</td></tr>"
                     % (r["id"], r["id"], esc(r["kind"]), esc(r["state"]),
-                       esc(r["state"]), esc(r["updated_at"])))
+                       esc(r["state"]), esc(at), esc(r["updated_at"])))
     parts.append("<h2>recent tasks</h2><table><tr><th>task</th><th>kind</th>"
-                 "<th>state</th><th>updated</th></tr>%s</table>"
-                 % ("".join(rows) or "<tr><td colspan=4 class=muted>none</td></tr>"))
+                 "<th>state</th><th>at step</th><th>updated</th></tr>%s</table>"
+                 % ("".join(rows) or "<tr><td colspan=5 class=muted>none</td></tr>"))
     for panel in (board or {}).get("overview_panels", []):
         parts.append(_panel_html(conn, panel, {}))
 
