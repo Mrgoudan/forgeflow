@@ -98,7 +98,10 @@ class HttpServerTest(unittest.TestCase):
 
         code, body = self._get(base + "/")
         self.assertEqual(code, 200)
-        self.assertIn("<h2>recent tasks</h2>", body)
+        self.assertIn("runs", body)                  # the run-centric front page
+        code, body = self._get(base + "/explore")
+        self.assertEqual(code, 200)
+        self.assertIn("<h2>recent tasks</h2>", body)  # ops moved to /explore
 
         code, body = self._get(base + "/api/task/99999")
         self.assertEqual(code, 404)
@@ -178,6 +181,55 @@ class BoardTest(unittest.TestCase):
             "    - { title: X, kind: table, sql: \"DELETE FROM tasks\" }\n"))
         with self.assertRaisesRegex(SystemExit, "single SELECT"):
             config.load_pack(pack_dir)
+
+    def test_thread_key_parse(self):
+        from helpers import make_pack, tmpdir
+        from forgeflow import config
+        base = tmpdir()
+        with self.assertRaisesRegex(SystemExit, "thread_key"):
+            config.load_pack(make_pack(base, base,
+                                       extra="board: { thread_key: [1] }\n"))
+        pack = config.load_pack(make_pack(base, base,
+                                          extra="board: { thread_key: key }\n"))
+        self.assertEqual(pack.board["thread_key"], "key")
+
+    def test_runs_front_page_groups_by_thread(self):
+        import urllib.request
+        from helpers import make_pack, make_engine, make_target_repo, tmpdir
+        from forgeflow import db, httpd
+        base = tmpdir()
+        repo = make_target_repo(base)
+        pack_dir = make_pack(base, repo, extra="board: { thread_key: key }\n")
+        eng = make_engine(base, pack_dir)
+        # a LIVE run (pending task): must render as an active run card
+        db.emit_event(eng.conn, "demo.scan_requested", {"key": "RUN-A"},
+                      eng.subscriptions)
+        # a FINISHED run: must collapse into the history strip
+        db.emit_event(eng.conn, "demo.scan_requested", {"key": "RUN-B"},
+                      eng.subscriptions)
+        eng.conn.execute("UPDATE tasks SET state='done' WHERE"
+                         " json_extract(payload,'$.key')='RUN-B'")
+        server = httpd.serve(base / "ff", eng.subscriptions,
+                             workflows=eng.workflows, board=eng.pack.board,
+                             pack_name="demo")
+        httpd.serve_in_thread(server)
+        host, port = server.server_address
+        try:
+            page = urllib.request.urlopen(
+                "http://%s:%s/" % (host, port)).read().decode()
+            self.assertIn("RUN-A", page)             # the live run, named
+            self.assertIn("<svg", page)              # drawn as a pipeline
+            self.assertIn("item.triaged", page)      # orchestration edge label
+            self.assertIn("not started", page)       # downstream node dimmed
+            self.assertIn("finished run", page)      # RUN-B collapsed
+            self.assertIn("RUN-B", page)
+            self.assertNotIn("recent events", page)  # ops moved off the front
+            ex = urllib.request.urlopen(
+                "http://%s:%s/explore" % (host, port)).read().decode()
+            self.assertIn("recent events", ex)
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_task_page_and_panels(self):
         import json as _json

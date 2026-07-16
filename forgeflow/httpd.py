@@ -91,7 +91,12 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(401, {"error": "missing or bad bearer token"})
         try:
             if self.path == "/" or self.path == "/index.html":
-                return self._send(200, _dashboard(self._conn(), self.pack_name, self.board),
+                return self._send(200, _dashboard(self._conn(), self.pack_name,
+                                                  self.board, self.workflows),
+                                  content_type="text/html")
+            if self.path == "/explore":
+                return self._send(200, _explore_page(self._conn(), self.pack_name,
+                                                     self.board),
                                   content_type="text/html")
             if self.path == "/api/status":
                 return self._json(200, _status(self._conn()))
@@ -584,6 +589,70 @@ _PAGE = """<!doctype html>
  .pc.ok { color: var(--ok); } .pc.warn { color: var(--bad); }
  .pc.off { color: var(--wait); }
  .pick { margin-top: .5rem; font-size: .8rem; color: var(--dim); }
+ nav { margin-left: 1rem; display: flex; gap: .9rem; font-size: .8rem; }
+ nav a { color: var(--dim); } nav a:hover { color: var(--ink);
+   text-decoration: none; }
+ .alert { display: flex; align-items: center; gap: .7rem;
+   border: 1px solid color-mix(in srgb, var(--wait) 55%%, transparent);
+   background: color-mix(in srgb, var(--wait) 9%%, transparent);
+   border-radius: 10px; padding: .65rem 1rem; }
+ .alert a { color: var(--wait); font-weight: 600; }
+ .alert .dot { width: .55rem; height: .55rem; border-radius: 50%%;
+   background: var(--wait); animation: blink 1.4s ease-in-out infinite;
+   flex: none; }
+ @keyframes blink { 0%%,100%% { opacity: .35 } 50%% { opacity: 1 } }
+ .runhead { display: flex; align-items: baseline; gap: .7rem;
+   margin-bottom: .35rem; }
+ .runhead .rname { font-family: var(--mono); font-weight: 700;
+   font-size: .95rem; letter-spacing: .02em; }
+ .runhead .chip { font-family: var(--mono); font-size: .72rem;
+   border-radius: 99px; padding: .1rem .6rem; border: 1px solid; }
+ .chip.ok   { color: var(--ok);   border-color: color-mix(in srgb, var(--ok) 45%%, transparent); }
+ .chip.bad  { color: var(--bad);  border-color: color-mix(in srgb, var(--bad) 45%%, transparent); }
+ .chip.run  { color: var(--run);  border-color: color-mix(in srgb, var(--run) 45%%, transparent); }
+ .chip.wait { color: var(--wait); border-color: color-mix(in srgb, var(--wait) 45%%, transparent);
+              animation: blink 1.4s ease-in-out infinite; }
+ .runhead .when { margin-left: auto; color: var(--faint); font-size: .75rem; }
+ .pipe { overflow-x: auto; padding: .2rem 0 .1rem; }
+ .pipe svg { display: block; }
+ .pipe .nrect { fill: color-mix(in srgb, var(--card-edge) 30%%, transparent);
+   stroke: var(--card-edge); stroke-width: 1.2; rx: 9; }
+ .pipe a { text-decoration: none; }
+ .pipe .ntitle { font: 600 12.5px var(--mono); fill: var(--ink); }
+ .pipe .nsub { font: 10.5px var(--mono); fill: var(--dim); }
+ .pipe .n-ok  .nrect { stroke: color-mix(in srgb, var(--ok) 60%%, transparent);
+   fill: color-mix(in srgb, var(--ok) 7%%, transparent); }
+ .pipe .n-ok  .ntitle { fill: var(--ok); }
+ .pipe .n-bad .nrect { stroke: color-mix(in srgb, var(--bad) 60%%, transparent);
+   fill: color-mix(in srgb, var(--bad) 8%%, transparent); }
+ .pipe .n-bad .ntitle { fill: var(--bad); }
+ .pipe .n-run .nrect { stroke: var(--ember);
+   fill: color-mix(in srgb, var(--ember) 9%%, transparent);
+   filter: drop-shadow(0 0 6px color-mix(in srgb, var(--ember) 45%%, transparent));
+   animation: pulseglow 1.8s ease-in-out infinite; }
+ .pipe .n-run .ntitle { fill: var(--ember); }
+ .pipe .n-cur .nrect { stroke: color-mix(in srgb, var(--run) 60%%, transparent); }
+ .pipe .n-cur .ntitle { fill: var(--run); }
+ .pipe .n-need .nrect { stroke: var(--wait);
+   fill: color-mix(in srgb, var(--wait) 10%%, transparent);
+   animation: pulseglow 1.4s ease-in-out infinite; }
+ .pipe .n-need .ntitle { fill: var(--wait); }
+ .pipe .n-off .ntitle { fill: var(--faint); }
+ .pipe .n-off .nsub { fill: var(--faint); }
+ @keyframes pulseglow { 0%%,100%% { stroke-opacity: .5 } 50%% { stroke-opacity: 1 } }
+ .pipe .e { stroke: var(--faint); stroke-width: 1.3; fill: none; opacity: .8; }
+ .pipe .e.on { stroke: var(--ember); stroke-dasharray: 5 4;
+   animation: flow 1.1s linear infinite; opacity: 1; }
+ @keyframes flow { to { stroke-dashoffset: -9; } }
+ .pipe .elabel { font: 9.5px var(--mono); fill: var(--faint); }
+ .pipe .badge { font: 700 11px var(--mono); fill: var(--wait); }
+ .exec { display: flex; flex-wrap: wrap; gap: .35rem .5rem; margin-top: .45rem;
+   font-family: var(--mono); font-size: .78rem; color: var(--dim);
+   align-items: center; }
+ details.hist summary { cursor: pointer; color: var(--dim);
+   font-size: .8rem; list-style: none; }
+ details.hist summary::before { content: "\25B8\00A0"; color: var(--faint); }
+ details.hist[open] summary::before { content: "\25BE\00A0"; }
  button { background: var(--card); color: var(--ink); cursor: pointer;
           border: 1px solid var(--card-edge); border-radius: 6px;
           padding: .3rem .8rem; font: inherit; font-size: .8rem; }
@@ -600,6 +669,8 @@ _PAGE = """<!doctype html>
 </style></head><body>
 <header><span class="name"><a href="/">forgeflow</a></span>
 <span class="muted">%(title)s</span>
+<nav><a href="/">runs</a> <a href="/decisions">decisions</a>
+<a href="/explore">explore</a></nav>
 <span class="beat">%(beat)s</span></header>
 <main>
 %(sections)s
@@ -632,43 +703,353 @@ def _frame(parts):
     return "\n".join(out)
 
 
-def _dashboard(conn, pack_name, board=None):
-    st = _status(conn)
+# ------------------------------------------------- runs (thread grouping)
+#
+# One raw request = one thread value = one RUN. The pack declares WHICH
+# payload field correlates (board.thread_key); the board groups every task
+# and open decision under it and draws the run as a pipeline: nodes are the
+# workflow kinds, edges are the emits->consumes orchestration map. The
+# engine attaches no meaning to the value — pure mechanism.
+
+_TERMINAL = {"done", "failed", "deferred"}
+
+
+def _ago(ts):
+    """'YYYY-MM-DD HH:MM:SS' (sqlite UTC) -> compact age string."""
+    import calendar
+    import time
+    try:
+        then = calendar.timegm(time.strptime(str(ts), "%Y-%m-%d %H:%M:%S"))
+    except (ValueError, TypeError):
+        return str(ts or "")
+    s = max(0, int(time.time()) - then)
+    if s < 90:
+        return "%ds ago" % s
+    if s < 5400:
+        return "%dm ago" % (s // 60)
+    if s < 172800:
+        return "%dh ago" % (s // 3600)
+    return "%dd ago" % (s // 86400)
+
+
+def _wf_graph(workflows):
+    """The orchestration map as a drawable DAG: an edge A->B for every event
+    A emits that B consumes; node depth = longest path from an entry (cycle-
+    bounded). Computed from the loaded defs only — nothing hardcoded."""
+    kinds = sorted(workflows or {})
+    emitters, consumers = {}, {}
+    for k in kinds:
+        for ev in workflows[k].emits:
+            emitters.setdefault(ev, []).append(k)
+        for ev in workflows[k].consumes:
+            consumers.setdefault(ev, []).append(k)
+    edges = []
+    for ev in sorted(emitters):
+        for s in emitters[ev]:
+            for d in consumers.get(ev, []):
+                if (s, d, ev) not in edges:
+                    edges.append((s, d, ev))
+    depth = {k: 0 for k in kinds}
+    for _ in range(len(kinds) + 1):
+        changed = False
+        for s, d, ev in edges:
+            if s != d and depth[s] + 1 > depth[d] and depth[s] + 1 <= len(kinds):
+                depth[d] = depth[s] + 1
+                changed = True
+        if not changed:
+            break
+    entry = {k: [ev for ev in workflows[k].consumes if ev not in emitters]
+             for k in kinds}
+    return {"kinds": kinds, "edges": edges, "depth": depth, "entry": entry}
+
+
+def _threads(conn, thread_key, limit=400):
+    """Group recent tasks by payload[thread_key]. Returns (threads, loose):
+    threads newest-first, each {key, tasks (oldest-first), latest {kind: row},
+    updated}; loose = tasks with no thread value."""
+    rows = conn.execute(
+        "SELECT id, kind, state, error_class, park_reason, attempts, payload,"
+        " created_at, updated_at FROM tasks ORDER BY id DESC LIMIT ?",
+        (limit,)).fetchall()
+    threads, loose = {}, []
+    for r in rows:
+        try:
+            payload = json.loads(r["payload"] or "{}")
+        except ValueError:
+            payload = {}
+        tv = payload.get(thread_key) if thread_key else None
+        if not isinstance(tv, str) or not tv:
+            loose.append(r)
+            continue
+        th = threads.setdefault(tv, {"key": tv, "tasks": [], "latest": {},
+                                     "updated": r["updated_at"]})
+        th["tasks"].append(r)
+        th["updated"] = max(th["updated"], r["updated_at"])
+        prev = th["latest"].get(r["kind"])
+        if prev is None or r["id"] > prev["id"]:
+            th["latest"][r["kind"]] = r
+    ordered = sorted(threads.values(), key=lambda t: t["updated"], reverse=True)
+    for th in ordered:
+        th["tasks"].reverse()                      # oldest first (the story)
+    return ordered, loose
+
+
+def _open_decisions(conn):
+    """Open decision rounds, plus a task_id -> [decision] index so runs can
+    badge the exact node that is waiting on the human."""
+    rows = conn.execute("SELECT id, key, round, title, task_id FROM decisions"
+                        " WHERE status='open' ORDER BY id").fetchall()
+    by_task = {}
+    for r in rows:
+        if r["task_id"] is not None:
+            by_task.setdefault(r["task_id"], []).append(r)
+    return rows, by_task
+
+
+def _node_info(conn, th, workflows, dec_by_task):
+    """Per workflow kind in one thread: latest task + step progress + what to
+    say under the node."""
+    info = {}
+    for kind, t in th["latest"].items():
+        wf = (workflows or {}).get(kind)
+        total = len(wf.steps) if wf else 0
+        done_n = conn.execute(
+            "SELECT count(DISTINCT step) FROM task_steps WHERE task_id=?"
+            " AND attempt=?", (t["id"], t["attempts"])).fetchone()[0]
+        last = conn.execute(
+            "SELECT step FROM task_steps WHERE task_id=? AND attempt=?"
+            " ORDER BY rowid DESC LIMIT 1", (t["id"], t["attempts"])).fetchone()
+        decisions = dec_by_task.get(t["id"], [])
+        needs_human = bool(decisions) or (
+            t["state"] == "parked" and t["error_class"] == "awaiting_human")
+        if needs_human:
+            sub = "needs you"
+        elif t["state"] == "running":
+            sub = "%s · %d/%d" % (last["step"] if last else "…", done_n, total)
+        elif t["state"] == "done":
+            sub = "done · %d steps" % done_n
+        elif t["state"] == "failed":
+            sub = "failed at %s" % (last["step"] if last else "?")
+        elif t["state"] == "parked":
+            sub = "parked · %s" % (t["error_class"] or "")
+        elif t["state"] == "retry_wait":
+            sub = "retrying %s" % (last["step"] if last else "")
+        else:
+            sub = t["state"]
+        info[kind] = {"task": t, "sub": sub, "needs_human": needs_human,
+                      "decisions": decisions, "step": last["step"] if last else "",
+                      "done_n": done_n, "total": total}
+    return info
+
+
+_NODE_CLS = {"done": "n-ok", "failed": "n-bad", "running": "n-run",
+             "pending": "n-cur", "retry_wait": "n-cur", "parked": "n-wait",
+             "deferred": "n-off"}
+
+
+def _pipeline_svg(graph, info):
+    """One run as an SVG pipeline. Nodes are workflow kinds coloured by the
+    thread's latest task of that kind; the node waiting on a human pulses
+    and carries a badge; the edge feeding an active node flows."""
     esc = html.escape
+    kinds, depth = graph["kinds"], graph["depth"]
+    if not kinds:
+        return ""
+    layers = {}
+    for k in kinds:
+        layers.setdefault(depth[k], []).append(k)
+    order = sorted(layers)
+    node_h, vgap, xgap, top = 42, 24, 64, 14
+    colw, xs, cx = {}, {}, 16
+    for d in order:
+        layers[d].sort()
+        colw[d] = max(96, int(max(len(k) for k in layers[d]) * 7.8) + 36)
+        xs[d] = cx
+        cx += colw[d] + xgap
+    width = cx - xgap + 16
+    height = top + max(len(v) for v in layers.values()) * (node_h + vgap)
+    pos = {}
+    for d in order:
+        for i, k in enumerate(layers[d]):
+            pos[k] = (xs[d], top + i * (node_h + vgap), colw[d])
+
+    out = ['<svg width="%d" height="%d" viewBox="0 0 %d %d"'
+           ' xmlns="http://www.w3.org/2000/svg" role="img">'
+           % (width, height, width, height),
+           '<defs><marker id="arr" viewBox="0 0 8 8" refX="7" refY="4"'
+           ' markerWidth="7" markerHeight="7" orient="auto">'
+           '<path d="M0 0 L8 4 L0 8 z" fill="currentColor" opacity=".55"/>'
+           '</marker></defs>']
+    # edges under nodes
+    for s, d, ev in graph["edges"]:
+        if s == d or s not in pos or d not in pos:
+            continue
+        x1, y1, w1 = pos[s]
+        x2, y2, _w2 = pos[d]
+        sx, sy = x1 + w1, y1 + node_h / 2.0
+        tx, ty = x2 - 7, y2 + node_h / 2.0
+        mid = (sx + tx) / 2.0
+        src, dst = info.get(s), info.get(d)
+        live = (src and src["task"]["state"] == "done" and dst
+                and dst["task"]["state"] not in _TERMINAL)
+        out.append('<path class="e%s" d="M%.0f %.0f C %.0f %.0f, %.0f %.0f,'
+                   ' %.0f %.0f" marker-end="url(#arr)"/>'
+                   % (" on" if live else "", sx, sy, mid, sy, mid, ty, tx, ty))
+        out.append('<text class="elabel" x="%.0f" y="%.0f"'
+                   ' text-anchor="middle">%s</text>'
+                   % (mid, min(sy, ty) - 7, esc(ev)))
+    # nodes over edges
+    for k in kinds:
+        x, y, w = pos[k]
+        nfo = info.get(k)
+        state = nfo["task"]["state"] if nfo else None
+        cls = "n-need" if (nfo and nfo["needs_human"]) \
+            else _NODE_CLS.get(state, "n-off")
+        sub = nfo["sub"] if nfo else "not started"
+        body = ('<g class="%s"><rect class="nrect" x="%d" y="%d" width="%d"'
+                ' height="%d" rx="9"/><text class="ntitle" x="%d" y="%d"'
+                ' text-anchor="middle">%s</text><text class="nsub" x="%d"'
+                ' y="%d" text-anchor="middle">%s</text>%s</g>'
+                % (cls, x, y, w, node_h, x + w / 2, y + 17, esc(k),
+                   x + w / 2, y + 32, esc(sub),
+                   ('<text class="badge" x="%d" y="%d" text-anchor="middle">'
+                    '&#9670;</text>' % (x + w - 2, y - 1))
+                   if nfo and nfo["needs_human"] else ""))
+        if nfo:
+            href = ("/decisions" if nfo["needs_human"]
+                    else "/task/%d" % nfo["task"]["id"])
+            body = '<a href="%s">%s</a>' % (href, body)
+        out.append(body)
+    out.append("</svg>")
+    return '<div class="pipe">%s</div>' % "".join(out)
+
+
+def _run_card(conn, th, graph, workflows, dec_by_task):
+    """One run: name + status chip + pipeline + executing-now strip."""
+    esc = html.escape
+    info = _node_info(conn, th, workflows, dec_by_task)
+    states = [t["state"] for t in th["latest"].values()]
+    n_dec = sum(len(n["decisions"]) for n in info.values())
+    needs = n_dec or any(n["needs_human"] for n in info.values())
+    deepest_done = all(s in _TERMINAL for s in states) and states
+    if needs:
+        chip = '<span class="chip wait">&#9670; needs your decision</span>'
+    elif "running" in states:
+        k = next(k for k, t in th["latest"].items() if t["state"] == "running")
+        chip = ('<span class="chip run">&#9654; running · %s · %s</span>'
+                % (esc(k), esc(info[k]["step"])))
+    elif "failed" in states:
+        chip = '<span class="chip bad">&#10007; failed</span>'
+    elif any(s in ("parked", "retry_wait") for s in states):
+        chip = '<span class="chip wait">&#10074;&#10074; parked</span>'
+    elif deepest_done and "failed" not in states:
+        chip = '<span class="chip ok">&#10003; complete</span>'
+    else:
+        chip = '<span class="chip run">queued</span>'
+    execing = ["<span class='cell cur'>%s · %s</span>"
+               % (esc(k), esc(n["step"] or "starting"))
+               for k, n in sorted(info.items())
+               if n["task"]["state"] == "running"]
+    head = ('<div class="runhead"><span class="rname">%s</span>%s'
+            '<span class="when">updated %s</span></div>'
+            % (esc(th["key"]), chip, esc(_ago(th["updated"]))))
+    strip = ('<div class="exec">executing now: %s</div>' % " ".join(execing)) \
+        if execing else ""
+    return '<section class="card run">%s%s%s</section>' \
+        % (head, _pipeline_svg(graph, info), strip)
+
+
+def _dashboard(conn, pack_name, board=None, workflows=None):
+    """The front page: what is this system doing for me RIGHT NOW.
+    Decision alert -> active runs (pipeline graphs) -> finished runs
+    (collapsed) -> loose tasks. Ops tables live on /explore."""
+    esc = html.escape
+    board = board or {}
     parts = []
 
-    n_open = conn.execute("SELECT count(*) FROM decisions"
-                          " WHERE status='open'").fetchone()[0]
-    if n_open:
-        parts.append('<h2>&#9888; waiting on you</h2><p><a href="/decisions">'
-                     '%d open decision%s &rarr;</a></p>'
-                     % (n_open, "s" if n_open != 1 else ""))
-    rows = []
-    for r in conn.execute("SELECT id, kind, state, updated_at FROM tasks"
-                          " ORDER BY updated_at DESC, id DESC LIMIT 15"):
-        at = ""
-        if r["state"] == "running":
-            st = conn.execute(
-                "SELECT step FROM task_steps WHERE task_id=?"
-                " ORDER BY rowid DESC LIMIT 1", (r["id"],)).fetchone()
-            at = st["step"] if st else ""
-        rows.append("<tr><td><a href='/task/%d'>#%d</a></td><td>%s</td>"
-                    "<td class='state-%s'>%s</td><td>%s</td>"
-                    "<td class=muted>%s</td></tr>"
-                    % (r["id"], r["id"], esc(r["kind"]), esc(r["state"]),
-                       esc(r["state"]), esc(at), esc(r["updated_at"])))
-    parts.append("<h2>recent tasks</h2><table><tr><th>task</th><th>kind</th>"
-                 "<th>state</th><th>at step</th><th>updated</th></tr>%s</table>"
-                 % ("".join(rows) or "<tr><td colspan=5 class=muted>none</td></tr>"))
+    open_dec, dec_by_task = _open_decisions(conn)
+    if open_dec:
+        items = ", ".join(esc(r["key"]) for r in open_dec[:4])
+        parts.append('<div class="alert"><span class="dot"></span>'
+                     '<span>%d decision%s waiting on you (%s)</span>'
+                     '<a href="/decisions">decide &rarr;</a></div>'
+                     % (len(open_dec), "s" if len(open_dec) != 1 else "", items))
+
+    graph = _wf_graph(workflows or {})
+    thread_key = board.get("thread_key")
+    threads, loose = _threads(conn, thread_key)
+    active, finished = [], []
+    for th in threads:
+        live = any(t["state"] not in _TERMINAL for t in th["latest"].values()) \
+            or any(dec_by_task.get(t["id"]) for t in th["tasks"])
+        (active if live else finished).append(th)
+
+    for th in active:
+        parts.append(_run_card(conn, th, graph, workflows, dec_by_task))
+
+    if finished:
+        rows = "".join(
+            "<tr><td>%s</td><td class='state-%s'>%s</td><td>%s</td>"
+            "<td class=muted>%s</td></tr>"
+            % (esc(th["key"]),
+               "done" if all(t["state"] == "done" for t in th["latest"].values())
+               else "failed",
+               "complete" if all(t["state"] == "done"
+                                 for t in th["latest"].values()) else "ended",
+               " ".join("<a href='/task/%d'>%s</a>" % (t["id"], esc(k))
+                        for k, t in sorted(th["latest"].items())),
+               esc(_ago(th["updated"]))) for th in finished[:20])
+        parts.append("<h2>finished runs</h2><details class=hist><summary>"
+                     "%d finished run%s</summary><table><tr><th>run</th>"
+                     "<th>state</th><th>tasks</th><th>updated</th></tr>%s"
+                     "</table></details>"
+                     % (len(finished), "s" if len(finished) != 1 else "", rows))
+
+    if not threads and not loose:
+        parts.append("<h2>runs</h2><p class=muted>nothing yet — emit an event"
+                     " (<code>POST /api/emit</code>) to start a run.</p>")
+
+    if loose:
+        rows = "".join(
+            "<tr><td><a href='/task/%d'>#%d</a></td><td>%s</td>"
+            "<td class='state-%s'>%s</td><td class=muted>%s</td></tr>"
+            % (r["id"], r["id"], esc(r["kind"]), esc(r["state"]),
+               esc(r["state"]), esc(_ago(r["updated_at"])))
+            for r in loose[:10])
+        parts.append("<h2>other tasks</h2><table><tr><th>task</th><th>kind</th>"
+                     "<th>state</th><th>updated</th></tr>%s</table>" % rows)
+
+    import time
+    hb = conn.execute("SELECT cursor FROM watermarks"
+                      " WHERE scope='daemon.heartbeat'").fetchone()
+    beat = "no heartbeat"
+    if hb:
+        age = int(time.time()) - int(hb["cursor"])
+        beat = ("daemon &middot; %ds ago" % age) if age < 3600 \
+            else "daemon heartbeat stale"
+    return _PAGE % {"title": esc(" · " + pack_name if pack_name else ""),
+                    "beat": beat, "sections": _frame(parts)}
+
+
+def _explore_page(conn, pack_name, board=None):
+    """The ops surface that used to crowd the front page: pack panels,
+    parked tasks, open joins, the event stream."""
+    st = _status(conn)
+    esc = html.escape
+    parts = ['<p><a href="/">&larr; runs</a></p>']
+
     for panel in (board or {}).get("overview_panels", []):
         parts.append(_panel_html(conn, panel, {}))
 
     if st["parked"]:
-        rows = ["<tr><td>#%d</td><td>%s</td><td>%s</td><td>%d</td></tr>"
-                % (p["id"], esc(p["kind"]), esc(str(p["reason"])), p["attempts"])
+        rows = ["<tr><td><a href='/task/%d'>#%d</a></td><td>%s</td>"
+                "<td>%s</td><td>%d</td></tr>"
+                % (p["id"], p["id"], esc(p["kind"]), esc(str(p["reason"])),
+                   p["attempts"])
                 for p in st["parked"]]
         parts.append("<h2>parked</h2><table><tr><th>task</th><th>kind</th>"
-                     "<th>reason</th><th>attempts</th></tr>%s</table>" % "".join(rows))
+                     "<th>reason</th><th>attempts</th></tr>%s</table>"
+                     % "".join(rows))
 
     if st["open_joins"]:
         rows = ["<tr><td>%d</td><td>%s</td><td>%d/%d</td></tr>"
@@ -684,12 +1065,16 @@ def _dashboard(conn, pack_name, board=None):
                  "<th>event</th></tr>%s</table>"
                  % ("".join(rows) or "<tr><td colspan=3 class=muted>none</td></tr>"))
 
-    import time
-    beat = ""
-    if st["daemon_heartbeat_epoch"]:
-        age = int(time.time()) - st["daemon_heartbeat_epoch"]
-        beat = ("daemon heartbeat %ds ago" % age) if age < 3600 else \
-               "daemon heartbeat stale"
-    return _PAGE % {"title": esc(" · " + pack_name if pack_name else ""),
-                    "beat": esc(beat or "no heartbeat"),
-                    "sections": _frame(parts)}
+    tasks = "".join(
+        "<tr><td><a href='/task/%d'>#%d</a></td><td>%s</td>"
+        "<td class='state-%s'>%s</td><td class=muted>%s</td></tr>"
+        % (r["id"], r["id"], esc(r["kind"]), esc(r["state"]), esc(r["state"]),
+           esc(_ago(r["updated_at"])))
+        for r in conn.execute("SELECT id, kind, state, updated_at FROM tasks"
+                              " ORDER BY updated_at DESC, id DESC LIMIT 25"))
+    parts.append("<h2>recent tasks</h2><table><tr><th>task</th><th>kind</th>"
+                 "<th>state</th><th>updated</th></tr>%s</table>"
+                 % (tasks or "<tr><td colspan=4 class=muted>none</td></tr>"))
+
+    return _PAGE % {"title": esc(" · %s · explore" % pack_name),
+                    "beat": "", "sections": _frame(parts)}

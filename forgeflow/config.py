@@ -315,17 +315,25 @@ def load_pack(pack_dir) -> Pack:
 
 
 def _parse_board(doc, _fail):
-    """board: {overview_panels: [...], task_panels: [...]} — each panel
-    {title, kind: table|status_grid|kv, sql: SELECT..., params?: {name: key}}.
-    SELECT-only is enforced here (the board must never write)."""
+    """board: {thread_key?, overview_panels: [...], task_panels: [...]} — each
+    panel {title, kind: table|status_grid|kv, sql: SELECT..., params?: {name:
+    key}}. SELECT-only is enforced here (the board must never write).
+    thread_key names the payload field that correlates tasks/decisions into
+    one RUN (one raw request = one thread through every workflow) — the board
+    groups by it; the engine attaches no meaning to the value."""
     if not doc:
         return {}
     if not isinstance(doc, dict):
         _fail("board: must be a mapping")
-    unknown = set(doc) - {"overview_panels", "task_panels"}
+    unknown = set(doc) - {"overview_panels", "task_panels", "thread_key"}
     if unknown:
         _fail("board: unknown keys %s" % sorted(unknown))
     out = {}
+    tk = doc.get("thread_key")
+    if tk is not None:
+        if not isinstance(tk, str) or not tk:
+            _fail("board: thread_key must be a non-empty payload field name")
+        out["thread_key"] = tk
     for section in ("overview_panels", "task_panels"):
         panels = doc.get(section) or []
         if not isinstance(panels, list):
