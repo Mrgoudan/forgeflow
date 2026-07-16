@@ -390,6 +390,36 @@ def _run_artifact(data_dir, run_id, name):
     return data[-262144:]                       # last 256 KB is plenty
 
 
+def _kv_html(obj, doc_cap=200000):
+    """Humane rendering for a payload/result dict: each key its own row;
+    a long or multi-line string value renders as the FULL document (wrapped,
+    real newlines — never JSON-escaped soup); nested structures stay compact
+    JSON. The 4000-char JSON dump this replaces made a requirement doc
+    unreadable."""
+    esc = html.escape
+    rows = []
+    for k in sorted(obj, key=lambda s: (s.startswith("_"), s)):
+        v = obj[k]
+        if isinstance(v, str) and ("\n" in v or len(v) > 120):
+            val = ('<pre class="doc">%s</pre>' % esc(v[:doc_cap])) + \
+                  ("<p class=muted>… truncated</p>" if len(v) > doc_cap else "")
+        elif isinstance(v, str):
+            val = "<code>%s</code>" % esc(v)
+        else:
+            s = json.dumps(v, sort_keys=True)
+            if len(s) > 300:
+                val = ('<details><summary>%s&hellip;</summary><pre>%s</pre>'
+                       '</details>' % (esc(s[:80]),
+                                       esc(json.dumps(v, indent=1,
+                                                      sort_keys=True)[:doc_cap])))
+            else:
+                val = "<code>%s</code>" % esc(s)
+        cls = " class=muted" if k.startswith("_") else ""
+        rows.append("<tr><th%s>%s</th><td>%s</td></tr>" % (cls, esc(k), val))
+    return "<table class=kvp>%s</table>" % "".join(rows) if rows \
+        else "<p class=muted>empty</p>"
+
+
 def _view_link(view, value):
     from urllib.parse import quote
     return '<a href="/view/%s?key=%s">%s</a>' % (
@@ -532,19 +562,17 @@ def _task_page(conn, task_id, workflows, board, pack_name):
         trail.append(
             "<tr><td class=muted>%s</td><td>%s</td>"
             "<td class='cell %s'>%s</td><td>%.1fs</td>"
-            "<td><details><summary>result%s</summary><pre>%s</pre></details>"
+            "<td><details><summary>result%s</summary>%s</details>"
             "</td></tr>"
             % (esc(r["at"]), esc(r["step"]), cls, esc(str(r["outcome"])),
-               (r["wall_ms"] or 0) / 1000.0, link,
-               esc(json.dumps(res, indent=1, sort_keys=True)[:4000])))
+               (r["wall_ms"] or 0) / 1000.0, link, _kv_html(res)))
     parts.append("<h2>step trail (attempt %d)</h2><table><tr><th>at</th>"
                  "<th>step</th><th>outcome</th><th>wall</th><th></th></tr>"
                  "%s</table>" % (attempt, "".join(trail) or
                                  "<tr><td colspan=5 class=muted>none</td></tr>"))
 
-    # payload for reference
-    parts.append("<h2>payload</h2><pre>%s</pre>"
-                 % esc(json.dumps(payload, indent=1, sort_keys=True)[:4000]))
+    # payload for reference — long fields (the requirement doc) in full
+    parts.append("<h2>payload</h2>%s" % _kv_html(payload))
 
     return _PAGE % {"title": esc(" · %s · task %d" % (pack_name, task_id)),
                     "beat": esc(t["state"]), "sections": _frame(parts)}
@@ -899,6 +927,11 @@ _PAGE = """<!doctype html>
  button:hover { border-color: var(--ember); color: var(--ember); }
  input[name=comment] { background: var(--bg); border: 1px solid var(--card-edge);
           border-radius: 6px; color: var(--ink); padding: .3rem .6rem; font: inherit; }
+ table.kvp th { width: 1%%; white-space: nowrap; font-family: var(--mono);
+   text-transform: none; letter-spacing: 0; font-size: .78rem;
+   color: var(--dim); padding-right: 1rem; }
+ table.kvp td { font-family: inherit; }
+ pre.doc { white-space: pre-wrap; word-break: break-word; max-width: 60rem; }
  pre { font-family: var(--mono); font-size: .78rem; line-height: 1.45;
        background: color-mix(in srgb, var(--bg) 70%%, black 8%%);
        border: 1px solid var(--card-edge); border-radius: 8px;
@@ -1383,12 +1416,12 @@ def _audit_trail(conn, task, block_names):
         out.append(
             "<tr><td class=muted>%s</td><td>a%d</td><td>%s</td>"
             "<td class=muted>%s</td><td class='cell %s'>%s</td><td>%.1fs</td>"
-            "<td><details><summary>in/out%s</summary><pre>%s</pre></details>"
+            "<td><details><summary>in/out%s</summary>%s</details>"
             "</td></tr>"
             % (esc(str(r["at"])), r["attempt"], esc(r["step"]),
                esc(block_names.get(r["step"], "")), cls,
                esc(str(r["outcome"])), (r["wall_ms"] or 0) / 1000.0, link,
-               esc(json.dumps(res, indent=1, sort_keys=True)[:4000])))
+               _kv_html(res)))
     return out
 
 
