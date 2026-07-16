@@ -227,6 +227,87 @@ class BoardTest(unittest.TestCase):
             ex = urllib.request.urlopen(
                 "http://%s:%s/explore" % (host, port)).read().decode()
             self.assertIn("recent events", ex)
+            # the run audit page: the whole story of one thread
+            audit = urllib.request.urlopen(
+                "http://%s:%s/run/RUN-A" % (host, port)).read().decode()
+            self.assertIn("audit trail", audit)
+            self.assertIn("filebug", audit)
+            self.assertIn("demo.scan_requested", audit)   # the run's events
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_views_and_launch(self):
+        import urllib.request
+        from urllib.parse import urlencode
+        from helpers import make_pack, make_engine, make_target_repo, tmpdir
+        from forgeflow import config, httpd
+        base = tmpdir()
+        repo = make_target_repo(base)
+        req_file = base / "req.md"
+        req_file.write_text("the requirement text\n")
+        pack_dir = make_pack(base, repo, extra=(
+            "board:\n"
+            "  thread_key: key\n"
+            "  views:\n"
+            "    thing:\n"
+            "      title: 'thing {key}'\n"
+            "      panels:\n"
+            "        - { title: itself, kind: table,\n"
+            "            sql: \"SELECT :key AS k, 'X-9' AS 'link:other'\" }\n"
+            "    other:\n"
+            "      title: other\n"
+            "      panels:\n"
+            "        - { title: o, kind: table, sql: 'SELECT :key AS k' }\n"
+            "  launch:\n"
+            "    - title: start a scan\n"
+            "      event: demo.scan_requested\n"
+            "      fields:\n"
+            "        - { name: key, required: true }\n"
+            "        - { name: note, kind: path_or_text }\n"))
+        eng = make_engine(base, pack_dir)
+        server = httpd.serve(base / "ff", eng.subscriptions,
+                             workflows=eng.workflows, board=eng.pack.board,
+                             pack_name="demo")
+        httpd.serve_in_thread(server)
+        host, port = server.server_address
+        try:
+            page = urllib.request.urlopen(
+                "http://%s:%s/view/thing?key=T-1" % (host, port)).read().decode()
+            self.assertIn("thing T-1", page)               # title templated
+            self.assertIn("T-1", page)                     # :key bound
+            self.assertIn('href="/view/other?key=X-9"', page)  # cross-link
+            self.assertIn(">other<", page)                 # header sans prefix
+            # unknown view 404s
+            try:
+                urllib.request.urlopen("http://%s:%s/view/nope" % (host, port))
+                self.fail("unknown view must 404")
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 404)
+            # front page renders the launch form
+            front = urllib.request.urlopen(
+                "http://%s:%s/" % (host, port)).read().decode()
+            self.assertIn("start a scan", front)
+            self.assertIn("/api/launch", front)
+            # launching with a PATH as the note reads the file content
+            body = urlencode({"event": "demo.scan_requested", "key": "L-1",
+                              "note": str(req_file)}).encode()
+            resp = urllib.request.urlopen(urllib.request.Request(
+                "http://%s:%s/api/launch" % (host, port), data=body))
+            self.assertIn(resp.status, (200, 303))
+            row = eng.conn.execute(
+                "SELECT payload FROM tasks WHERE kind='filebug'").fetchone()
+            payload = json.loads(row["payload"])
+            self.assertEqual(payload["key"], "L-1")
+            self.assertIn("the requirement text", payload["note"])
+            # a missing required field is a 400, not a silent half-launch
+            bad = urlencode({"event": "demo.scan_requested", "note": "x"}).encode()
+            try:
+                urllib.request.urlopen(urllib.request.Request(
+                    "http://%s:%s/api/launch" % (host, port), data=bad))
+                self.fail("missing required field must 400")
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 400)
         finally:
             server.shutdown()
             server.server_close()

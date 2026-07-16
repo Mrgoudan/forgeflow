@@ -105,6 +105,23 @@ class _Handler(BaseHTTPRequestHandler):
             if self.path == "/decisions":
                 return self._send(200, _decisions_page(self._conn(), self.pack_name),
                                   content_type="text/html")
+            if self.path.startswith("/view/"):
+                from urllib.parse import parse_qs, unquote, urlparse
+                u = urlparse(self.path)
+                qs = {k: v[0] for k, v in parse_qs(u.query).items()}
+                page = _view_page(self._conn(), unquote(u.path[len("/view/"):]),
+                                  qs, self.board, self.pack_name)
+                if page is None:
+                    return self._json(404, {"error": "no such view"})
+                return self._send(200, page, content_type="text/html")
+            if self.path.startswith("/run/"):
+                from urllib.parse import unquote
+                key = unquote(self.path[len("/run/"):])
+                page = _run_audit_page(self._conn(), key, self.workflows,
+                                       self.board, self.pack_name)
+                if page is None:
+                    return self._json(404, {"error": "no run '%s'" % key})
+                return self._send(200, page, content_type="text/html")
             if self.path.startswith("/task/"):
                 raw = self.path[len("/task/"):]
                 if not raw.isdigit():
@@ -142,6 +159,8 @@ class _Handler(BaseHTTPRequestHandler):
             if not raw.isdigit():
                 return self._json(400, {"error": "decision id must be an integer"})
             return self._resolve_decision(int(raw))
+        if self.path == "/api/launch":
+            return self._launch()
         if self.path != "/api/emit":
             return self._json(404, {"error": "unknown path %s" % self.path})
         try:
@@ -172,6 +191,52 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._json(500, {"error": str(e)})
 
+
+    def _launch(self):
+        """POST /api/launch: submit a pack-declared launch form. Builds the
+        payload from the form fields (path_or_text fields read the file when
+        the value is a readable path — same trust as the local CLI) and
+        emits the declared event; the run appears on the front page."""
+        from urllib.parse import parse_qs
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            if length > 1 << 20:
+                return self._json(413, {"error": "body too large"})
+            raw = self.rfile.read(length).decode("utf-8")
+            if "json" in self.headers.get("Content-Type", ""):
+                vals = json.loads(raw or "{}")
+            else:
+                vals = {k: v[0] for k, v in parse_qs(raw).items()}
+            event = vals.get("event")
+            spec = next((l for l in (self.board or {}).get("launch", [])
+                         if l["event"] == event), None)
+            if spec is None:
+                return self._json(400, {"error": "no launch form emits %r" % event})
+            if event not in self.subscriptions:
+                return self._json(400, {"error": "no workflow consumes '%s'" % event})
+            data = {}
+            for f in spec["fields"]:
+                v = str(vals.get(f["name"]) or "").strip() or f["default"]
+                if f["required"] and not v:
+                    return self._json(400, {"error": "field '%s' is required"
+                                            % f["name"]})
+                if v and f["kind"] == "path_or_text" and "\n" not in v \
+                        and len(v) < 4096:
+                    p = Path(v).expanduser()
+                    if p.is_file():
+                        v = p.read_text(errors="replace")[:1 << 20]
+                if v:
+                    data[f["name"]] = v
+            conn = self._conn()
+            event_id = db.emit_event(conn, event, data, self.subscriptions)
+            if "json" in self.headers.get("Content-Type", ""):
+                return self._json(200, {"event_id": event_id, "event": event})
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        except Exception as e:
+            return self._json(500, {"error": str(e)})
 
     def _resolve_decision(self, decision_id):
         from urllib.parse import parse_qs
@@ -318,21 +383,51 @@ def _run_artifact(data_dir, run_id, name):
     return data[-262144:]                       # last 256 KB is plenty
 
 
-def _panel_html(conn, panel, payload):
+def _view_link(view, value):
+    from urllib.parse import quote
+    return '<a href="/view/%s?key=%s">%s</a>' % (
+        quote(str(view)), quote(str(value)), html.escape(str(value)))
+
+
+def _sql_args(sql, supplied):
+    """Bind exactly the named params the SQL mentions (missing -> None), so
+    a view panel can use :key or any other query-string arg."""
+    import re
+    names = set(re.findall(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)", sql))
+    return {n: (supplied or {}).get(n) for n in names}
+
+
+def _panel_html(conn, panel, payload, args=None):
     """Render one pack-declared board panel (SELECT-only, enforced at load).
-    A broken panel renders its error — it must never take the page down."""
+    A broken panel renders its error — it must never take the page down.
+    Cross-linking convention: a column aliased 'link:<view>' renders each
+    cell as a link to /view/<view>?key=<cell> (header shows just <view>)."""
     esc = html.escape
     try:
-        args = {name: (payload or {}).get(key)
-                for name, key in (panel.get("params") or {}).items()}
+        if args is None:
+            args = {name: (payload or {}).get(key)
+                    for name, key in (panel.get("params") or {}).items()}
         cur = conn.execute(panel["sql"], args)
         cols = [d[0] for d in cur.description]
         rows = cur.fetchmany(500)
     except Exception as e:
         return "<h2>%s</h2><p class=muted>panel error: %s</p>" % (
             esc(panel["title"]), esc(str(e)))
+    links = {c: c.split(":", 1)[1] for c in cols if c.startswith("link:")}
+
+    def _cell(col, v):
+        if v is None:
+            return "<span class=muted>&mdash;</span>"
+        if col in links:
+            return _view_link(links[col], v)
+        s = str(v)
+        if "\n" in s:                       # multi-line values (code) stay code
+            return "<pre>%s</pre>" % esc(s[:4000])
+        return esc(s)
+
     out = ["<h2>%s</h2>" % esc(panel["title"])]
     if panel["kind"] == "status_grid":
+        link_col = next(iter(links), None)
         cells = []
         for r in rows:
             d = dict(zip(cols, r))
@@ -344,19 +439,26 @@ def _panel_html(conn, panel, payload):
             label = esc(str(d.get("label", "?")))
             extra = d.get("attempts")
             badge = ("<sup>%s</sup>" % extra) if extra else ""
-            cells.append('<span class="cell %s" title="%s: %s">%s%s</span>'
-                         % (cls, label, esc(status), label, badge))
+            cell = ('<span class="cell %s" title="%s: %s">%s%s</span>'
+                    % (cls, label, esc(status), label, badge))
+            if link_col and d.get(link_col) is not None:
+                from urllib.parse import quote
+                cell = '<a href="/view/%s?key=%s">%s</a>' % (
+                    quote(links[link_col]), quote(str(d[link_col])), cell)
+            cells.append(cell)
         out.append('<div class="grid">%s</div>'
                    % ("".join(cells) or "<span class=muted>none</span>"))
     elif panel["kind"] == "kv":
         out.append("<table>%s</table>" % "".join(
             "<tr><th>%s</th><td>%s</td></tr>"
-            % (esc(str(r[0])), esc(str(r[1] if len(r) > 1 else "")))
+            % (esc(str(r[0])),
+               _cell(cols[1] if len(cols) > 1 else "", r[1]) if len(r) > 1 else "")
             for r in rows))
     else:                                        # table
-        head = "".join("<th>%s</th>" % esc(c) for c in cols)
+        head = "".join("<th>%s</th>" % esc(links.get(c, c)) for c in cols)
         body = "".join(
-            "<tr>%s</tr>" % "".join("<td>%s</td>" % esc(str(v)) for v in r)
+            "<tr>%s</tr>" % "".join("<td>%s</td>" % _cell(c, v)
+                                    for c, v in zip(cols, r))
             for r in rows)
         out.append("<table><tr>%s</tr>%s</table>"
                    % (head, body or "<tr><td class=muted>none</td></tr>"))
@@ -709,6 +811,20 @@ _PAGE = """<!doctype html>
  nav { margin-left: 1rem; display: flex; gap: .9rem; font-size: .8rem; }
  nav a { color: var(--dim); } nav a:hover { color: var(--ink);
    text-decoration: none; }
+ a.rname { color: var(--ink); } a.rname:hover { color: var(--ember);
+   text-decoration: none; }
+ .launch { display: flex; flex-direction: column; gap: .55rem;
+   margin-top: .6rem; }
+ .lf { display: flex; flex-direction: column; gap: .2rem; font-size: .78rem;
+   color: var(--dim); }
+ .launch input, .launch textarea { background: var(--bg); color: var(--ink);
+   border: 1px solid var(--card-edge); border-radius: 6px; font: inherit;
+   font-size: .84rem; padding: .35rem .6rem; }
+ .launch textarea { font-family: var(--mono); resize: vertical; }
+ .launch input:focus, .launch textarea:focus { outline: none;
+   border-color: var(--ember); }
+ .go { align-self: flex-start; border-color:
+   color-mix(in srgb, var(--ember) 55%%, transparent); color: var(--ember); }
  .alert { display: flex; align-items: center; gap: .7rem;
    border: 1px solid color-mix(in srgb, var(--wait) 55%%, transparent);
    background: color-mix(in srgb, var(--wait) 9%%, transparent);
@@ -797,7 +913,9 @@ _PAGE = """<!doctype html>
 </main>
 <script>
 setInterval(async () => {
-  if (document.querySelector("details[open]") || String(getSelection())) return;
+  if (document.querySelector("details[open]") || String(getSelection())
+      || (document.activeElement
+          && document.activeElement.matches("input,textarea"))) return;
   try {
     const r = await fetch(location.href, {cache: "no-store"});
     const d = new DOMParser().parseFromString(await r.text(), "text/html");
@@ -1067,9 +1185,12 @@ def _run_card(conn, th, graph, workflows, dec_by_task):
                % (esc(k), esc(n["step"] or "starting"))
                for k, n in sorted(info.items())
                if n["task"]["state"] == "running"]
-    head = ('<div class="runhead"><span class="rname">%s</span>%s'
+    from urllib.parse import quote
+    head = ('<div class="runhead"><a class="rname" href="/run/%s"'
+            ' title="full audit trail">%s</a>%s'
             '<span class="when">updated %s</span></div>'
-            % (esc(th["key"]), chip, esc(_ago(th["updated"]))))
+            % (quote(th["key"]), esc(th["key"]), chip,
+               esc(_ago(th["updated"]))))
     strip = ('<div class="exec">executing now: %s</div>' % " ".join(execing)) \
         if execing else ""
     return '<section class="card run">%s%s%s</section>' \
@@ -1085,13 +1206,6 @@ def _dashboard(conn, pack_name, board=None, workflows=None):
     parts = []
 
     open_dec, dec_by_task = _open_decisions(conn)
-    if open_dec:
-        items = ", ".join(esc(r["key"]) for r in open_dec[:4])
-        parts.append('<div class="alert"><span class="dot"></span>'
-                     '<span>%d decision%s waiting on you (%s)</span>'
-                     '<a href="/decisions">decide &rarr;</a></div>'
-                     % (len(open_dec), "s" if len(open_dec) != 1 else "", items))
-
     graph = _wf_graph(workflows or {})
     thread_key = board.get("thread_key")
     threads, loose = _threads(conn, thread_key)
@@ -1101,14 +1215,25 @@ def _dashboard(conn, pack_name, board=None, workflows=None):
             or any(dec_by_task.get(t["id"]) for t in th["tasks"])
         (active if live else finished).append(th)
 
+    if open_dec:
+        items = ", ".join(esc(r["key"]) for r in open_dec[:4])
+        parts.append('<div class="alert"><span class="dot"></span>'
+                     '<span>%d decision%s waiting on you (%s)</span>'
+                     '<a href="/decisions">decide &rarr;</a></div>'
+                     % (len(open_dec), "s" if len(open_dec) != 1 else "", items))
+
+    parts.extend(_launch_forms(board, any_active=bool(active)))
+
     for th in active:
         parts.append(_run_card(conn, th, graph, workflows, dec_by_task))
 
     if finished:
+        from urllib.parse import quote
         rows = "".join(
-            "<tr><td>%s</td><td class='state-%s'>%s</td><td>%s</td>"
+            "<tr><td><a href='/run/%s'>%s</a></td>"
+            "<td class='state-%s'>%s</td><td>%s</td>"
             "<td class=muted>%s</td></tr>"
-            % (esc(th["key"]),
+            % (quote(th["key"]), esc(th["key"]),
                "done" if all(t["state"] == "done" for t in th["latest"].values())
                else "failed",
                "complete" if all(t["state"] == "done"
@@ -1195,3 +1320,166 @@ def _explore_page(conn, pack_name, board=None):
 
     return _PAGE % {"title": esc(" · %s · explore" % pack_name),
                     "beat": "", "sections": _frame(parts)}
+
+
+# ------------------------------------------------------------- entity views
+
+def _view_page(conn, name, qs, board, pack_name):
+    """A pack-declared entity page (/view/<name>?key=...): the pack's panels
+    with the query string bound as SQL params. Everything an entity touches,
+    one click deep, via the link:<view> column convention."""
+    esc = html.escape
+    spec = ((board or {}).get("views") or {}).get(name)
+    if spec is None:
+        return None
+    key = qs.get("key", "")
+    title = spec["title"].replace("{key}", key)
+    parts = ['<p><a href="/">&larr; runs</a></p>',
+             '<div class="runhead"><span class="rname">%s</span></div>'
+             % esc(title)]
+    for pn in spec["panels"]:
+        parts.append(_panel_html(conn, pn, {}, args=_sql_args(pn["sql"], qs)))
+    return _PAGE % {"title": esc(" · %s · %s" % (pack_name, title)),
+                    "beat": "", "sections": _frame(parts)}
+
+
+# ---------------------------------------------------------- run audit trail
+
+def _audit_trail(conn, task, block_names):
+    """Every recorded step of one task, EVERY attempt, oldest first: when,
+    which block ran, what it decided, how long it took, and the run
+    artifacts (prompt / stdout / verdict / context) when an agent spoke.
+    This is the audit surface — full detail lives here, not on the front."""
+    esc = html.escape
+    rows = conn.execute(
+        "SELECT attempt, step, outcome, wall_ms, at, result FROM task_steps"
+        " WHERE task_id=? ORDER BY rowid", (task["id"],)).fetchall()
+    out = []
+    for r in rows:
+        res = json.loads(r["result"] or "{}")
+        run_id = res.get("_run_id")
+        link = (' &middot; <a href="/api/run/%d/prompt">prompt</a>'
+                ' <a href="/api/run/%d/stdout">stdout</a>'
+                ' <a href="/api/run/%d/verdict">verdict</a>'
+                ' <a href="/api/run/%d/context">context</a>'
+                % (run_id, run_id, run_id, run_id)) if run_id else ""
+        cls = "warn" if r["outcome"] in _BAD_OUTCOMES else "ok"
+        out.append(
+            "<tr><td class=muted>%s</td><td>a%d</td><td>%s</td>"
+            "<td class=muted>%s</td><td class='cell %s'>%s</td><td>%.1fs</td>"
+            "<td><details><summary>in/out%s</summary><pre>%s</pre></details>"
+            "</td></tr>"
+            % (esc(str(r["at"])), r["attempt"], esc(r["step"]),
+               esc(block_names.get(r["step"], "")), cls,
+               esc(str(r["outcome"])), (r["wall_ms"] or 0) / 1000.0, link,
+               esc(json.dumps(res, indent=1, sort_keys=True)[:4000])))
+    return out
+
+
+def _run_audit_page(conn, key, workflows, board, pack_name):
+    """/run/<thread value>: the COMPLETE story of one raw request — every
+    task it spawned (oldest first), every step of every attempt, every
+    decision round with its verdict, every event it emitted."""
+    esc = html.escape
+    thread_key = (board or {}).get("thread_key")
+    if not thread_key:
+        return None
+    tasks = []
+    for r in conn.execute("SELECT * FROM tasks ORDER BY id"):
+        try:
+            payload = json.loads(r["payload"] or "{}")
+        except ValueError:
+            continue
+        if payload.get(thread_key) == key:
+            tasks.append(r)
+    if not tasks:
+        return None
+    parts = ['<p><a href="/">&larr; runs</a></p>',
+             '<div class="runhead"><span class="rname">%s</span>'
+             '<span class="chip run">audit trail</span></div>' % esc(key)]
+
+    ids = [t["id"] for t in tasks]
+    marks = ",".join("?" * len(ids))
+    dec = conn.execute(
+        "SELECT * FROM decisions WHERE task_id IN (%s) ORDER BY id" % marks,
+        ids).fetchall()
+    if dec:
+        rows = []
+        for d in dec:
+            answer = json.loads(d["answer"] or "{}")
+            said = []
+            if answer.get("picked"):
+                said.append("picked: %s" % answer["picked"])
+            if answer.get("comment"):
+                said.append("&ldquo;%s&rdquo;" % esc(str(answer["comment"])))
+            rows.append("<tr><td>%s</td><td>%d</td><td>%s</td><td>%s</td>"
+                        "<td>%s</td><td class=muted>%s</td></tr>"
+                        % (esc(d["key"]), d["round"], esc(d["title"]),
+                           esc(str(d["verdict"] or "open")),
+                           " ".join(said) or "<span class=muted>&mdash;</span>",
+                           esc(str(d["resolved_at"] or ""))))
+        parts.append("<h2>human decisions</h2><table><tr><th>key</th>"
+                     "<th>round</th><th>question</th><th>verdict</th>"
+                     "<th>answer</th><th>at</th></tr>%s</table>" % "".join(rows))
+
+    for t in tasks:
+        wf = (workflows or {}).get(t["kind"])
+        block_names = {s.name: s.block.name for s in wf.steps} if wf else {}
+        trail = _audit_trail(conn, t, block_names)
+        parts.append(
+            "<h2>%s &middot; <a href='/task/%d'>task #%d</a> &middot; "
+            "<span class='state-%s'>%s</span></h2>"
+            "<table><tr><th>at</th><th>att</th><th>step</th><th>block</th>"
+            "<th>outcome</th><th>wall</th><th></th></tr>%s</table>"
+            % (esc(t["kind"]), t["id"], t["id"], esc(t["state"]),
+               esc(t["state"]),
+               "".join(trail) or "<tr><td colspan=7 class=muted>no steps"
+                                 " recorded</td></tr>"))
+
+    try:
+        evs = conn.execute(
+            "SELECT id, name, at FROM events WHERE json_extract(payload, ?)=?"
+            " ORDER BY id", ("$." + thread_key, key)).fetchall()
+    except Exception:
+        evs = []
+    if evs:
+        parts.append("<h2>events of this run</h2><table><tr><th>id</th>"
+                     "<th>at</th><th>event</th></tr>%s</table>"
+                     % "".join("<tr><td>%d</td><td class=muted>%s</td>"
+                               "<td>%s</td></tr>"
+                               % (e["id"], esc(e["at"]), esc(e["name"]))
+                               for e in evs))
+    return _PAGE % {"title": esc(" · %s · run %s" % (pack_name, key)),
+                    "beat": "", "sections": _frame(parts)}
+
+
+# ------------------------------------------------------------- launch forms
+
+def _launch_forms(board, any_active):
+    """Pack-declared 'start a run' forms. Collapsed once runs are in flight,
+    open on an idle board — paste, click, go."""
+    esc = html.escape
+    out = []
+    for spec in (board or {}).get("launch") or []:
+        fields = []
+        for f in spec["fields"]:
+            ph = ("paste a file path or the text itself"
+                  if f["kind"] == "path_or_text" else "")
+            common = ('name="%s" placeholder="%s"%s'
+                      % (esc(f["name"]), esc(ph),
+                         " required" if f["required"] else ""))
+            if f["kind"] in ("textarea", "path_or_text"):
+                inp = ('<textarea %s rows="2">%s</textarea>'
+                       % (common, esc(f["default"])))
+            else:
+                inp = '<input %s value="%s">' % (common, esc(f["default"]))
+            fields.append('<label class="lf"><span>%s</span>%s</label>'
+                          % (esc(f["label"]), inp))
+        out.append(
+            '<section class="card"><details class="hist"%s><summary>%s'
+            '</summary><form class="launch" method="post" action="/api/launch">'
+            '<input type="hidden" name="event" value="%s">%s'
+            '<button class="go">start &rarr;</button></form></details></section>'
+            % ("" if any_active else " open", esc(spec["title"]),
+               esc(spec["event"]), "".join(fields)))
+    return out

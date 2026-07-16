@@ -314,10 +314,119 @@ def load_pack(pack_dir) -> Pack:
     )
 
 
+def _check_panel(pn, where, _fail):
+    """One board panel: {title, kind: table|status_grid|kv, sql: SELECT...,
+    params?: {sql-name: payload-key}}. SELECT-only is enforced here (the
+    board must never write)."""
+    if not isinstance(pn, dict):
+        _fail("%s must be a mapping" % where)
+    bad = set(pn) - {"title", "kind", "sql", "params"}
+    if bad:
+        _fail("%s: unknown keys %s" % (where, sorted(bad)))
+    title, kind, sql = pn.get("title"), pn.get("kind", "table"), pn.get("sql")
+    if not title or not isinstance(title, str):
+        _fail("%s needs a title" % where)
+    if kind not in ("table", "status_grid", "kv"):
+        _fail("%s: kind must be table|status_grid|kv" % where)
+    if not isinstance(sql, str) or not sql.strip().lower().startswith("select"):
+        _fail("%s: sql must be a single SELECT" % where)
+    if ";" in sql.rstrip().rstrip(";"):
+        _fail("%s: one statement only" % where)
+    params = pn.get("params") or {}
+    if not isinstance(params, dict) or not all(
+            isinstance(k, str) and isinstance(v, str)
+            for k, v in params.items()):
+        _fail("%s: params must map sql-name -> payload-key" % where)
+    return {"title": title, "kind": kind, "sql": sql, "params": params}
+
+
+_FIELD_KINDS = ("text", "textarea", "path_or_text")
+
+
+def _parse_launch(entries, _fail):
+    """board.launch: [{title, event, fields: [{name, label?, kind?, default?,
+    required?}]}] — a form the board renders; submitting emits `event` with
+    one payload key per field. kind path_or_text: if the submitted value is a
+    readable file path, the FILE CONTENT becomes the value (paste a path or
+    the text itself — same trust as the local CLI). The engine only checks
+    shape; whether anyone consumes the event is checked when it fires."""
+    if not entries:
+        return []
+    if not isinstance(entries, list):
+        _fail("board.launch must be a list of {title, event, fields}")
+    out = []
+    for i, e in enumerate(entries):
+        where = "board.launch[%d]" % i
+        if not isinstance(e, dict):
+            _fail("%s must be a mapping" % where)
+        bad = set(e) - {"title", "event", "fields"}
+        if bad:
+            _fail("%s: unknown keys %s" % (where, sorted(bad)))
+        title, ev = e.get("title"), e.get("event")
+        if not title or not isinstance(title, str):
+            _fail("%s needs a title" % where)
+        if not isinstance(ev, str) or not EVENT_RE.match(ev):
+            _fail("%s: malformed event name %r" % (where, ev))
+        fields = e.get("fields") or []
+        if not isinstance(fields, list) or not fields:
+            _fail("%s needs a non-empty fields list" % where)
+        clean = []
+        for j, f in enumerate(fields):
+            fw = "%s.fields[%d]" % (where, j)
+            if not isinstance(f, dict):
+                _fail("%s must be a mapping" % fw)
+            fbad = set(f) - {"name", "label", "kind", "default", "required"}
+            if fbad:
+                _fail("%s: unknown keys %s" % (fw, sorted(fbad)))
+            fname = f.get("name")
+            if not isinstance(fname, str) or not _IDENT_RE.match(fname):
+                _fail("%s: 'name' must be a plain identifier (payload key)" % fw)
+            fkind = f.get("kind", "text")
+            if fkind not in _FIELD_KINDS:
+                _fail("%s: kind must be one of %s" % (fw, "|".join(_FIELD_KINDS)))
+            clean.append({"name": fname, "label": str(f.get("label") or fname),
+                          "kind": fkind, "default": str(f.get("default", "")),
+                          "required": bool(f.get("required", False))})
+        out.append({"title": title, "event": ev, "fields": clean})
+    return out
+
+
+def _parse_views(doc, _fail):
+    """board.views: {name: {title, panels: [...]}} — parameterized entity
+    pages at /view/<name>?key=... Panel SQL binds :key (and any other query-
+    string arg it names). Cross-linking is a COLUMN ALIAS convention: a
+    column named 'link:<view>' renders each cell as a link to that view
+    keyed by the cell value — the pack declares relationships in SQL, the
+    engine renders them. Corpora pattern: mechanism here, meaning there."""
+    if not doc:
+        return {}
+    if not isinstance(doc, dict):
+        _fail("board.views must be a mapping of view-name -> {title, panels}")
+    out = {}
+    for name, spec in doc.items():
+        if not isinstance(name, str) or not _IDENT_RE.match(name):
+            _fail("board.views: bad view name %r" % (name,))
+        where = "board.views.%s" % name
+        if not isinstance(spec, dict):
+            _fail("%s must be a mapping" % where)
+        bad = set(spec) - {"title", "panels"}
+        if bad:
+            _fail("%s: unknown keys %s" % (where, sorted(bad)))
+        title = spec.get("title") or name
+        if not isinstance(title, str):
+            _fail("%s: title must be a string" % where)
+        panels = spec.get("panels")
+        if not isinstance(panels, list) or not panels:
+            _fail("%s needs a non-empty panels list" % where)
+        out[name] = {"title": title,
+                     "panels": [_check_panel(pn, "%s.panels[%d]" % (where, i),
+                                             _fail)
+                                for i, pn in enumerate(panels)]}
+    return out
+
+
 def _parse_board(doc, _fail):
-    """board: {thread_key?, overview_panels: [...], task_panels: [...]} — each
-    panel {title, kind: table|status_grid|kv, sql: SELECT..., params?: {name:
-    key}}. SELECT-only is enforced here (the board must never write).
+    """board: {thread_key?, overview_panels?, task_panels?, views?, launch?}.
     thread_key names the payload field that correlates tasks/decisions into
     one RUN (one raw request = one thread through every workflow) — the board
     groups by it; the engine attaches no meaning to the value."""
@@ -325,7 +434,8 @@ def _parse_board(doc, _fail):
         return {}
     if not isinstance(doc, dict):
         _fail("board: must be a mapping")
-    unknown = set(doc) - {"overview_panels", "task_panels", "thread_key"}
+    unknown = set(doc) - {"overview_panels", "task_panels", "thread_key",
+                          "views", "launch"}
     if unknown:
         _fail("board: unknown keys %s" % sorted(unknown))
     out = {}
@@ -338,31 +448,10 @@ def _parse_board(doc, _fail):
         panels = doc.get(section) or []
         if not isinstance(panels, list):
             _fail("board.%s must be a list" % section)
-        clean = []
-        for i, pn in enumerate(panels):
-            if not isinstance(pn, dict):
-                _fail("board.%s[%d] must be a mapping" % (section, i))
-            bad = set(pn) - {"title", "kind", "sql", "params"}
-            if bad:
-                _fail("board.%s[%d]: unknown keys %s" % (section, i, sorted(bad)))
-            title, kind, sql = pn.get("title"), pn.get("kind", "table"), pn.get("sql")
-            if not title or not isinstance(title, str):
-                _fail("board.%s[%d] needs a title" % (section, i))
-            if kind not in ("table", "status_grid", "kv"):
-                _fail("board.%s[%d]: kind must be table|status_grid|kv" % (section, i))
-            if not isinstance(sql, str) or not sql.strip().lower().startswith("select"):
-                _fail("board.%s[%d]: sql must be a single SELECT" % (section, i))
-            if ";" in sql.rstrip().rstrip(";"):
-                _fail("board.%s[%d]: one statement only" % (section, i))
-            params = pn.get("params") or {}
-            if not isinstance(params, dict) or not all(
-                    isinstance(k, str) and isinstance(v, str)
-                    for k, v in params.items()):
-                _fail("board.%s[%d]: params must map sql-name -> payload-key"
-                      % (section, i))
-            clean.append({"title": title, "kind": kind, "sql": sql,
-                          "params": params})
-        out[section] = clean
+        out[section] = [_check_panel(pn, "board.%s[%d]" % (section, i), _fail)
+                        for i, pn in enumerate(panels)]
+    out["views"] = _parse_views(doc.get("views"), _fail)
+    out["launch"] = _parse_launch(doc.get("launch"), _fail)
     return out
 
 
