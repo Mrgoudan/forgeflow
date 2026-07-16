@@ -569,7 +569,8 @@ def human_ask(ctx, task, prev):
         did = dbmod.create_decision(
             conn, key, spec["title"], task_id=task["id"],
             kind=spec.get("kind", "question"), body=spec.get("body"),
-            options=spec.get("options"), recommended=spec.get("recommended"))
+            context=spec.get("context"), options=spec.get("options"),
+            recommended=spec.get("recommended"))
         return "awaiting_human", {
             "decision_id": did, "key": key,
             "_staged": [{"op": "emit_event", "name": "decision.requested",

@@ -443,57 +443,141 @@ def _task_page(conn, task_id, workflows, board, pack_name):
 
 # ---------------------------------------------------------- decisions page
 
+def _rich(text, limit=6000):
+    """Markdown-lite -> HTML for human-facing decision prose: paragraphs,
+    `- ` bullets, `inline code`, ```fenced blocks```. Escapes first —
+    model/pack text is never trusted as HTML."""
+    import re
+    esc = html.escape
+    text = str(text or "")[:limit]
+    out, para, bullets, fence = [], [], [], None
+
+    def _inline(s):
+        return re.sub(r"`([^`]+)`", r"<code>\1</code>", esc(s))
+
+    def _flush():
+        if para:
+            out.append("<p>%s</p>" % "<br>".join(para))
+            para.clear()
+        if bullets:
+            out.append("<ul>%s</ul>" % "".join("<li>%s</li>" % b for b in bullets))
+            bullets.clear()
+
+    for line in text.splitlines():
+        if fence is not None:
+            if line.strip().startswith("```"):
+                out.append("<pre>%s</pre>" % esc("\n".join(fence)))
+                fence = None
+            else:
+                fence.append(line)
+            continue
+        if line.strip().startswith("```"):
+            _flush()
+            fence = []
+            continue
+        s = line.strip()
+        if not s:
+            _flush()
+        elif s.startswith(("- ", "* ")):
+            if para:
+                _flush()
+            bullets.append(_inline(s[2:]))
+        else:
+            if bullets:
+                _flush()
+            para.append(_inline(s))
+    if fence is not None:
+        out.append("<pre>%s</pre>" % esc("\n".join(fence)))
+    _flush()
+    return "".join(out)
+
+
+def _decision_card(r):
+    """One open decision round: readable situation + clickable option cards
+    (click = choose, one confirm) + ONE reject-all-and-regenerate action.
+    Reframe/abandon are demoted to quiet links. No raw JSON anywhere —
+    that lives on the audit surfaces."""
+    esc = html.escape
+    opts = json.loads(r["options"] or "[]")
+    action = "/api/decision/%d/resolve" % r["id"]
+    cards, names = [], []
+    for o in opts:
+        rich = isinstance(o, dict)
+        name = (o.get("title") if rich else o) or "?"
+        names.append(str(name))
+        rec = str(name) == r["recommended"]
+        inner = ['<div class="opthead"><strong>%s</strong>%s</div>'
+                 % (esc(str(name)),
+                    '<span class="chip ok">recommended</span>' if rec else "")]
+        if rich:
+            if o.get("summary"):
+                inner.append('<p>%s</p>' % esc(str(o["summary"])))
+            for sign, key, cls in (("+", "pros", "ok"), ("&minus;", "cons", "warn")):
+                for item in (o.get(key) or []):
+                    inner.append('<div class="pc %s">%s %s</div>'
+                                 % (cls, sign, esc(str(item))))
+            if o.get("risks"):
+                inner.append('<div class="pc off">risk: %s</div>'
+                             % esc(str(o["risks"])))
+            if o.get("sketch"):
+                inner.append('<details class="lift"><summary>sketch</summary>'
+                             '<pre>%s</pre></details>' % esc(str(o["sketch"])[:2000]))
+        inner.append('<button class="choose" name="verdict" value="picked">'
+                     'choose this &rarr;</button>')
+        cards.append(
+            '<form class="opt%s" method="post" action="%s"'
+            ' onsubmit="return confirm(\'Go with: %s?\')">'
+            '<input type="hidden" name="picked" value="%s">%s</form>'
+            % (" rec" if rec else "", action,
+               esc(str(name)).replace("'", "&#39;"), esc(str(name)),
+               "".join(inner)))
+
+    rejected_all = "".join('<input type="hidden" name="rejected" value="%s">'
+                           % esc(n) for n in names)
+    head = ('<div class="runhead"><span class="rname">%s</span>'
+            '<span class="chip wait">round %d</span>'
+            '<span class="when">%s</span></div>'
+            '<p class="dtitle">%s</p>'
+            % (esc(r["key"]), r["round"], esc(_ago(r["created_at"])),
+               esc(r["title"])))
+    body = ('<div class="muted">%s</div>' % _rich(r["body"])) if r["body"] else ""
+    context = ""
+    if "context" in r.keys() and r["context"]:
+        context = ('<div class="ctx"><div class="ctxlabel">the situation'
+                   '</div>%s</div>' % _rich(r["context"]))
+    reject = (
+        '<form class="rejects" method="post" action="%s">%s'
+        '<input name="comment" placeholder="what\'s wrong / what you want'
+        ' instead (optional)&hellip;">'
+        '<button name="verdict" value="revise">Reject all &amp; regenerate'
+        '</button></form>' % (action, rejected_all)) if names else (
+        '<form class="rejects" method="post" action="%s">'
+        '<input name="comment" placeholder="your answer&hellip;">'
+        '<button name="verdict" value="revise">Send</button></form>' % action)
+    quiet = ('<div class="quiet">or: '
+             '<form method="post" action="%s" onsubmit="return'
+             ' confirm(\'Reframe: go back and rethink the question itself?\')">'
+             '<button class="linkish" name="verdict" value="reframe">reframe'
+             ' the question</button></form> &middot; '
+             '<form method="post" action="%s" onsubmit="return'
+             ' confirm(\'Abandon this entirely?\')">'
+             '<button class="linkish danger" name="verdict" value="abandon">'
+             'abandon</button></form></div>' % (action, action))
+    return ('<section class="card run">%s%s%s<div class="opts">%s</div>'
+            '%s%s</section>'
+            % (head, body, context, "".join(cards), reject, quiet))
+
+
 def _decisions_page(conn, pack_name):
     esc = html.escape
-    parts = ['<p><a href="/">&larr; overview</a></p>']
+    parts = ['<p><a href="/">&larr; runs</a></p>']
     rows = conn.execute("SELECT * FROM decisions WHERE status='open'"
                         " ORDER BY id").fetchall()
     if not rows:
-        parts.append("<h2>decisions</h2><p class=muted>nothing waiting on you.</p>")
+        parts.append("<h2>decisions</h2><p class=muted>nothing waiting"
+                     " on you.</p>")
     for r in rows:
-        opts = json.loads(r["options"] or "[]")
-        cards = []
-        for o in opts:
-            rich = isinstance(o, dict)
-            name = (o.get("title") if rich else o) or "?"
-            star = " &#9733;" if name == r["recommended"] else ""
-            inner = ["<strong>%s%s</strong>" % (esc(str(name)), star)]
-            if rich:
-                if o.get("summary"):
-                    inner.append("<p>%s</p>" % esc(str(o["summary"])))
-                for label, key, cls in (("+", "pros", "ok"), ("&minus;", "cons", "warn")):
-                    for item in (o.get(key) or []):
-                        inner.append('<div class="pc %s">%s %s</div>'
-                                     % (cls, label, esc(str(item))))
-                if o.get("risks"):
-                    inner.append('<div class="pc off">risk: %s</div>'
-                                 % esc(str(o["risks"])))
-                if o.get("sketch"):
-                    inner.append("<details><summary>sketch</summary>"
-                                 "<pre>%s</pre></details>" % esc(str(o["sketch"])[:2000]))
-            inner.append(
-                '<div class="pick"><label><input type="radio" name="picked"'
-                ' value="%s"%s> pick</label> <label><input type="checkbox"'
-                ' name="rejected" value="%s"> reject</label></div>'
-                % (esc(str(name)), " checked" if name == r["recommended"] else "",
-                   esc(str(name))))
-            cards.append('<div class="opt">%s</div>' % "".join(inner))
-        parts.append(
-            '<h2>%s · round %d · %s</h2>'
-            '<form method="post" action="/api/decision/%d/resolve">'
-            '<p>%s</p>%s'
-            '<div class="opts">%s</div>'
-            '<p><input name="comment" placeholder="comment / discussion&hellip;"'
-            ' style="width:60%%"></p>'
-            '<p><button name="verdict" value="picked">Pick selected</button> '
-            '<button name="verdict" value="revise">Revise (send rejections'
-            ' + comment)</button> <button name="verdict" value="reframe">'
-            'Reframe</button> <button name="verdict" value="abandon">Abandon'
-            '</button></p></form>'
-            % (esc(r["key"]), r["round"], esc(r["kind"]), r["id"],
-               esc(r["title"]),
-               ("<p class=muted>%s</p>" % esc(r["body"])) if r["body"] else "",
-               "".join(cards)))
+        parts.append(_decision_card(r))
     hist = conn.execute("SELECT key, round, verdict, answered_by, resolved_at"
                         " FROM decisions WHERE status='resolved'"
                         " ORDER BY resolved_at DESC LIMIT 10").fetchall()
@@ -589,6 +673,39 @@ _PAGE = """<!doctype html>
  .pc.ok { color: var(--ok); } .pc.warn { color: var(--bad); }
  .pc.off { color: var(--wait); }
  .pick { margin-top: .5rem; font-size: .8rem; color: var(--dim); }
+ .dtitle { margin: .1rem 0 .6rem; font-size: 1.02rem; font-weight: 600; }
+ .ctx { border-left: 3px solid color-mix(in srgb, var(--ember) 55%%, transparent);
+   background: color-mix(in srgb, var(--card-edge) 22%%, transparent);
+   border-radius: 0 8px 8px 0; padding: .55rem .9rem; margin: .6rem 0 .8rem;
+   font-size: .86rem; }
+ .ctx p { margin: .25rem 0; } .ctx ul { margin: .25rem 0 .25rem 1.1rem;
+   padding: 0; } .ctx li { margin: .12rem 0; }
+ .ctxlabel { font: 600 .66rem/1.6 -apple-system, sans-serif;
+   letter-spacing: .13em; text-transform: uppercase; color: var(--ember);
+   margin-bottom: .15rem; }
+ form.opt { position: relative; margin: 0; transition: border-color .15s,
+   box-shadow .15s, transform .15s; }
+ form.opt:hover { border-color: var(--ember); transform: translateY(-1px);
+   box-shadow: 0 3px 14px color-mix(in srgb, var(--ember) 18%%, transparent); }
+ form.opt.rec { border-color: color-mix(in srgb, var(--ok) 45%%, transparent); }
+ .opthead { display: flex; align-items: baseline; gap: .5rem;
+   justify-content: space-between; margin-bottom: .2rem; }
+ .choose { display: block; width: 100%%; margin-top: .6rem; text-align: center;
+   color: var(--dim); border-style: dashed; }
+ .choose::after { content: ""; position: absolute; inset: 0; cursor: pointer; }
+ form.opt:hover .choose { color: var(--ember); border-color: var(--ember); }
+ details.lift { position: relative; z-index: 2; }
+ .rejects { display: flex; gap: .6rem; margin-top: .9rem; align-items: center; }
+ .rejects input[name=comment] { flex: 1; }
+ .rejects button { flex: none; border-color:
+   color-mix(in srgb, var(--bad) 45%%, transparent); color: var(--bad); }
+ .rejects button:hover { border-color: var(--bad); color: var(--bad); }
+ .quiet { margin-top: .55rem; font-size: .76rem; color: var(--faint); }
+ .quiet form { display: inline; }
+ .linkish { background: none; border: none; padding: 0; color: var(--dim);
+   text-decoration: underline; font-size: .76rem; cursor: pointer; }
+ .linkish:hover { color: var(--ink); border: none; }
+ .linkish.danger:hover { color: var(--bad); }
  nav { margin-left: 1rem; display: flex; gap: .9rem; font-size: .8rem; }
  nav a { color: var(--dim); } nav a:hover { color: var(--ink);
    text-decoration: none; }

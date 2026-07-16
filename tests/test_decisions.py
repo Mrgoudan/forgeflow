@@ -93,6 +93,8 @@ class DecisionsHttpTest(unittest.TestCase):
         base = tmpdir()
         conn = db.connect(base / "state" / "forgeflow.db")
         did = db.create_decision(conn, "F/design", "pick", kind="proposal",
+                                 context="Driven by `R-1`.\n\n- affects X\n"
+                                         "- affects Y",
                                  options=[{"title": "A", "pros": ["p"]}, "B"],
                                  recommended="A")
         from forgeflow import httpd
@@ -104,6 +106,14 @@ class DecisionsHttpTest(unittest.TestCase):
                 "http://%s:%s/decisions" % (host, port)).read().decode()
             self.assertIn("pick", page)
             self.assertIn("F/design", page)
+            # the humane surface: click-to-choose cards, one reject-all
+            # action, rendered (not raw) context — and no JSON dumps.
+            self.assertIn("choose this", page)
+            self.assertIn("Reject all", page)
+            self.assertIn("the situation", page)
+            self.assertIn("<code>R-1</code>", page)      # markdown-lite rendered
+            self.assertIn("<li>affects X</li>", page)
+            self.assertIn("recommended", page)
             body = urlencode({"verdict": "picked", "picked": "A"}).encode()
             req = urllib.request.Request(
                 "http://%s:%s/api/decision/%d/resolve" % (host, port, did),

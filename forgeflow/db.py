@@ -249,7 +249,12 @@ CREATE TABLE IF NOT EXISTS decisions (
     task_id       INTEGER,               -- the task waiting on this round
     kind          TEXT NOT NULL DEFAULT 'question',  -- question | proposal
     title         TEXT NOT NULL,
-    body          TEXT,                  -- context: why this is being asked
+    body          TEXT,                  -- why this is being asked (one line)
+    context       TEXT,                  -- the situation, HUMAN-READABLE: what
+                                         -- led here, what is affected, what
+                                         -- happens next (markdown-lite; the
+                                         -- board renders it at the decision
+                                         -- point so nobody digs through JSON)
     options       TEXT,                  -- JSON list
     recommended   TEXT,                  -- option name the asker recommends
     status        TEXT NOT NULL DEFAULT 'open',  -- open | resolved | superseded
@@ -368,13 +373,19 @@ def _mig_v6(conn):
     )""")
 
 
-SCHEMA_VERSION = 6
+def _mig_v7(conn):
+    """v7 (0.8.0): decisions carry human-readable context."""
+    _add_column(conn, "decisions", "context", "TEXT")
+
+
+SCHEMA_VERSION = 7
 MIGRATIONS: list = [
     (2, _mig_v2),
     (3, _mig_v3),
     (4, _mig_v4),
     (5, _mig_v5),
     (6, _mig_v6),
+    (7, _mig_v7),
 ]       # [(version, callable(conn))] — idempotent single statements only
         #   (they must compose into _migrate's one transaction)
 
@@ -512,9 +523,12 @@ VERDICTS = ("picked", "revise", "reframe", "abandon")
 
 
 def create_decision(conn, key, title, task_id=None, kind="question",
-                    body=None, options=None, recommended=None) -> int:
+                    body=None, context=None, options=None,
+                    recommended=None) -> int:
     """Open the next round for `key`. Any prior open round is superseded —
-    one live question per key, ever."""
+    one live question per key, ever. `context` is the human-readable
+    situation report shown AT the decision point (what led here, what is
+    affected, what happens after each verdict)."""
     with ensure_tx(conn):
         conn.execute("UPDATE decisions SET status='superseded'"
                      " WHERE key=? AND status='open'", (key,))
@@ -522,8 +536,8 @@ def create_decision(conn, key, title, task_id=None, kind="question",
                             " WHERE key=?", (key,)).fetchone()[0]
         cur = conn.execute(
             "INSERT INTO decisions(key, round, task_id, kind, title, body,"
-            " options, recommended) VALUES (?,?,?,?,?,?,?,?)",
-            (key, last + 1, task_id, kind, title, body,
+            " context, options, recommended) VALUES (?,?,?,?,?,?,?,?,?)",
+            (key, last + 1, task_id, kind, title, body, context,
              canonical_json(options or []), recommended))
         return cur.lastrowid
 
