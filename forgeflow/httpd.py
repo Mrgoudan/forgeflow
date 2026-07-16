@@ -90,9 +90,16 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             return self._json(401, {"error": "missing or bad bearer token"})
         try:
-            if self.path == "/" or self.path == "/index.html":
+            if self.path == "/" or self.path == "/index.html" \
+                    or self.path.startswith("/?"):
+                from urllib.parse import parse_qs, urlparse
+                q = {k: v[0] for k, v in
+                     parse_qs(urlparse(self.path).query).items()}
+                prefill = {k[len("launch_"):]: v for k, v in q.items()
+                           if k.startswith("launch_")}
                 return self._send(200, _dashboard(self._conn(), self.pack_name,
-                                                  self.board, self.workflows),
+                                                  self.board, self.workflows,
+                                                  prefill=prefill),
                                   content_type="text/html")
             if self.path == "/explore":
                 return self._send(200, _explore_page(self._conn(), self.pack_name,
@@ -1197,7 +1204,7 @@ def _run_card(conn, th, graph, workflows, dec_by_task):
         % (head, _pipeline_svg(graph, info), strip)
 
 
-def _dashboard(conn, pack_name, board=None, workflows=None):
+def _dashboard(conn, pack_name, board=None, workflows=None, prefill=None):
     """The front page: what is this system doing for me RIGHT NOW.
     Decision alert -> active runs (pipeline graphs) -> finished runs
     (collapsed) -> loose tasks. Ops tables live on /explore."""
@@ -1222,7 +1229,8 @@ def _dashboard(conn, pack_name, board=None, workflows=None):
                      '<a href="/decisions">decide &rarr;</a></div>'
                      % (len(open_dec), "s" if len(open_dec) != 1 else "", items))
 
-    parts.extend(_launch_forms(board, any_active=bool(active)))
+    parts.extend(_launch_forms(board, any_active=bool(active),
+                               prefill=prefill))
 
     for th in active:
         parts.append(_run_card(conn, th, graph, workflows, dec_by_task))
@@ -1232,7 +1240,10 @@ def _dashboard(conn, pack_name, board=None, workflows=None):
         rows = "".join(
             "<tr><td><a href='/run/%s'>%s</a></td>"
             "<td class='state-%s'>%s</td><td>%s</td>"
-            "<td class=muted>%s</td></tr>"
+            "<td class=muted>%s</td>"
+            "<td><a href='/?launch_%s=%s' title='reopen the start form with"
+            " this run prefilled — an edited requirement re-runs only what"
+            " changed'>revise &rarr;</a></td></tr>"
             % (quote(th["key"]), esc(th["key"]),
                "done" if all(t["state"] == "done" for t in th["latest"].values())
                else "failed",
@@ -1240,11 +1251,13 @@ def _dashboard(conn, pack_name, board=None, workflows=None):
                                  for t in th["latest"].values()) else "ended",
                " ".join("<a href='/task/%d'>%s</a>" % (t["id"], esc(k))
                         for k, t in sorted(th["latest"].items())),
-               esc(_ago(th["updated"]))) for th in finished[:20])
+               esc(_ago(th["updated"])),
+               quote(thread_key or ""), quote(th["key"]))
+            for th in finished[:20])
         parts.append("<h2>finished runs</h2><details class=hist><summary>"
                      "%d finished run%s</summary><table><tr><th>run</th>"
-                     "<th>state</th><th>tasks</th><th>updated</th></tr>%s"
-                     "</table></details>"
+                     "<th>state</th><th>tasks</th><th>updated</th><th></th>"
+                     "</tr>%s</table></details>"
                      % (len(finished), "s" if len(finished) != 1 else "", rows))
 
     if not threads and not loose:
@@ -1397,9 +1410,13 @@ def _run_audit_page(conn, key, workflows, board, pack_name):
             tasks.append(r)
     if not tasks:
         return None
+    from urllib.parse import quote
     parts = ['<p><a href="/">&larr; runs</a></p>',
              '<div class="runhead"><span class="rname">%s</span>'
-             '<span class="chip run">audit trail</span></div>' % esc(key)]
+             '<span class="chip run">audit trail</span>'
+             '<span class="when"><a href="/?launch_%s=%s">revise this run'
+             ' &rarr;</a></span></div>'
+             % (esc(key), quote(thread_key), quote(key))]
 
     ids = [t["id"] for t in tasks]
     marks = ",".join("?" * len(ids))
@@ -1458,13 +1475,16 @@ def _run_audit_page(conn, key, workflows, board, pack_name):
 
 # ------------------------------------------------------------- launch forms
 
-def _launch_form(spec, collapsed, key=None):
+def _launch_form(spec, collapsed, key=None, prefill=None):
     """One pack-declared launch form. `key` (entity views) replaces '{key}'
-    in field defaults, so a view-scoped form knows its entity."""
+    in field defaults, so a view-scoped form knows its entity; `prefill`
+    ({field: value}, from ?launch_<field>= links) overrides defaults — how a
+    finished run's 'revise' link reopens the form with its key filled in."""
     esc = html.escape
     fields = []
     for f in spec["fields"]:
         default = f["default"].replace("{key}", key) if key else f["default"]
+        default = (prefill or {}).get(f["name"], default)
         if f["kind"] == "hidden":
             fields.append('<input type="hidden" name="%s" value="%s">'
                           % (esc(f["name"]), esc(default)))
@@ -1489,10 +1509,11 @@ def _launch_form(spec, collapsed, key=None):
                esc(spec["event"]), "".join(fields)))
 
 
-def _launch_forms(board, any_active):
+def _launch_forms(board, any_active, prefill=None):
     """Front-page 'start a run' forms (view-scoped ones render on their
-    view). Collapsed once runs are in flight, open on an idle board —
-    paste, click, go."""
-    return [_launch_form(spec, collapsed=any_active)
+    view). Collapsed once runs are in flight, open on an idle board or when
+    a 'revise' link arrives with prefill — paste, click, go."""
+    return [_launch_form(spec, collapsed=any_active and not prefill,
+                         prefill=prefill)
             for spec in (board or {}).get("launch") or []
             if not spec.get("on_view")]
