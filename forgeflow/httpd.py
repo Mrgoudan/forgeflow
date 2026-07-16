@@ -1339,6 +1339,9 @@ def _view_page(conn, name, qs, board, pack_name):
              % esc(title)]
     for pn in spec["panels"]:
         parts.append(_panel_html(conn, pn, {}, args=_sql_args(pn["sql"], qs)))
+    for ln in (board or {}).get("launch") or []:
+        if ln.get("on_view") == name:
+            parts.append(_launch_form(ln, collapsed=True, key=key))
     return _PAGE % {"title": esc(" · %s · %s" % (pack_name, title)),
                     "beat": "", "sections": _frame(parts)}
 
@@ -1455,31 +1458,41 @@ def _run_audit_page(conn, key, workflows, board, pack_name):
 
 # ------------------------------------------------------------- launch forms
 
-def _launch_forms(board, any_active):
-    """Pack-declared 'start a run' forms. Collapsed once runs are in flight,
-    open on an idle board — paste, click, go."""
+def _launch_form(spec, collapsed, key=None):
+    """One pack-declared launch form. `key` (entity views) replaces '{key}'
+    in field defaults, so a view-scoped form knows its entity."""
     esc = html.escape
-    out = []
-    for spec in (board or {}).get("launch") or []:
-        fields = []
-        for f in spec["fields"]:
-            ph = ("paste a file path or the text itself"
-                  if f["kind"] == "path_or_text" else "")
-            common = ('name="%s" placeholder="%s"%s'
-                      % (esc(f["name"]), esc(ph),
-                         " required" if f["required"] else ""))
-            if f["kind"] in ("textarea", "path_or_text"):
-                inp = ('<textarea %s rows="2">%s</textarea>'
-                       % (common, esc(f["default"])))
-            else:
-                inp = '<input %s value="%s">' % (common, esc(f["default"]))
-            fields.append('<label class="lf"><span>%s</span>%s</label>'
-                          % (esc(f["label"]), inp))
-        out.append(
-            '<section class="card"><details class="hist"%s><summary>%s'
+    fields = []
+    for f in spec["fields"]:
+        default = f["default"].replace("{key}", key) if key else f["default"]
+        if f["kind"] == "hidden":
+            fields.append('<input type="hidden" name="%s" value="%s">'
+                          % (esc(f["name"]), esc(default)))
+            continue
+        ph = ("paste a file path or the text itself"
+              if f["kind"] == "path_or_text" else "")
+        common = ('name="%s" placeholder="%s"%s'
+                  % (esc(f["name"]), esc(ph),
+                     " required" if f["required"] else ""))
+        if f["kind"] in ("textarea", "path_or_text"):
+            inp = ('<textarea %s rows="2">%s</textarea>'
+                   % (common, esc(default)))
+        else:
+            inp = '<input %s value="%s">' % (common, esc(default))
+        fields.append('<label class="lf"><span>%s</span>%s</label>'
+                      % (esc(f["label"]), inp))
+    return ('<section class="card"><details class="hist"%s><summary>%s'
             '</summary><form class="launch" method="post" action="/api/launch">'
             '<input type="hidden" name="event" value="%s">%s'
             '<button class="go">start &rarr;</button></form></details></section>'
-            % ("" if any_active else " open", esc(spec["title"]),
+            % (" open" if not collapsed else "", esc(spec["title"]),
                esc(spec["event"]), "".join(fields)))
-    return out
+
+
+def _launch_forms(board, any_active):
+    """Front-page 'start a run' forms (view-scoped ones render on their
+    view). Collapsed once runs are in flight, open on an idle board —
+    paste, click, go."""
+    return [_launch_form(spec, collapsed=any_active)
+            for spec in (board or {}).get("launch") or []
+            if not spec.get("on_view")]

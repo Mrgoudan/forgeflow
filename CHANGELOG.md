@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.8.0 — 2026-07-16
+
+### Added
+- **Runs**: `board.thread_key` names the payload field that correlates one
+  raw request across every workflow. The front page is rebuilt around it:
+  active runs render as live SVG pipeline graphs (nodes = workflow kinds
+  from the emits→consumes orchestration map, per-node state + step
+  progress, needs-you badge, flowing edge), finished runs collapse, ops
+  tables move to `/explore`.
+- **Humane decisions**: `decisions.context` column (schema v7) — a
+  human-readable situation report rendered AT the decision point
+  (markdown-lite, escaped). `/decisions` rework: click-to-choose option
+  cards (one confirm), a single "Reject all & regenerate" action with an
+  optional message (= revise); reframe/abandon demoted to quiet links. No
+  raw JSON on user surfaces.
+- **Entity views**: `board.views` — pack-declared parameterized pages
+  (`/view/<name>?key=...`); panel SQL binds query-string args; a column
+  aliased `link:<view>` renders as a cross-link (tables + status grids).
+- **Run audit**: `/run/<thread>` — the complete story of one request:
+  every task oldest-first, every attempt/step with block name, in/out and
+  run artifacts, every decision round, every event.
+- **Launch forms**: `board.launch` — pack-declared start forms
+  (`POST /api/launch`); `path_or_text` fields read the file when handed a
+  readable path; `on_view` attaches a form to an entity view with `{key}`
+  prefilled (the "change this function" hook); `hidden` field kind.
+
 ## 0.7.3 — 2026-07-12
 
 ### Fixed

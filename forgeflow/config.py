@@ -340,15 +340,18 @@ def _check_panel(pn, where, _fail):
     return {"title": title, "kind": kind, "sql": sql, "params": params}
 
 
-_FIELD_KINDS = ("text", "textarea", "path_or_text")
+_FIELD_KINDS = ("text", "textarea", "path_or_text", "hidden")
 
 
 def _parse_launch(entries, _fail):
-    """board.launch: [{title, event, fields: [{name, label?, kind?, default?,
-    required?}]}] — a form the board renders; submitting emits `event` with
-    one payload key per field. kind path_or_text: if the submitted value is a
-    readable file path, the FILE CONTENT becomes the value (paste a path or
-    the text itself — same trust as the local CLI). The engine only checks
+    """board.launch: [{title, event, on_view?, fields: [{name, label?, kind?,
+    default?, required?}]}] — a form the board renders; submitting emits
+    `event` with one payload key per field. kind path_or_text: if the
+    submitted value is a readable file path, the FILE CONTENT becomes the
+    value (paste a path or the text itself — same trust as the local CLI).
+    on_view: the form renders on that entity view instead of the front page,
+    with '{key}' in field defaults replaced by the view key (that is how a
+    'change this function' form knows its function). The engine only checks
     shape; whether anyone consumes the event is checked when it fires."""
     if not entries:
         return []
@@ -359,7 +362,7 @@ def _parse_launch(entries, _fail):
         where = "board.launch[%d]" % i
         if not isinstance(e, dict):
             _fail("%s must be a mapping" % where)
-        bad = set(e) - {"title", "event", "fields"}
+        bad = set(e) - {"title", "event", "fields", "on_view"}
         if bad:
             _fail("%s: unknown keys %s" % (where, sorted(bad)))
         title, ev = e.get("title"), e.get("event")
@@ -367,6 +370,9 @@ def _parse_launch(entries, _fail):
             _fail("%s needs a title" % where)
         if not isinstance(ev, str) or not EVENT_RE.match(ev):
             _fail("%s: malformed event name %r" % (where, ev))
+        on_view = e.get("on_view")
+        if on_view is not None and (not isinstance(on_view, str) or not on_view):
+            _fail("%s: on_view must be a view name" % where)
         fields = e.get("fields") or []
         if not isinstance(fields, list) or not fields:
             _fail("%s needs a non-empty fields list" % where)
@@ -387,7 +393,8 @@ def _parse_launch(entries, _fail):
             clean.append({"name": fname, "label": str(f.get("label") or fname),
                           "kind": fkind, "default": str(f.get("default", "")),
                           "required": bool(f.get("required", False))})
-        out.append({"title": title, "event": ev, "fields": clean})
+        out.append({"title": title, "event": ev, "fields": clean,
+                    "on_view": on_view})
     return out
 
 
