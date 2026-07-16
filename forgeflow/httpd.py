@@ -750,7 +750,7 @@ _PAGE = """<!doctype html>
  .state-running, .state-pending { color: var(--run); }
  .state-done::before, .state-failed::before, .state-parked::before,
  .state-running::before, .state-pending::before, .state-retry_wait::before {
-   content: "\25CF\00A0"; font-size: .7em; vertical-align: .15em; }
+   content: "● "; font-size: .7em; vertical-align: .15em; }
  .grid { display: flex; flex-wrap: wrap; gap: .3rem .35rem; align-items: center;
          font-family: var(--mono); font-size: .78rem; }
  .cell { padding: .16rem .55rem; border-radius: 6px; white-space: nowrap;
@@ -884,8 +884,8 @@ _PAGE = """<!doctype html>
    align-items: center; }
  details.hist summary { cursor: pointer; color: var(--dim);
    font-size: .8rem; list-style: none; }
- details.hist summary::before { content: "\25B8\00A0"; color: var(--faint); }
- details.hist[open] summary::before { content: "\25BE\00A0"; }
+ details.hist summary::before { content: "▸ "; color: var(--faint); }
+ details.hist[open] summary::before { content: "▾ "; }
  button { background: var(--card); color: var(--ink); cursor: pointer;
           border: 1px solid var(--card-edge); border-radius: 6px;
           padding: .3rem .8rem; font: inherit; font-size: .8rem; }
