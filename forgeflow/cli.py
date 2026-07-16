@@ -133,6 +133,45 @@ def cmd_unpark(args):
     return 0
 
 
+def cmd_decisions(args):
+    """Open human decisions — what the pipeline is waiting on."""
+    import json as _json
+    conn = db.connect(Path(args.root) / "state" / "forgeflow.db")
+    rows = conn.execute("SELECT * FROM decisions WHERE status='open'"
+                        " ORDER BY id").fetchall()
+    if not rows:
+        print("no open decisions")
+        return 0
+    for r in rows:
+        print("#%d  %s  round %d  (%s)  task %s" % (
+            r["id"], r["key"], r["round"], r["kind"], r["task_id"]))
+        print("    %s" % r["title"])
+        for opt in _json.loads(r["options"] or "[]"):
+            name = opt.get("title") if isinstance(opt, dict) else opt
+            star = " *" if name == r["recommended"] else ""
+            print("      - %s%s" % (name, star))
+        print("    decide: forgeflow decide %d picked --option <name>"
+              " | revise --comment ... | reframe | abandon" % r["id"])
+    return 0
+
+
+def cmd_decide(args):
+    """Resolve a decision from the terminal; the waiting task resumes on the
+    same attempt."""
+    conn = db.connect(Path(args.root) / "state" / "forgeflow.db")
+    answer = {}
+    if args.option:
+        answer["picked"] = args.option
+    if args.reject:
+        answer["rejected"] = args.reject
+    if args.comment:
+        answer["comment"] = args.comment
+    tid = db.resolve_decision(conn, args.decision_id, args.verdict, answer)
+    print("decision %d -> %s%s" % (args.decision_id, args.verdict,
+          ("; task %s resumed" % tid) if tid else ""))
+    return 0
+
+
 def cmd_trace(args):
     """The full story of one task, straight from the db: what event created
     it, every step boundary, every model run, what it emitted, and which
@@ -607,6 +646,15 @@ def main(argv=None):
     pr.add_argument("task_id", nargs="?", type=int, default=None)
     pr.add_argument("--kind", default=None, help="only tasks of this kind")
 
+    pd = sub.add_parser("decisions", help="open human decisions (the queue of asks)")
+    pD = sub.add_parser("decide", help="answer a decision; the task resumes")
+    pD.add_argument("decision_id", type=int)
+    pD.add_argument("verdict", choices=["picked", "revise", "reframe", "abandon"])
+    pD.add_argument("--option", help="option name (for picked)")
+    pD.add_argument("--reject", action="append", default=[],
+                    help="rejected option (repeatable, for revise)")
+    pD.add_argument("--comment")
+
     pt = sub.add_parser("trace", help="one task's full story from the db")
     pt.add_argument("task_id", type=int)
 
@@ -645,6 +693,7 @@ def main(argv=None):
     args = p.parse_args(argv)
     return {"validate": cmd_validate, "run": cmd_run, "once": cmd_once,
             "emit": cmd_emit, "status": cmd_status, "unpark": cmd_unpark,
+            "decisions": cmd_decisions, "decide": cmd_decide,
             "retry": cmd_retry, "trace": cmd_trace, "gc": cmd_gc,
             "metrics": cmd_metrics, "doctor": cmd_doctor,
             "llm": cmd_llm}[args.cmd](args)

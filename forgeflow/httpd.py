@@ -97,6 +97,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(200, _status(self._conn()))
             if self.path == "/api/metrics":
                 return self._json(200, _metrics(self._conn()))
+            if self.path == "/decisions":
+                return self._send(200, _decisions_page(self._conn(), self.pack_name),
+                                  content_type="text/html")
             if self.path.startswith("/task/"):
                 raw = self.path[len("/task/"):]
                 if not raw.isdigit():
@@ -129,6 +132,11 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._authorized():
             return self._json(401, {"error": "missing or bad bearer token"})
+        if self.path.startswith("/api/decision/") and self.path.endswith("/resolve"):
+            raw = self.path[len("/api/decision/"):-len("/resolve")]
+            if not raw.isdigit():
+                return self._json(400, {"error": "decision id must be an integer"})
+            return self._resolve_decision(int(raw))
         if self.path != "/api/emit":
             return self._json(404, {"error": "unknown path %s" % self.path})
         try:
@@ -156,6 +164,47 @@ class _Handler(BaseHTTPRequestHandler):
             event_id = db.emit_event(conn, name, data, self.subscriptions)
             return self._json(200, {"event_id": event_id, "event": name,
                                     "consumers": self.subscriptions[name]})
+        except Exception as e:
+            return self._json(500, {"error": str(e)})
+
+
+    def _resolve_decision(self, decision_id):
+        from urllib.parse import parse_qs
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            if length > 1 << 20:
+                return self._json(413, {"error": "body too large"})
+            raw = self.rfile.read(length).decode("utf-8")
+            ctype = self.headers.get("Content-Type", "")
+            if "json" in ctype:
+                body = json.loads(raw or "{}")
+                verdict = body.get("verdict")
+                answer = {k: v for k, v in body.items()
+                          if k in ("picked", "rejected", "comment") and v}
+            else:
+                q = parse_qs(raw)
+                verdict = (q.get("verdict") or [None])[0]
+                answer = {}
+                if q.get("picked"):
+                    answer["picked"] = q["picked"][0]
+                if q.get("rejected"):
+                    answer["rejected"] = q["rejected"]
+                if q.get("comment") and q["comment"][0].strip():
+                    answer["comment"] = q["comment"][0].strip()
+            if verdict == "picked" and not answer.get("picked"):
+                return self._json(400, {"error": "picked needs an option"})
+            conn = self._conn()
+            tid = db.resolve_decision(conn, decision_id, verdict, answer,
+                                      answered_by="board")
+            if "json" in ctype:
+                return self._json(200, {"decision": decision_id,
+                                        "verdict": verdict, "resumed_task": tid})
+            self.send_response(303)
+            self.send_header("Location", "/decisions")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        except ValueError as e:
+            return self._json(400, {"error": str(e)})
         except Exception as e:
             return self._json(500, {"error": str(e)})
 
@@ -387,6 +436,74 @@ def _task_page(conn, task_id, workflows, board, pack_name):
                     "beat": esc(t["state"]), "sections": _frame(parts)}
 
 
+# ---------------------------------------------------------- decisions page
+
+def _decisions_page(conn, pack_name):
+    esc = html.escape
+    parts = ['<p><a href="/">&larr; overview</a></p>']
+    rows = conn.execute("SELECT * FROM decisions WHERE status='open'"
+                        " ORDER BY id").fetchall()
+    if not rows:
+        parts.append("<h2>decisions</h2><p class=muted>nothing waiting on you.</p>")
+    for r in rows:
+        opts = json.loads(r["options"] or "[]")
+        cards = []
+        for o in opts:
+            rich = isinstance(o, dict)
+            name = (o.get("title") if rich else o) or "?"
+            star = " &#9733;" if name == r["recommended"] else ""
+            inner = ["<strong>%s%s</strong>" % (esc(str(name)), star)]
+            if rich:
+                if o.get("summary"):
+                    inner.append("<p>%s</p>" % esc(str(o["summary"])))
+                for label, key, cls in (("+", "pros", "ok"), ("&minus;", "cons", "warn")):
+                    for item in (o.get(key) or []):
+                        inner.append('<div class="pc %s">%s %s</div>'
+                                     % (cls, label, esc(str(item))))
+                if o.get("risks"):
+                    inner.append('<div class="pc off">risk: %s</div>'
+                                 % esc(str(o["risks"])))
+                if o.get("sketch"):
+                    inner.append("<details><summary>sketch</summary>"
+                                 "<pre>%s</pre></details>" % esc(str(o["sketch"])[:2000]))
+            inner.append(
+                '<div class="pick"><label><input type="radio" name="picked"'
+                ' value="%s"%s> pick</label> <label><input type="checkbox"'
+                ' name="rejected" value="%s"> reject</label></div>'
+                % (esc(str(name)), " checked" if name == r["recommended"] else "",
+                   esc(str(name))))
+            cards.append('<div class="opt">%s</div>' % "".join(inner))
+        parts.append(
+            '<h2>%s · round %d · %s</h2>'
+            '<form method="post" action="/api/decision/%d/resolve">'
+            '<p>%s</p>%s'
+            '<div class="opts">%s</div>'
+            '<p><input name="comment" placeholder="comment / discussion&hellip;"'
+            ' style="width:60%%"></p>'
+            '<p><button name="verdict" value="picked">Pick selected</button> '
+            '<button name="verdict" value="revise">Revise (send rejections'
+            ' + comment)</button> <button name="verdict" value="reframe">'
+            'Reframe</button> <button name="verdict" value="abandon">Abandon'
+            '</button></p></form>'
+            % (esc(r["key"]), r["round"], esc(r["kind"]), r["id"],
+               esc(r["title"]),
+               ("<p class=muted>%s</p>" % esc(r["body"])) if r["body"] else "",
+               "".join(cards)))
+    hist = conn.execute("SELECT key, round, verdict, answered_by, resolved_at"
+                        " FROM decisions WHERE status='resolved'"
+                        " ORDER BY resolved_at DESC LIMIT 10").fetchall()
+    if hist:
+        parts.append("<h2>recently decided</h2><table><tr><th>key</th>"
+                     "<th>round</th><th>verdict</th><th>by</th><th>at</th></tr>%s</table>"
+                     % "".join("<tr><td>%s</td><td>%d</td><td>%s</td><td>%s</td>"
+                               "<td class=muted>%s</td></tr>"
+                               % (esc(h["key"]), h["round"], esc(str(h["verdict"])),
+                                  esc(str(h["answered_by"])), esc(str(h["resolved_at"])))
+                               for h in hist))
+    return _PAGE % {"title": esc(" · %s · decisions" % pack_name),
+                    "beat": "", "sections": _frame(parts)}
+
+
 # ---------------------------------------------------------------- dashboard
 
 _PAGE = """<!doctype html>
@@ -458,6 +575,21 @@ _PAGE = """<!doctype html>
  .cell.off  { color: var(--faint); }
  .cell sup  { color: var(--wait); }
  .arrow { color: var(--faint); font-size: .8rem; }
+ .opts { display: flex; flex-wrap: wrap; gap: .7rem; }
+ .opt { flex: 1 1 16rem; max-width: 22rem; border: 1px solid var(--card-edge);
+        border-radius: 8px; padding: .7rem .8rem; font-size: .85rem;
+        background: color-mix(in srgb, var(--card-edge) 20%%, transparent); }
+ .opt p { margin: .3rem 0; color: var(--dim); }
+ .pc { font-family: var(--mono); font-size: .78rem; margin: .12rem 0; }
+ .pc.ok { color: var(--ok); } .pc.warn { color: var(--bad); }
+ .pc.off { color: var(--wait); }
+ .pick { margin-top: .5rem; font-size: .8rem; color: var(--dim); }
+ button { background: var(--card); color: var(--ink); cursor: pointer;
+          border: 1px solid var(--card-edge); border-radius: 6px;
+          padding: .3rem .8rem; font: inherit; font-size: .8rem; }
+ button:hover { border-color: var(--ember); color: var(--ember); }
+ input[name=comment] { background: var(--bg); border: 1px solid var(--card-edge);
+          border-radius: 6px; color: var(--ink); padding: .3rem .6rem; font: inherit; }
  pre { font-family: var(--mono); font-size: .78rem; line-height: 1.45;
        background: color-mix(in srgb, var(--bg) 70%%, black 8%%);
        border: 1px solid var(--card-edge); border-radius: 8px;
@@ -505,6 +637,12 @@ def _dashboard(conn, pack_name, board=None):
     esc = html.escape
     parts = []
 
+    n_open = conn.execute("SELECT count(*) FROM decisions"
+                          " WHERE status='open'").fetchone()[0]
+    if n_open:
+        parts.append('<h2>&#9888; waiting on you</h2><p><a href="/decisions">'
+                     '%d open decision%s &rarr;</a></p>'
+                     % (n_open, "s" if n_open != 1 else ""))
     rows = []
     for r in conn.execute("SELECT id, kind, state, updated_at FROM tasks"
                           " ORDER BY updated_at DESC, id DESC LIMIT 15"):

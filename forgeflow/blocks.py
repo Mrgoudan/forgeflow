@@ -26,6 +26,7 @@ genuinely new capabilities.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -45,20 +46,24 @@ class Block:
     accepts_context: frozenset = field(default_factory=frozenset)
     required_params: frozenset = field(default_factory=frozenset)
     resumable: bool = False      # default for steps using this block
+    # fresh: NEVER replay this block's recorded outcome on a crash/decision
+    # resume — always re-execute (a gate that recorded 'awaiting_human' must
+    # re-check the decision, not replay the wait).
+    fresh: bool = False
 
 
 _BLOCKS = {}
 
 
 def block(name, exec_class, outcomes, accepts_context=(), required_params=(),
-          resumable=False):
+          resumable=False, fresh=False):
     """Decorator: register a block. Duplicate names are a startup error."""
     def wrap(fn):
         if name in _BLOCKS:
             raise SystemExit("block '%s' registered twice" % name)
         _BLOCKS[name] = Block(name, fn, exec_class, frozenset(outcomes),
                               frozenset(accepts_context),
-                              frozenset(required_params), resumable)
+                              frozenset(required_params), resumable, fresh)
         return fn
     return wrap
 
@@ -515,6 +520,66 @@ def db_upsert_item(ctx, task, prev):
         if ctx.get(f) is not None:
             op[f] = _tpl(ctx, task, prev, ctx[f])
     return "ok", {"_staged": [op]}
+
+
+
+
+@block("human.ask", "state",
+       {"picked", "revise", "reframe", "abandon", "awaiting_human"},
+       required_params={"key"}, fresh=True)
+def human_ask(ctx, task, prev):
+    """The human gate — a step whose OUTCOME a person decides. Lifecycle:
+
+      1. no open/unconsumed round + prev carries `decision` -> open the next
+         round (options from the proposing step) and wait (awaiting_human
+         parks; resolve resumes the SAME attempt, and `fresh` makes this step
+         re-run instead of replaying the wait).
+      2. open round, unanswered -> keep waiting.
+      3. resolved + unconsumed -> consume it: the verdict IS the outcome
+         (picked | revise | reframe | abandon), the answer rides in the
+         result for downstream steps / the next proposing round.
+
+    The workflow maps each verdict to an edge — forward with state, a
+    revision back-edge, a reframe further back — so multi-round human
+    interaction is ordinary graph walking, bounded by max_visits."""
+    conn = ctx["_conn"]
+    from .util import template as _template
+    key = _template(ctx["key"], {"payload": task.get("payload") or {},
+                                 "prev": prev or {}})
+    from . import db as dbmod
+    row = conn.execute(
+        "SELECT * FROM decisions WHERE key=? AND status IN ('open','resolved')"
+        " AND consumed_at IS NULL ORDER BY round DESC LIMIT 1", (key,)).fetchone()
+
+    if row is not None and row["status"] == "resolved":
+        conn.execute("UPDATE decisions SET consumed_at=datetime('now')"
+                     " WHERE id=?", (row["id"],))
+        answer = json.loads(row["answer"] or "{}")
+        return row["verdict"], {"decision_id": row["id"], "key": key,
+                                "round": row["round"], "answer": answer,
+                                "options": json.loads(row["options"] or "[]")}
+
+    if row is None:
+        spec = (prev or {}).get("decision")
+        if not isinstance(spec, dict) or not spec.get("title"):
+            raise RuntimeError(
+                "human.ask '%s': no open decision and the previous step "
+                "carried no `decision` ({title, options?, ...}) to open one"
+                % key)
+        did = dbmod.create_decision(
+            conn, key, spec["title"], task_id=task["id"],
+            kind=spec.get("kind", "question"), body=spec.get("body"),
+            options=spec.get("options"), recommended=spec.get("recommended"))
+        return "awaiting_human", {
+            "decision_id": did, "key": key,
+            "_staged": [{"op": "emit_event", "name": "decision.requested",
+                         "payload": {"decision_id": did, "key": key,
+                                     "title": spec["title"]}}]}
+
+    # open + unanswered: make sure the row points at THIS task, keep waiting
+    conn.execute("UPDATE decisions SET task_id=? WHERE id=?",
+                 (task["id"], row["id"]))
+    return "awaiting_human", {"decision_id": row["id"], "key": key}
 
 
 @block("event.emit", "state", {"ok"},

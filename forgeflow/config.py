@@ -76,6 +76,11 @@ class Pack:
     # {overview_panels: [...], task_panels: [...]}; task panels may bind SQL
     # named params from the task payload via params: {sql_name: payload_key}.
     board: dict = field(default_factory=dict)
+    # notify: {event_name: [argv...]} — when the daemon sees a matching event,
+    # it spawns the command (detached) with the event name + JSON payload
+    # appended as two extra args. HOW you get pinged (desktop, webhook, chat)
+    # is pack configuration; the engine only owns the trigger.
+    notify: dict = field(default_factory=dict)
     # item lifecycle — PACK-DECLARED: {state: [allowed next states]}. The
     # engine core ships NO lifecycle (it defines only the initial state
     # 'found' = "recorded"); what states exist and how they may move is
@@ -94,7 +99,7 @@ _PACK_KEYS = {"name", "paths", "params", "workflows", "blocks", "schema",
               "tools", "agents", "prompts", "schemas", "models", "workspace_root",
               "idle_interval_s", "unpark_interval_s", "agent_health_url",
               "concurrency", "min_free_disk_mb", "retry", "schedule", "http",
-              "corpora", "item_states", "board"}
+              "corpora", "item_states", "board", "notify"}
 
 
 def load_pack(pack_dir) -> Pack:
@@ -285,6 +290,7 @@ def load_pack(pack_dir) -> Pack:
     corpora = _parse_corpora(doc.get("corpora"), models, agents, _fail)
     item_states = _parse_item_states(doc.get("item_states"), _fail)
     board = _parse_board(doc.get("board"), _fail)
+    notify = _parse_notify(doc.get("notify"), _fail)
 
     workspace_root = doc.get("workspace_root")
     if workspace_root:
@@ -304,7 +310,7 @@ def load_pack(pack_dir) -> Pack:
         concurrency=doc.get("concurrency") or {},
         min_free_disk_mb=int(doc.get("min_free_disk_mb", 0)),
         policy=policy, schedule=schedule, http=http, corpora=corpora,
-        item_states=item_states, board=board,
+        item_states=item_states, board=board, notify=notify,
     )
 
 
@@ -349,6 +355,23 @@ def _parse_board(doc, _fail):
             clean.append({"title": title, "kind": kind, "sql": sql,
                           "params": params})
         out[section] = clean
+    return out
+
+
+def _parse_notify(doc, _fail):
+    """notify: {event_name: [argv...]} — argv list, never a shell string."""
+    if not doc:
+        return {}
+    if not isinstance(doc, dict):
+        _fail("notify: must map event names to argv lists")
+    out = {}
+    for ev, argv in doc.items():
+        if not isinstance(ev, str) or not ev:
+            _fail("notify: event names must be strings")
+        if (not isinstance(argv, list) or not argv
+                or not all(isinstance(a, str) for a in argv)):
+            _fail("notify.%s: must be a non-empty argv list" % ev)
+        out[ev] = list(argv)
     return out
 
 

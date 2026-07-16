@@ -299,6 +299,8 @@ class Engine:
             print("engine: %d workers, lane caps=%s"
                   % (workers, {k: v._initial_value for k, v in lanes.items()}))
             last_unpark = last_beat = 0.0
+            self._notify_cursor = self.conn.execute(
+                "SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
             try:
                 while True:
                     now = time.monotonic()
@@ -314,6 +316,7 @@ class Engine:
                         self._unpark_tick()
                         last_unpark = now
                     self._schedule_tick()
+                    self._notify_tick()
                     time.sleep(min(idle, unpark_every))
             finally:
                 stop.set()
@@ -365,6 +368,28 @@ class Engine:
               % (server.server_address[0], server.server_address[1],
                  " (token required)" if token else ""))
         return server
+
+    def _notify_tick(self):
+        """Fire pack-configured notifications for events emitted since the
+        last tick. Detached spawn; a dead notifier never blocks the daemon."""
+        cfg = getattr(self.pack, "notify", None) if self.pack else None
+        if not cfg:
+            return
+        rows = self.conn.execute(
+            "SELECT id, name, payload FROM events WHERE id > ? ORDER BY id",
+            (self._notify_cursor,)).fetchall()
+        for r in rows:
+            self._notify_cursor = r["id"]
+            argv = cfg.get(r["name"])
+            if not argv:
+                continue
+            try:
+                subprocess.Popen(argv + [r["name"], r["payload"] or "{}"],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+            except Exception as e:
+                print("notify: %s failed: %s" % (argv[0], e), file=sys.stderr)
 
     def _disk_ok(self) -> bool:
         mb = getattr(self.pack, "min_free_disk_mb", 0) if self.pack else 0

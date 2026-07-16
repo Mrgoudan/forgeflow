@@ -395,7 +395,8 @@ def execute(env: ExecEnv, workflow: Workflow, task: dict) -> str:
                               "step '%s' exceeded max_visits=%d"
                               % (current, step.max_visits))
 
-        if current in rows and current not in replayed:
+        if (current in rows and current not in replayed
+                and not getattr(step.block, "fresh", False)):
             # resume: this step already completed for this attempt
             outcome, result = rows[current]["outcome"], rows[current]["result"]
             replayed.add(current)

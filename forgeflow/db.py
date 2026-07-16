@@ -17,7 +17,7 @@ import sqlite3
 from pathlib import Path
 
 from . import queue
-from .util import ensure_tx
+from .util import canonical_json, ensure_tx
 
 # The item lifecycle is PACK-DECLARED (project.yaml `item_states:`) — what
 # states exist and how they may move is domain vocabulary, not an engine
@@ -236,6 +236,32 @@ CREATE TABLE IF NOT EXISTS corpus_summaries (
 -- outcome-learned utility signal: rows that co-occur with done tasks of
 -- the same kind earn rank, rows that co-occur with failures lose it —
 -- auto-labelled from the ledger, no human annotation.
+-- Human decision points — an ENGINE primitive (asking a person, waiting,
+-- and routing on their verdict is orchestration, like parks and events; what
+-- a decision MEANS belongs to the pack that raises it). One row per ROUND:
+-- a revise verdict supersedes the round and the proposing step opens the
+-- next. options is JSON — plain strings for simple questions, rich objects
+-- ({title, summary, pros, cons, risks, sketch}) for proposal compares.
+CREATE TABLE IF NOT EXISTS decisions (
+    id            INTEGER PRIMARY KEY,
+    key           TEXT NOT NULL,         -- caller-chosen stable decision key
+    round         INTEGER NOT NULL DEFAULT 1,
+    task_id       INTEGER,               -- the task waiting on this round
+    kind          TEXT NOT NULL DEFAULT 'question',  -- question | proposal
+    title         TEXT NOT NULL,
+    body          TEXT,                  -- context: why this is being asked
+    options       TEXT,                  -- JSON list
+    recommended   TEXT,                  -- option name the asker recommends
+    status        TEXT NOT NULL DEFAULT 'open',  -- open | resolved | superseded
+    verdict       TEXT,                  -- picked | revise | reframe | abandon
+    answer        TEXT,                  -- JSON {picked?, rejected?, comment?}
+    answered_by   TEXT,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    resolved_at   TEXT,
+    consumed_at   TEXT,                  -- the gate consumed the verdict
+    UNIQUE (key, round)
+);
+
 CREATE TABLE IF NOT EXISTS context_uses (
     task_id       INTEGER NOT NULL REFERENCES tasks(id),
     kind          TEXT NOT NULL,         -- task kind (utility is per-kind)
@@ -478,3 +504,52 @@ def record_transition(conn, item_id: int, to_state: str, event: str,
                     "from_state": from_state, "via": event},
                    subscriptions)
         return transition_id
+
+
+# ------------------------------------------------------------- decisions
+
+VERDICTS = ("picked", "revise", "reframe", "abandon")
+
+
+def create_decision(conn, key, title, task_id=None, kind="question",
+                    body=None, options=None, recommended=None) -> int:
+    """Open the next round for `key`. Any prior open round is superseded —
+    one live question per key, ever."""
+    with ensure_tx(conn):
+        conn.execute("UPDATE decisions SET status='superseded'"
+                     " WHERE key=? AND status='open'", (key,))
+        last = conn.execute("SELECT COALESCE(MAX(round),0) FROM decisions"
+                            " WHERE key=?", (key,)).fetchone()[0]
+        cur = conn.execute(
+            "INSERT INTO decisions(key, round, task_id, kind, title, body,"
+            " options, recommended) VALUES (?,?,?,?,?,?,?,?)",
+            (key, last + 1, task_id, kind, title, body,
+             canonical_json(options or []), recommended))
+        return cur.lastrowid
+
+
+def resolve_decision(conn, decision_id, verdict, answer=None,
+                     answered_by="user"):
+    """Record the human's verdict and WAKE the waiting task on the SAME
+    attempt (queue.resume_decision): the park wasn't a failure, so completed
+    steps replay for free and only the gate re-runs. Returns the task id
+    that was resumed (or None)."""
+    from .util import canonical_json as _cj
+    if verdict not in VERDICTS:
+        raise ValueError("verdict must be one of %s" % (VERDICTS,))
+    with ensure_tx(conn):
+        row = conn.execute("SELECT task_id, status FROM decisions WHERE id=?",
+                           (decision_id,)).fetchone()
+        if row is None:
+            raise ValueError("no decision %s" % decision_id)
+        if row["status"] != "open":
+            raise ValueError("decision %s is %s, not open"
+                             % (decision_id, row["status"]))
+        conn.execute(
+            "UPDATE decisions SET status='resolved', verdict=?, answer=?,"
+            " answered_by=?, resolved_at=datetime('now') WHERE id=?",
+            (verdict, _cj(answer or {}), answered_by, decision_id))
+        tid = row["task_id"]
+        if tid is not None:
+            queue.resume_decision(conn, tid)
+        return tid

@@ -47,6 +47,9 @@ POLICY = {
     # auto-unparks by default; packs may set unpark_after_s to opt into
     # automatic re-runs after a definition change.
     "definition_changed":   Policy(0,  0,  0,    park_on_exhaust=True, unpark_after_s=None),
+    # a human gate: parked until a person answers (resolve_decision resumes
+    # the SAME attempt — the park is a wait, not a failure).
+    "awaiting_human":       Policy(0,  0,  0,    park_on_exhaust=True, unpark_after_s=None),
     "workspace_dirty":      Policy(0,  0,  0,    park_on_exhaust=False, consume_task=True),
     "agent_noop":           Policy(0,  0,  0,    park_on_exhaust=False, consume_task=True),
     "framework_bug":        Policy(0,  0,  0,    park_on_exhaust=False, consume_task=True),
@@ -468,4 +471,14 @@ def clamp_clock_skew(conn, horizon_s=172800, to_s=3600):
         " WHERE next_attempt IS NOT NULL"
         "   AND next_attempt > datetime('now', '+' || ? || ' seconds')",
         (int(to_s), int(horizon_s)))
+    return cur.rowcount
+
+
+def resume_decision(conn, task_id) -> int:
+    """parked(awaiting_human) -> pending on the SAME attempt. Unlike unpark(),
+    no attempts bump: nothing failed, so completed steps replay instantly and
+    only the (fresh) gate step re-executes to consume the verdict."""
+    cur = conn.execute(
+        "UPDATE tasks SET state='pending', next_attempt=NULL,"
+        " updated_at=datetime('now') WHERE id=? AND state='parked'", (task_id,))
     return cur.rowcount
