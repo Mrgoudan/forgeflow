@@ -978,6 +978,19 @@ _PAGE = """<!doctype html>
    opacity: .3; }
  .stepsx { margin-top: .5rem; display: flex; flex-direction: column;
    gap: .3rem; }
+ #sidepanel { position: fixed; left: 0; top: 0; bottom: 0;
+   width: min(30rem, 88vw); background: var(--card);
+   border-right: 1px solid var(--card-edge);
+   box-shadow: 8px 0 32px color-mix(in srgb, black 45%%, transparent);
+   overflow-y: auto; padding: .9rem 1.1rem 2rem; z-index: 50;
+   animation: slidein .16s ease-out; }
+ @keyframes slidein { from { transform: translateX(-30%%); opacity: 0; }
+   to { transform: none; opacity: 1; } }
+ #sidepanel section.card { border: 0; padding: .4rem 0 .6rem;
+   border-bottom: 1px solid color-mix(in srgb, var(--card-edge) 60%%,
+   transparent); border-radius: 0; }
+ #sp-close { float: right; font-size: 1rem; line-height: 1;
+   padding: .15rem .55rem; margin: 0 0 .4rem .6rem; }
  .stepsx details { border-top: 1px solid
    color-mix(in srgb, var(--card-edge) 60%%, transparent); padding-top: .3rem; }
  .dotpipe g.se path { stroke: var(--faint); }
@@ -1027,6 +1040,34 @@ _PAGE = """<!doctype html>
 <code>POST /api/emit</code></p>
 </main>
 <script>
+// clicking a step block opens its "what does this do" page in a small
+// panel on the LEFT instead of leaving the page (fallback: navigate).
+document.addEventListener("click", async (e) => {
+  const a = e.target.closest("a");
+  const href = a && a.getAttribute("href");
+  if (!href || !href.startsWith("/step/")) return;
+  e.preventDefault();
+  try {
+    const r = await fetch(href, {cache: "no-store"});
+    const d = new DOMParser().parseFromString(await r.text(), "text/html");
+    let p = document.getElementById("sidepanel");
+    if (!p) {
+      p = document.createElement("aside");
+      p.id = "sidepanel";
+      document.body.appendChild(p);
+    }
+    p.innerHTML = '<button id="sp-close" title="close (Esc)">&times;</button>'
+                  + d.querySelector("main").innerHTML;
+    p.querySelector("#sp-close").onclick = () => p.remove();
+    p.scrollTop = 0;
+  } catch (err) { location.href = href; }
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    const p = document.getElementById("sidepanel");
+    if (p) p.remove();
+  }
+});
 setInterval(async () => {
   if (document.querySelector("details[open]") || String(getSelection())
       || (document.activeElement
