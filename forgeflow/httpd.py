@@ -1122,10 +1122,12 @@ _NODE_CLS = {"done": "n-ok", "failed": "n-bad", "running": "n-run",
              "deferred": "n-off"}
 
 
-def _pipeline_svg(graph, info):
+def _pipeline_svg(graph, info, entries=None):
     """One run as an SVG pipeline. Nodes are workflow kinds coloured by the
     thread's latest task of that kind; the node waiting on a human pulses
-    and carries a badge; the edge feeding an active node flows."""
+    and carries a badge; the edge feeding an active node flows. With
+    `entries` (kind -> entry-event label), a node with no task shows what
+    starts it instead of 'not started' — the static always-visible map."""
     esc = html.escape
     kinds, depth = graph["kinds"], graph["depth"]
     if not kinds:
@@ -1180,7 +1182,8 @@ def _pipeline_svg(graph, info):
         state = nfo["task"]["state"] if nfo else None
         cls = "n-need" if (nfo and nfo["needs_human"]) \
             else _NODE_CLS.get(state, "n-off")
-        sub = nfo["sub"] if nfo else "not started"
+        sub = nfo["sub"] if nfo else (
+            entries.get(k, "") if entries is not None else "not started")
         body = ('<g class="%s"><rect class="nrect" x="%d" y="%d" width="%d"'
                 ' height="%d" rx="9"/><text class="ntitle" x="%d" y="%d"'
                 ' text-anchor="middle">%s</text><text class="nsub" x="%d"'
@@ -1267,6 +1270,23 @@ def _dashboard(conn, pack_name, board=None, workflows=None, prefill=None):
 
     for th in active:
         parts.append(_run_card(conn, th, graph, workflows, dec_by_task))
+
+    if not active and graph["kinds"]:
+        # the workflow is visible RUNNING OR NOT: with no live run, show the
+        # system's pipeline itself. An entry node is labelled by what starts
+        # it: a true entry event, or a launch-form event (an event can be
+        # both launchable AND re-emitted internally — fn_edit escalating to
+        # spec.requested — and it is still a way in).
+        launchable = {l["event"] for l in board.get("launch") or []}
+        entries = {}
+        for k in graph["kinds"]:
+            evs = [ev for ev in (workflows or {})[k].consumes
+                   if ev in launchable or ev in graph["entry"].get(k, [])]
+            entries[k] = ("◂ " + evs[0]) if evs else ""
+        parts.append('<section class="card run"><div class="runhead">'
+                     '<span class="rname">the pipeline</span>'
+                     '<span class="chip run">idle — start a run above</span>'
+                     '</div>%s</section>' % _pipeline_svg(graph, {}, entries))
 
     if finished:
         from urllib.parse import quote
