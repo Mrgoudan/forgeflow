@@ -750,13 +750,13 @@ _PAGE = """<!doctype html>
    --bg: #101418; --card: #171d24; --card-edge: #232c36;
    --ink: #d7dee6; --dim: #7d8a97; --faint: #4a545f;
    --ember: #e8963a; --ok: #4cc38a; --bad: #e5534b; --run: #539bf5;
-   --wait: #d4a72c; --mono: ui-monospace, "SF Mono", "Cascadia Code",
-   Menlo, Consolas, monospace;
+   --wait: #d4a72c; --llm: #a78bfa; --mono: ui-monospace, "SF Mono",
+   "Cascadia Code", Menlo, Consolas, monospace;
  }
  @media (prefers-color-scheme: light) {
    :root { --bg:#f3f4f6; --card:#ffffff; --card-edge:#dfe3e8; --ink:#1f262e;
            --dim:#5c6773; --faint:#9aa4af; --ember:#c26d10; --ok:#1a7f37;
-           --bad:#c73e36; --run:#0f62d6; --wait:#9a6700; }
+           --bad:#c73e36; --run:#0f62d6; --wait:#9a6700; --llm:#7c3aed; }
  }
  * { box-sizing: border-box; }
  body { margin: 0; background: var(--bg); color: var(--ink);
@@ -954,22 +954,43 @@ _PAGE = """<!doctype html>
  .dotpipe g.wf.n-need > polygon, .dotpipe g.wf.n-need > path {
    stroke: var(--wait); animation: pulseglow 1.4s ease-in-out infinite; }
  .dotpipe g.wf.n-need > text { fill: var(--wait); }
- .dotpipe g.st polygon { fill: color-mix(in srgb, var(--card-edge) 32%%,
-   transparent); stroke: color-mix(in srgb, var(--card-edge) 80%%,
-   transparent); }
+ /* WHO does the step = fill hue (machinery steel, llm violet, human
+    amber); HOW it went = border + text (ok green, warn red, cur ember). */
+ .dotpipe g.st polygon, .dotpipe g.st path {
+   fill: color-mix(in srgb, var(--card-edge) 32%%, transparent);
+   stroke: color-mix(in srgb, var(--card-edge) 80%%, transparent); }
+ .dotpipe g.st.t-llm polygon, .dotpipe g.st.t-llm path {
+   fill: color-mix(in srgb, var(--llm) 14%%, transparent);
+   stroke: color-mix(in srgb, var(--llm) 45%%, transparent); }
+ .dotpipe g.st.t-human polygon, .dotpipe g.st.t-human path {
+   fill: color-mix(in srgb, var(--wait) 15%%, transparent);
+   stroke: color-mix(in srgb, var(--wait) 55%%, transparent); }
  .dotpipe g.st text { fill: var(--dim); }
- .dotpipe g.st.ok polygon { fill: color-mix(in srgb, var(--ok) 10%%,
-   transparent); stroke: color-mix(in srgb, var(--ok) 45%%, transparent); }
+ .dotpipe g.st.t-llm text { fill: color-mix(in srgb, var(--llm) 75%%, var(--ink)); }
+ .dotpipe g.st.t-human text { fill: color-mix(in srgb, var(--wait) 80%%, var(--ink)); }
+ .dotpipe g.st.ok polygon, .dotpipe g.st.ok path {
+   stroke: color-mix(in srgb, var(--ok) 60%%, transparent); }
  .dotpipe g.st.ok text { fill: var(--ok); }
- .dotpipe g.st.warn polygon { fill: color-mix(in srgb, var(--bad) 12%%,
-   transparent); stroke: color-mix(in srgb, var(--bad) 50%%, transparent); }
+ .dotpipe g.st.warn polygon, .dotpipe g.st.warn path {
+   stroke: color-mix(in srgb, var(--bad) 60%%, transparent); }
  .dotpipe g.st.warn text { fill: var(--bad); }
- .dotpipe g.st.cur polygon { fill: color-mix(in srgb, var(--ember) 14%%,
-   transparent); stroke: var(--ember);
-   animation: pulseglow 1.2s ease-in-out infinite; }
+ .dotpipe g.st.cur polygon, .dotpipe g.st.cur path {
+   fill: color-mix(in srgb, var(--ember) 14%%, transparent);
+   stroke: var(--ember); animation: pulseglow 1.2s ease-in-out infinite; }
  .dotpipe g.st.cur text { fill: var(--ember); font-weight: 700; }
- .dotpipe g.st.off polygon { opacity: .55; }
- .dotpipe g.st.off text { opacity: .55; }
+ .dotpipe g.st.off polygon, .dotpipe g.st.off path { opacity: .75; }
+ .dotpipe g.st.off text { opacity: .8; }
+ .legend { display: flex; gap: 1.1rem; margin-top: .45rem; font-family:
+   var(--mono); font-size: .72rem; color: var(--faint); align-items: center; }
+ .legend .sw { display: inline-block; width: .72rem; height: .72rem;
+   border-radius: 3px; margin-right: .35rem; vertical-align: -.08rem;
+   border: 1px solid; }
+ .legend .sw.mech { background: color-mix(in srgb, var(--card-edge) 32%%,
+   transparent); border-color: var(--card-edge); }
+ .legend .sw.llm { background: color-mix(in srgb, var(--llm) 14%%,
+   transparent); border-color: color-mix(in srgb, var(--llm) 45%%, transparent); }
+ .legend .sw.human { background: color-mix(in srgb, var(--wait) 15%%,
+   transparent); border-color: color-mix(in srgb, var(--wait) 55%%, transparent); }
  .dotpipe g.st.sink polygon, .dotpipe g.st.sink path { opacity: .4;
    stroke-dasharray: 3 3; }
  .dotpipe g.st.sink text { opacity: .45; }
@@ -1363,6 +1384,10 @@ def _dot_steps(kind, wf, nfo):
            + _DOT_STYLE)
     for s in wf.steps:
         scls = steps_cls.get(s.name, "off")
+        # WHO does this step: a human, a model, or plain machinery — each
+        # its own colour channel (state rides on border/text).
+        tcls = ("t-human" if s.block.name == "human.ask"
+                else "t-llm" if s.block.exec_class == "llm" else "t-mech")
         branch = fanout.get(s.name, 0) >= 2 or s.block.name == "human.ask"
         doc = (s.block.fn.__doc__ or "").strip().split("\n")[0].strip()
         tip = "%s — %s" % (s.block.name, doc) if doc else s.block.name
@@ -1372,8 +1397,8 @@ def _dot_steps(kind, wf, nfo):
         elif branch:
             scls += " branch"
             extra = ', shape=diamond, margin="0.06,0.02"'
-        src.append('%s [label=%s, class="st %s", URL=%s, tooltip=%s%s];'
-                   % (q(s.name), q(s.name), scls,
+        src.append('%s [label=%s, class="st %s %s", URL=%s, tooltip=%s%s];'
+                   % (q(s.name), q(s.name), tcls, scls,
                       q("/step/%s/%s" % (kind, s.name)), q(tip[:200]), extra))
     for (sname, target), outs in sorted(by_target.items()):
         if target in sinks:
@@ -1412,7 +1437,11 @@ def _render_pipeline(graph, info, workflows, entries=None):
             label += " · " + nfo["sub"]
         panels.append('<details class="hist"><summary>%s</summary>%s'
                       '</details>' % (esc(label), svg))
-    return over + ('<div class="stepsx">%s</div>' % "".join(panels)
+    legend = ('<div class="legend"><span><span class="sw human"></span>'
+              'human decides</span><span><span class="sw llm"></span>'
+              'model works</span><span><span class="sw mech"></span>'
+              'machinery (deterministic)</span></div>')
+    return over + ('<div class="stepsx">%s</div>%s' % ("".join(panels), legend)
                    if panels else "")
 
 
