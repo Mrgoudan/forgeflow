@@ -121,6 +121,16 @@ class _Handler(BaseHTTPRequestHandler):
                 if page is None:
                     return self._json(404, {"error": "no such view"})
                 return self._send(200, page, content_type="text/html")
+            if self.path.startswith("/step/"):
+                from urllib.parse import unquote
+                parts = self.path[len("/step/"):].split("/", 1)
+                if len(parts) != 2:
+                    return self._json(400, {"error": "want /step/<workflow>/<step>"})
+                page = _step_page(unquote(parts[0]), unquote(parts[1]),
+                                  self.workflows, self.pack_name)
+                if page is None:
+                    return self._json(404, {"error": "no such step"})
+                return self._send(200, page, content_type="text/html")
             if self.path.startswith("/run/"):
                 from urllib.parse import unquote
                 key = unquote(self.path[len("/run/"):])
@@ -1218,7 +1228,7 @@ def _dot_pipeline(graph, info, workflows, entries=None):
 
     src = ["digraph forgeflow {",
            'rankdir=TB; bgcolor="transparent"; compound=true;'
-           ' ranksep=0.32; nodesep=0.22;',
+           ' ranksep=0.32; nodesep=0.22; splines=polyline;',
            'graph [fontname="Courier", fontsize=10, labeljust=l];',
            'node [shape=box, style="rounded,filled", fontname="Courier",'
            ' fontsize=9, height=0.22, margin="0.10,0.035",'
@@ -1245,22 +1255,29 @@ def _dot_pipeline(graph, info, workflows, entries=None):
                    % (q(k + ("  ·  " + sub if sub else "")), wcls))
         if href:
             src.append("URL=%s;" % q(href))
-        names = set()
-        for s in wf.steps:
-            names.add(s.name)
-            scls = steps_cls.get(s.name, "off")
-            nid = q("%s.%s" % (k, s.name))
-            src.append('%s [label=%s, class="st %s"%s];'
-                       % (nid, q(s.name), scls,
-                          (", URL=%s" % q(href)) if href else ""))
-            if s.block.name in ("event.emit", "fanout.emit"):
-                ev = s.params.get("name")
-                if isinstance(ev, str):
-                    emit_step[(k, ev)] = s.name
+        names = {s.name for s in wf.steps}
         by_target = {}                          # collapse multi-outcome edges
         for (sname, outcome), target in wf.dispatch.items():
             if sname in names and target in names:
                 by_target.setdefault((sname, target), []).append(outcome)
+        fanout = {}                             # steps that BRANCH -> diamonds
+        for (sname, _t) in by_target:
+            fanout[sname] = fanout.get(sname, 0) + 1
+        for s in wf.steps:
+            scls = steps_cls.get(s.name, "off")
+            nid = q("%s.%s" % (k, s.name))
+            branch = fanout.get(s.name, 0) >= 2 or s.block.name == "human.ask"
+            doc = (s.block.fn.__doc__ or "").strip().split("\n")[0].strip()
+            tip = "%s — %s" % (s.block.name, doc) if doc else s.block.name
+            src.append('%s [label=%s, class="st %s%s", URL=%s, tooltip=%s%s];'
+                       % (nid, q(s.name), scls, " branch" if branch else "",
+                          q("/step/%s/%s" % (k, s.name)), q(tip[:200]),
+                          ', shape=diamond, margin="0.06,0.02"'
+                          if branch else ""))
+            if s.block.name in ("event.emit", "fanout.emit"):
+                ev = s.params.get("name")
+                if isinstance(ev, str):
+                    emit_step[(k, ev)] = s.name
         for (sname, target), outs in sorted(by_target.items()):
             label = ",".join(sorted(outs))
             if len(label) > 16:
@@ -1613,6 +1630,55 @@ def _explore_page(conn, pack_name, board=None):
                  % (tasks or "<tr><td colspan=4 class=muted>none</td></tr>"))
 
     return _PAGE % {"title": esc(" · %s · explore" % pack_name),
+                    "beat": "", "sections": _frame(parts)}
+
+
+# ------------------------------------------------------------- step page
+
+def _step_page(kind, step_name, workflows, pack_name):
+    """What does this block do? Clicked from a pipeline node: the step's
+    block (name + its docstring — the code IS the documentation), where
+    each outcome routes, its params, context providers, and bounds. Pure
+    reflection over the loaded defs — nothing is written twice."""
+    esc = html.escape
+    wf = (workflows or {}).get(kind)
+    if wf is None:
+        return None
+    step = next((s for s in wf.steps if s.name == step_name), None)
+    if step is None:
+        return None
+    blk = step.block
+    doc = (blk.fn.__doc__ or "").strip()
+    parts = ['<p><a href="/">&larr; runs</a></p>',
+             '<div class="runhead"><span class="rname">%s · %s</span>'
+             '<span class="chip run">%s</span></div>'
+             % (esc(kind), esc(step_name), esc(blk.name))]
+    parts.append('<h2>what this block does</h2><div class="ctx">%s</div>'
+                 % _rich(doc or "(no docstring)"))
+    rows = "".join(
+        "<tr><td>%s</td><td>&rarr;</td><td>%s</td></tr>"
+        % (esc(outcome),
+           ("<a href='/step/%s/%s'>%s</a>" % (esc(kind), esc(target),
+                                              esc(target))
+            if any(s.name == target for s in wf.steps)
+            else "<span class='state-%s'>%s</span>" % (esc(target), esc(target))))
+        for (sname, outcome), target in sorted(wf.dispatch.items())
+        if sname == step_name)
+    parts.append("<h2>where each outcome goes</h2><table><tr><th>outcome</th>"
+                 "<th></th><th>next</th></tr>%s</table>" % rows)
+    if step.params:
+        parts.append("<h2>params</h2>%s" % _kv_html(dict(step.params)))
+    meta = {"exec class": blk.exec_class, "timeout": "%ds" % step.timeout_s,
+            "max visits": step.max_visits}
+    if step.lane:
+        meta["lane"] = step.lane
+    if step.llm:
+        meta["agent binding"] = step.llm
+        meta["verdict schema"] = step.schema or ""
+    if step.context:
+        meta["context served"] = ", ".join(c for c, _spec in step.context)
+    parts.append("<h2>bounds &amp; wiring</h2>%s" % _kv_html(meta))
+    return _PAGE % {"title": esc(" · %s · %s/%s" % (pack_name, kind, step_name)),
                     "beat": "", "sections": _frame(parts)}
 
 
