@@ -924,6 +924,51 @@ _PAGE = """<!doctype html>
  .pipe .sdot.cur { fill: var(--ember);
    animation: blink 1.2s ease-in-out infinite; }
  .pipe .sname.off, .pipe .sdot.off { opacity: .5; }
+ /* graphviz-rendered pipeline: dot owns geometry, these rules own colour
+    (svg presentation attributes lose to CSS). */
+ .dotpipe svg { max-width: 100%%; height: auto; }
+ .dotpipe text { font-family: var(--mono); }
+ .dotpipe g.wf > polygon, .dotpipe g.wf > path {
+   fill: color-mix(in srgb, var(--card-edge) 14%%, transparent);
+   stroke: var(--card-edge); }
+ .dotpipe g.wf > text { fill: var(--dim); font-weight: 700; }
+ .dotpipe g.wf.n-ok > polygon, .dotpipe g.wf.n-ok > path {
+   stroke: color-mix(in srgb, var(--ok) 50%%, transparent); }
+ .dotpipe g.wf.n-ok > text { fill: var(--ok); }
+ .dotpipe g.wf.n-bad > polygon, .dotpipe g.wf.n-bad > path {
+   stroke: color-mix(in srgb, var(--bad) 55%%, transparent); }
+ .dotpipe g.wf.n-bad > text { fill: var(--bad); }
+ .dotpipe g.wf.n-run > polygon, .dotpipe g.wf.n-run > path {
+   stroke: var(--ember); animation: pulseglow 1.8s ease-in-out infinite; }
+ .dotpipe g.wf.n-run > text { fill: var(--ember); }
+ .dotpipe g.wf.n-need > polygon, .dotpipe g.wf.n-need > path {
+   stroke: var(--wait); animation: pulseglow 1.4s ease-in-out infinite; }
+ .dotpipe g.wf.n-need > text { fill: var(--wait); }
+ .dotpipe g.st polygon { fill: color-mix(in srgb, var(--card-edge) 32%%,
+   transparent); stroke: color-mix(in srgb, var(--card-edge) 80%%,
+   transparent); }
+ .dotpipe g.st text { fill: var(--dim); }
+ .dotpipe g.st.ok polygon { fill: color-mix(in srgb, var(--ok) 10%%,
+   transparent); stroke: color-mix(in srgb, var(--ok) 45%%, transparent); }
+ .dotpipe g.st.ok text { fill: var(--ok); }
+ .dotpipe g.st.warn polygon { fill: color-mix(in srgb, var(--bad) 12%%,
+   transparent); stroke: color-mix(in srgb, var(--bad) 50%%, transparent); }
+ .dotpipe g.st.warn text { fill: var(--bad); }
+ .dotpipe g.st.cur polygon { fill: color-mix(in srgb, var(--ember) 14%%,
+   transparent); stroke: var(--ember);
+   animation: pulseglow 1.2s ease-in-out infinite; }
+ .dotpipe g.st.cur text { fill: var(--ember); font-weight: 700; }
+ .dotpipe g.st.off polygon { opacity: .55; }
+ .dotpipe g.st.off text { opacity: .55; }
+ .dotpipe g.se path { stroke: var(--faint); }
+ .dotpipe g.se polygon { fill: var(--faint); stroke: var(--faint); }
+ .dotpipe g.se text { fill: var(--faint); }
+ .dotpipe g.we path { stroke: var(--dim); }
+ .dotpipe g.we polygon { fill: var(--dim); stroke: var(--dim); }
+ .dotpipe g.we text { fill: var(--ember); }
+ .dotpipe g.we.fb path { stroke: var(--wait); }
+ .dotpipe g.we.fb text { fill: var(--wait); }
+ .dotpipe g.we.fb polygon { fill: var(--wait); stroke: var(--wait); }
  .exec { display: flex; flex-wrap: wrap; gap: .35rem .5rem; margin-top: .45rem;
    font-family: var(--mono); font-size: .78rem; color: var(--dim);
    align-items: center; }
@@ -1150,6 +1195,120 @@ _NODE_CLS = {"done": "n-ok", "failed": "n-bad", "running": "n-run",
              "pending": "n-cur", "retry_wait": "n-cur", "parked": "n-wait",
              "deferred": "n-off"}
 
+_DOT_CACHE = {}                       # dot-source sha -> svg (small, capped)
+
+
+def _dot_pipeline(graph, info, workflows, entries=None):
+    """The pipeline via graphviz `dot` when it is on PATH: each workflow a
+    CLUSTER (a block containing blocks), each step a node, edges = the
+    ACTUAL dispatch map (outcome -> target, retry loops included), plus the
+    cross-workflow event edges. dot owns geometry; the board's CSS owns
+    colour (dot >= 2.40 forwards class= into the SVG). Returns None when
+    dot is missing or fails — the caller uses the builtin renderer, and the
+    page never depends on an uninstalled tool."""
+    import hashlib
+    import shutil
+    import subprocess
+    if not graph["kinds"] or shutil.which("dot") is None:
+        return None
+    esc = html.escape
+
+    def q(s):                                   # dot double-quoted id
+        return '"%s"' % str(s).replace("\\", "\\\\").replace('"', '\\"')
+
+    src = ["digraph forgeflow {",
+           'rankdir=TB; bgcolor="transparent"; compound=true;'
+           ' ranksep=0.32; nodesep=0.22;',
+           'graph [fontname="Courier", fontsize=10, labeljust=l];',
+           'node [shape=box, style="rounded,filled", fontname="Courier",'
+           ' fontsize=9, height=0.22, margin="0.10,0.035",'
+           ' color="#555555", fillcolor="#333333", fontcolor="#aaaaaa"];',
+           'edge [fontname="Courier", fontsize=7, arrowsize=0.5,'
+           ' color="#666666", fontcolor="#888888"];']
+    emit_step = {}                              # (kind, event) -> step name
+    for ci, k in enumerate(graph["kinds"]):
+        wf = (workflows or {}).get(k)
+        if wf is None:
+            continue
+        nfo = info.get(k)
+        state = nfo["task"]["state"] if nfo else None
+        wcls = "n-need" if (nfo and nfo["needs_human"]) \
+            else _NODE_CLS.get(state, "n-off")
+        sub = nfo["sub"] if nfo else (
+            entries.get(k, "") if entries is not None else "")
+        steps_cls = (nfo or {}).get("steps_cls") or {}
+        href = ("/decisions" if nfo and nfo["needs_human"]
+                else "/task/%d" % nfo["task"]["id"] if nfo else None)
+        src.append("subgraph cluster_%d {" % ci)
+        src.append('label=%s; class="wf %s"; style="rounded";'
+                   ' color="#555555"; fontcolor="#aaaaaa"; margin=10;'
+                   % (q(k + ("  ·  " + sub if sub else "")), wcls))
+        if href:
+            src.append("URL=%s;" % q(href))
+        names = set()
+        for s in wf.steps:
+            names.add(s.name)
+            scls = steps_cls.get(s.name, "off")
+            nid = q("%s.%s" % (k, s.name))
+            src.append('%s [label=%s, class="st %s"%s];'
+                       % (nid, q(s.name), scls,
+                          (", URL=%s" % q(href)) if href else ""))
+            if s.block.name in ("event.emit", "fanout.emit"):
+                ev = s.params.get("name")
+                if isinstance(ev, str):
+                    emit_step[(k, ev)] = s.name
+        by_target = {}                          # collapse multi-outcome edges
+        for (sname, outcome), target in wf.dispatch.items():
+            if sname in names and target in names:
+                by_target.setdefault((sname, target), []).append(outcome)
+        for (sname, target), outs in sorted(by_target.items()):
+            label = ",".join(sorted(outs))
+            if len(label) > 16:
+                label = label[:14] + "…"
+            src.append('%s -> %s [label=%s, class="se"];'
+                       % (q("%s.%s" % (k, sname)), q("%s.%s" % (k, target)),
+                          q(label)))
+        src.append("}")
+    for s, d, ev, fb in graph["edges"]:
+        if s == d or s not in graph["kinds"] or d not in graph["kinds"]:
+            continue
+        swf, dwf = workflows.get(s), workflows.get(d)
+        if not swf or not swf.steps or not dwf or not dwf.steps:
+            continue
+        anchor = emit_step.get((s, ev), swf.steps[0].name)
+        ci_s, ci_d = graph["kinds"].index(s), graph["kinds"].index(d)
+        src.append('%s -> %s [label=%s, class="we%s", ltail=cluster_%d,'
+                   ' lhead=cluster_%d, penwidth=1.4%s];'
+                   % (q("%s.%s" % (s, anchor)),
+                      q("%s.%s" % (d, dwf.steps[0].name)),
+                      q(ev + (" ↩" if fb else "")), " fb" if fb else "",
+                      ci_s, ci_d,
+                      ", style=dashed, constraint=false" if fb else ""))
+    src.append("}")
+    source = "\n".join(src)
+    key = hashlib.sha256(source.encode()).hexdigest()
+    svg = _DOT_CACHE.get(key)
+    if svg is None:
+        try:
+            out = subprocess.run(["dot", "-Tsvg"], input=source.encode(),
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, timeout=5)
+            if out.returncode != 0:
+                return None
+            raw = out.stdout.decode("utf-8", "replace")
+            svg = raw[raw.find("<svg"):]
+        except Exception:
+            return None
+        if len(_DOT_CACHE) > 32:
+            _DOT_CACHE.clear()
+        _DOT_CACHE[key] = svg
+    return '<div class="pipe dotpipe">%s</div>' % svg
+
+
+def _render_pipeline(graph, info, workflows, entries=None):
+    return _dot_pipeline(graph, info, workflows, entries) \
+        or _pipeline_svg(graph, info, workflows, entries)
+
 
 def _pipeline_svg(graph, info, workflows=None, entries=None):
     """One run as an SVG pipeline, EXPANDED: each workflow is a column
@@ -1304,7 +1463,7 @@ def _run_card(conn, th, graph, workflows, dec_by_task):
     strip = ('<div class="exec">executing now: %s</div>' % " ".join(execing)) \
         if execing else ""
     return '<section class="card run">%s%s%s</section>' \
-        % (head, _pipeline_svg(graph, info, workflows), strip)
+        % (head, _render_pipeline(graph, info, workflows), strip)
 
 
 def _dashboard(conn, pack_name, board=None, workflows=None, prefill=None):
@@ -1355,7 +1514,7 @@ def _dashboard(conn, pack_name, board=None, workflows=None, prefill=None):
                      '<span class="rname">the pipeline</span>'
                      '<span class="chip run">idle — start a run above</span>'
                      '</div>%s</section>'
-                     % _pipeline_svg(graph, {}, workflows, entries))
+                     % _render_pipeline(graph, {}, workflows, entries))
 
     if finished:
         from urllib.parse import quote

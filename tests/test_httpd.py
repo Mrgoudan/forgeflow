@@ -220,7 +220,8 @@ class BoardTest(unittest.TestCase):
             self.assertIn("RUN-A", page)             # the live run, named
             self.assertIn("<svg", page)              # drawn as a pipeline
             self.assertIn("item.triaged", page)      # orchestration edge label
-            self.assertIn("not started", page)       # downstream node dimmed
+            self.assertIn("notify", page)            # downstream workflow shown
+            self.assertIn("reproduce", page)         # steps are nodes too
             self.assertIn("finished run", page)      # RUN-B collapsed
             self.assertIn("RUN-B", page)
             self.assertNotIn("recent events", page)  # ops moved off the front
