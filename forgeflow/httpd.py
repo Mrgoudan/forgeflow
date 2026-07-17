@@ -912,8 +912,18 @@ _PAGE = """<!doctype html>
  .pipe .e.on { stroke: var(--ember); stroke-dasharray: 5 4;
    animation: flow 1.1s linear infinite; opacity: 1; }
  @keyframes flow { to { stroke-dashoffset: -9; } }
+ .pipe .e.fb { stroke-dasharray: 3 4; opacity: .55; }
  .pipe .elabel { font: 9.5px var(--mono); fill: var(--faint); }
  .pipe .badge { font: 700 11px var(--mono); fill: var(--wait); }
+ .pipe .nrule { stroke: var(--card-edge); stroke-width: 1; }
+ .pipe .sname { font: 10.5px var(--mono); fill: var(--dim); }
+ .pipe .sdot { fill: var(--faint); }
+ .pipe .sname.ok { fill: var(--ok); } .pipe .sdot.ok { fill: var(--ok); }
+ .pipe .sname.warn { fill: var(--bad); } .pipe .sdot.warn { fill: var(--bad); }
+ .pipe .sname.cur { fill: var(--ember); font-weight: 700; }
+ .pipe .sdot.cur { fill: var(--ember);
+   animation: blink 1.2s ease-in-out infinite; }
+ .pipe .sname.off, .pipe .sdot.off { opacity: .5; }
  .exec { display: flex; flex-wrap: wrap; gap: .35rem .5rem; margin-top: .45rem;
    font-family: var(--mono); font-size: .78rem; color: var(--dim);
    align-items: center; }
@@ -1007,10 +1017,14 @@ def _ago(ts):
     return "%dd ago" % (s // 86400)
 
 
-def _wf_graph(workflows):
+def _wf_graph(workflows, roots=()):
     """The orchestration map as a drawable DAG: an edge A->B for every event
-    A emits that B consumes; node depth = longest path from an entry (cycle-
-    bounded). Computed from the loaded defs only — nothing hardcoded."""
+    A emits that B consumes. `roots` (ordered: launch events first) pin
+    their consumers at depth 0 and mark edges INTO them as FEEDBACK — an
+    internal re-emit of a launchable event (fn_edit escalating back to the
+    planner) is a loop-back, and must not push the normal pipeline's first
+    workflow to the right. Computed from the loaded defs — nothing
+    hardcoded."""
     kinds = sorted(workflows or {})
     emitters, consumers = {}, {}
     for k in kinds:
@@ -1018,24 +1032,34 @@ def _wf_graph(workflows):
             emitters.setdefault(ev, []).append(k)
         for ev in workflows[k].consumes:
             consumers.setdefault(ev, []).append(k)
+    roots = list(roots)
+    pinned = {}                          # kind -> its root's rank (layer order)
+    for k in kinds:
+        for ev in workflows[k].consumes:
+            if ev in roots:
+                pinned.setdefault(k, roots.index(ev))
     edges = []
     for ev in sorted(emitters):
         for s in emitters[ev]:
             for d in consumers.get(ev, []):
-                if (s, d, ev) not in edges:
-                    edges.append((s, d, ev))
+                fb = d in pinned and s != d
+                if (s, d, ev, fb) not in edges:
+                    edges.append((s, d, ev, fb))
     depth = {k: 0 for k in kinds}
     for _ in range(len(kinds) + 1):
         changed = False
-        for s, d, ev in edges:
-            if s != d and depth[s] + 1 > depth[d] and depth[s] + 1 <= len(kinds):
+        for s, d, ev, fb in edges:
+            if fb or s == d:
+                continue
+            if depth[s] + 1 > depth[d] and depth[s] + 1 <= len(kinds):
                 depth[d] = depth[s] + 1
                 changed = True
         if not changed:
             break
     entry = {k: [ev for ev in workflows[k].consumes if ev not in emitters]
              for k in kinds}
-    return {"kinds": kinds, "edges": edges, "depth": depth, "entry": entry}
+    return {"kinds": kinds, "edges": edges, "depth": depth, "entry": entry,
+            "pinned": pinned}
 
 
 def _threads(conn, thread_key, limit=400):
@@ -1082,18 +1106,23 @@ def _open_decisions(conn):
 
 
 def _node_info(conn, th, workflows, dec_by_task):
-    """Per workflow kind in one thread: latest task + step progress + what to
-    say under the node."""
+    """Per workflow kind in one thread: latest task + step progress + per-step
+    outcome classes (the expanded graph colours every step node)."""
     info = {}
     for kind, t in th["latest"].items():
         wf = (workflows or {}).get(kind)
         total = len(wf.steps) if wf else 0
-        done_n = conn.execute(
-            "SELECT count(DISTINCT step) FROM task_steps WHERE task_id=?"
-            " AND attempt=?", (t["id"], t["attempts"])).fetchone()[0]
-        last = conn.execute(
-            "SELECT step FROM task_steps WHERE task_id=? AND attempt=?"
-            " ORDER BY rowid DESC LIMIT 1", (t["id"], t["attempts"])).fetchone()
+        rows = conn.execute(
+            "SELECT step, outcome FROM task_steps WHERE task_id=? AND attempt=?"
+            " ORDER BY rowid", (t["id"], t["attempts"])).fetchall()
+        done_n = len({r["step"] for r in rows})
+        last = rows[-1] if rows else None
+        steps_cls = {}
+        for r in rows:
+            steps_cls[r["step"]] = ("warn" if str(r["outcome"]) in _BAD_OUTCOMES
+                                    else "ok")
+        if last is not None and t["state"] == "running":
+            steps_cls[last["step"]] = "cur"
         decisions = dec_by_task.get(t["id"], [])
         needs_human = bool(decisions) or (
             t["state"] == "parked" and t["error_class"] == "awaiting_human")
@@ -1113,7 +1142,7 @@ def _node_info(conn, th, workflows, dec_by_task):
             sub = t["state"]
         info[kind] = {"task": t, "sub": sub, "needs_human": needs_human,
                       "decisions": decisions, "step": last["step"] if last else "",
-                      "done_n": done_n, "total": total}
+                      "done_n": done_n, "total": total, "steps_cls": steps_cls}
     return info
 
 
@@ -1122,33 +1151,48 @@ _NODE_CLS = {"done": "n-ok", "failed": "n-bad", "running": "n-run",
              "deferred": "n-off"}
 
 
-def _pipeline_svg(graph, info, entries=None):
-    """One run as an SVG pipeline. Nodes are workflow kinds coloured by the
-    thread's latest task of that kind; the node waiting on a human pulses
-    and carries a badge; the edge feeding an active node flows. With
-    `entries` (kind -> entry-event label), a node with no task shows what
-    starts it instead of 'not started' — the static always-visible map."""
+def _pipeline_svg(graph, info, workflows=None, entries=None):
+    """One run as an SVG pipeline, EXPANDED: each workflow is a column
+    listing every step (the walk, in definition order), each step dotted by
+    its outcome this run — green ok, red bad, ember pulsing = executing
+    now, faint = not reached. Feedback edges (a re-emitted launch event)
+    curve back over the top, dashed. With `entries` (kind -> entry-event
+    label), a node with no task shows what starts it — the static map."""
     esc = html.escape
     kinds, depth = graph["kinds"], graph["depth"]
     if not kinds:
         return ""
+    HDR, ROW, PADB, XGAP, VGAP = 34, 15, 7, 62, 26
+    has_fb = any(fb for _s, _d, _e, fb in graph["edges"])
+    top = 30 if has_fb else 16
+
+    geom = {}                       # kind -> (w, h, [step names])
+    for k in kinds:
+        wf = (workflows or {}).get(k)
+        steps = [s.name for s in wf.steps] if wf else []
+        longest = max([len(k) + 2] + [len(n) + 3 for n in steps])
+        geom[k] = (max(108, int(longest * 6.9) + 26),
+                   HDR + len(steps) * ROW + (PADB if steps else 0), steps)
+
     layers = {}
     for k in kinds:
         layers.setdefault(depth[k], []).append(k)
     order = sorted(layers)
-    node_h, vgap, xgap, top = 42, 24, 64, 14
+    pinned = graph.get("pinned") or {}
     colw, xs, cx = {}, {}, 16
     for d in order:
-        layers[d].sort()
-        colw[d] = max(96, int(max(len(k) for k in layers[d]) * 7.8) + 36)
+        layers[d].sort(key=lambda k: (pinned.get(k, 99), k))
+        colw[d] = max(geom[k][0] for k in layers[d])
         xs[d] = cx
-        cx += colw[d] + xgap
-    width = cx - xgap + 16
-    height = top + max(len(v) for v in layers.values()) * (node_h + vgap)
-    pos = {}
+        cx += colw[d] + XGAP
+    width = cx - XGAP + 16
+    pos, height = {}, 0
     for d in order:
-        for i, k in enumerate(layers[d]):
-            pos[k] = (xs[d], top + i * (node_h + vgap), colw[d])
+        y = top
+        for k in layers[d]:
+            pos[k] = (xs[d], y, colw[d], geom[k][1])
+            y += geom[k][1] + VGAP
+        height = max(height, y - VGAP + 12)
 
     out = ['<svg width="%d" height="%d" viewBox="0 0 %d %d"'
            ' xmlns="http://www.w3.org/2000/svg" role="img">'
@@ -1157,39 +1201,62 @@ def _pipeline_svg(graph, info, entries=None):
            ' markerWidth="7" markerHeight="7" orient="auto">'
            '<path d="M0 0 L8 4 L0 8 z" fill="currentColor" opacity=".55"/>'
            '</marker></defs>']
-    # edges under nodes
-    for s, d, ev in graph["edges"]:
+    # edges under nodes — normal ones join header midlines; feedback loops
+    # back over the top, dashed
+    for s, d, ev, fb in graph["edges"]:
         if s == d or s not in pos or d not in pos:
             continue
-        x1, y1, w1 = pos[s]
-        x2, y2, _w2 = pos[d]
-        sx, sy = x1 + w1, y1 + node_h / 2.0
-        tx, ty = x2 - 7, y2 + node_h / 2.0
-        mid = (sx + tx) / 2.0
+        x1, y1, w1, _h1 = pos[s]
+        x2, y2, w2, _h2 = pos[d]
         src, dst = info.get(s), info.get(d)
         live = (src and src["task"]["state"] == "done" and dst
                 and dst["task"]["state"] not in _TERMINAL)
+        if fb:
+            sx, sy = x1 + w1 / 2.0, y1 - 2
+            tx, ty = x2 + w2 / 2.0, y2 - 2
+            out.append('<path class="e fb" d="M%.0f %.0f C %.0f %.0f, %.0f'
+                       ' %.0f, %.0f %.0f" marker-end="url(#arr)"/>'
+                       % (sx, sy, sx, 8, tx, 8, tx, ty))
+            out.append('<text class="elabel" x="%.0f" y="%.0f"'
+                       ' text-anchor="middle">%s ↩</text>'
+                       % ((sx + tx) / 2.0, 12, esc(ev)))
+            continue
+        sx, sy = x1 + w1, y1 + HDR / 2.0
+        tx, ty = x2 - 7, y2 + HDR / 2.0
+        mid = (sx + tx) / 2.0
         out.append('<path class="e%s" d="M%.0f %.0f C %.0f %.0f, %.0f %.0f,'
                    ' %.0f %.0f" marker-end="url(#arr)"/>'
                    % (" on" if live else "", sx, sy, mid, sy, mid, ty, tx, ty))
         out.append('<text class="elabel" x="%.0f" y="%.0f"'
                    ' text-anchor="middle">%s</text>'
                    % (mid, min(sy, ty) - 7, esc(ev)))
-    # nodes over edges
+    # nodes over edges: header + every step as a dotted row
     for k in kinds:
-        x, y, w = pos[k]
+        x, y, w, h = pos[k]
+        steps = geom[k][2]
         nfo = info.get(k)
         state = nfo["task"]["state"] if nfo else None
         cls = "n-need" if (nfo and nfo["needs_human"]) \
             else _NODE_CLS.get(state, "n-off")
         sub = nfo["sub"] if nfo else (
             entries.get(k, "") if entries is not None else "not started")
+        steps_cls = (nfo or {}).get("steps_cls") or {}
+        rows = []
+        for i, name in enumerate(steps):
+            sy = y + HDR + (i + 0.5) * ROW
+            scls = steps_cls.get(name, "off")
+            rows.append('<circle class="sdot %s" cx="%d" cy="%.1f" r="3"/>'
+                        '<text class="sname %s" x="%d" y="%.1f">%s</text>'
+                        % (scls, x + 13, sy, scls, x + 22, sy + 3.5,
+                           esc(name)))
         body = ('<g class="%s"><rect class="nrect" x="%d" y="%d" width="%d"'
-                ' height="%d" rx="9"/><text class="ntitle" x="%d" y="%d"'
+                ' height="%d" rx="10"/><text class="ntitle" x="%d" y="%d"'
                 ' text-anchor="middle">%s</text><text class="nsub" x="%d"'
-                ' y="%d" text-anchor="middle">%s</text>%s</g>'
-                % (cls, x, y, w, node_h, x + w / 2, y + 17, esc(k),
-                   x + w / 2, y + 32, esc(sub),
+                ' y="%d" text-anchor="middle">%s</text>'
+                '<line class="nrule" x1="%d" y1="%d" x2="%d" y2="%d"/>%s%s</g>'
+                % (cls, x, y, w, h, x + w / 2, y + 14, esc(k),
+                   x + w / 2, y + 27, esc(sub),
+                   x + 8, y + HDR - 1, x + w - 8, y + HDR - 1, "".join(rows),
                    ('<text class="badge" x="%d" y="%d" text-anchor="middle">'
                     '&#9670;</text>' % (x + w - 2, y - 1))
                    if nfo and nfo["needs_human"] else ""))
@@ -1237,7 +1304,7 @@ def _run_card(conn, th, graph, workflows, dec_by_task):
     strip = ('<div class="exec">executing now: %s</div>' % " ".join(execing)) \
         if execing else ""
     return '<section class="card run">%s%s%s</section>' \
-        % (head, _pipeline_svg(graph, info), strip)
+        % (head, _pipeline_svg(graph, info, workflows), strip)
 
 
 def _dashboard(conn, pack_name, board=None, workflows=None, prefill=None):
@@ -1249,7 +1316,8 @@ def _dashboard(conn, pack_name, board=None, workflows=None, prefill=None):
     parts = []
 
     open_dec, dec_by_task = _open_decisions(conn)
-    graph = _wf_graph(workflows or {})
+    graph = _wf_graph(workflows or {},
+                      roots=[l["event"] for l in board.get("launch") or []])
     thread_key = board.get("thread_key")
     threads, loose = _threads(conn, thread_key)
     active, finished = [], []
@@ -1286,7 +1354,8 @@ def _dashboard(conn, pack_name, board=None, workflows=None, prefill=None):
         parts.append('<section class="card run"><div class="runhead">'
                      '<span class="rname">the pipeline</span>'
                      '<span class="chip run">idle — start a run above</span>'
-                     '</div>%s</section>' % _pipeline_svg(graph, {}, entries))
+                     '</div>%s</section>'
+                     % _pipeline_svg(graph, {}, workflows, entries))
 
     if finished:
         from urllib.parse import quote
