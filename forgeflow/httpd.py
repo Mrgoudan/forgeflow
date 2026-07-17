@@ -1044,7 +1044,8 @@ _PAGE = """<!doctype html>
 // panel on the LEFT instead of leaving the page (fallback: navigate).
 document.addEventListener("click", async (e) => {
   const a = e.target.closest("a");
-  const href = a && a.getAttribute("href");
+  // graphviz SVG anchors carry xlink:href, not href
+  const href = a && (a.getAttribute("href") || a.getAttribute("xlink:href"));
   if (!href || !href.startsWith("/step/")) return;
   e.preventDefault();
   try {
