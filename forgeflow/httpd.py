@@ -970,6 +970,16 @@ _PAGE = """<!doctype html>
  .dotpipe g.st.cur text { fill: var(--ember); font-weight: 700; }
  .dotpipe g.st.off polygon { opacity: .55; }
  .dotpipe g.st.off text { opacity: .55; }
+ .dotpipe g.st.sink polygon, .dotpipe g.st.sink path { opacity: .4;
+   stroke-dasharray: 3 3; }
+ .dotpipe g.st.sink text { opacity: .45; }
+ .dotpipe g.se.fail path { stroke: var(--faint); opacity: .3; }
+ .dotpipe g.se.fail polygon { fill: var(--faint); stroke: var(--faint);
+   opacity: .3; }
+ .stepsx { margin-top: .5rem; display: flex; flex-direction: column;
+   gap: .3rem; }
+ .stepsx details { border-top: 1px solid
+   color-mix(in srgb, var(--card-edge) 60%%, transparent); padding-top: .3rem; }
  .dotpipe g.se path { stroke: var(--faint); }
  .dotpipe g.se polygon { fill: var(--faint); stroke: var(--faint); }
  .dotpipe g.se text { fill: var(--faint); }
@@ -1208,123 +1218,160 @@ _NODE_CLS = {"done": "n-ok", "failed": "n-bad", "running": "n-run",
 _DOT_CACHE = {}                       # dot-source sha -> svg (small, capped)
 
 
-def _dot_pipeline(graph, info, workflows, entries=None):
-    """The pipeline via graphviz `dot` when it is on PATH: each workflow a
-    CLUSTER (a block containing blocks), each step a node, edges = the
-    ACTUAL dispatch map (outcome -> target, retry loops included), plus the
-    cross-workflow event edges. dot owns geometry; the board's CSS owns
-    colour (dot >= 2.40 forwards class= into the SVG). Returns None when
-    dot is missing or fails — the caller uses the builtin renderer, and the
-    page never depends on an uninstalled tool."""
+def _dot_q(s):                                  # dot double-quoted id
+    return '"%s"' % str(s).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _dot_render(source):
+    """dot source -> inner <svg>, cached by source hash; None on any
+    failure (missing binary, error, timeout) so callers can fall back."""
     import hashlib
     import shutil
     import subprocess
-    if not graph["kinds"] or shutil.which("dot") is None:
+    if shutil.which("dot") is None:
         return None
-    esc = html.escape
+    key = hashlib.sha256(source.encode()).hexdigest()
+    svg = _DOT_CACHE.get(key)
+    if svg is not None:
+        return svg
+    try:
+        out = subprocess.run(["dot", "-Tsvg"], input=source.encode(),
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=5)
+        if out.returncode != 0:
+            return None
+        raw = out.stdout.decode("utf-8", "replace")
+        svg = raw[raw.find("<svg"):]
+    except Exception:
+        return None
+    if len(_DOT_CACHE) > 32:
+        _DOT_CACHE.clear()
+    _DOT_CACHE[key] = svg
+    return svg
 
-    def q(s):                                   # dot double-quoted id
-        return '"%s"' % str(s).replace("\\", "\\\\").replace('"', '\\"')
 
-    src = ["digraph forgeflow {",
-           'rankdir=TB; bgcolor="transparent"; compound=true;'
-           ' ranksep=0.32; nodesep=0.22; splines=polyline;',
-           'graph [fontname="Courier", fontsize=10, labeljust=l];',
-           'node [shape=box, style="rounded,filled", fontname="Courier",'
-           ' fontsize=9, height=0.22, margin="0.10,0.035",'
-           ' color="#555555", fillcolor="#333333", fontcolor="#aaaaaa"];',
-           'edge [fontname="Courier", fontsize=7, arrowsize=0.5,'
-           ' color="#666666", fontcolor="#888888"];']
-    emit_step = {}                              # (kind, event) -> step name
-    for ci, k in enumerate(graph["kinds"]):
-        wf = (workflows or {}).get(k)
-        if wf is None:
-            continue
+_DOT_STYLE = [
+    'graph [fontname="Courier", fontsize=10, bgcolor="transparent"];',
+    'node [shape=box, style="rounded,filled", fontname="Courier",'
+    ' fontsize=9, height=0.22, margin="0.10,0.035",'
+    ' color="#555555", fillcolor="#333333", fontcolor="#aaaaaa"];',
+    'edge [fontname="Courier", fontsize=7, arrowsize=0.5,'
+    ' color="#666666", fontcolor="#888888"];']
+
+
+def _dot_overview(graph, info, entries=None):
+    """The WORKFLOW-LEVEL graph (the original compact view): one node per
+    workflow, event edges between them, feedback dashed. This is what a run
+    card shows; the step detail lives in per-workflow expanders."""
+    q = _dot_q
+    src = (["digraph overview {",
+            "rankdir=LR; ranksep=0.5; nodesep=0.3; splines=polyline;"]
+           + _DOT_STYLE)
+    for k in graph["kinds"]:
         nfo = info.get(k)
         state = nfo["task"]["state"] if nfo else None
         wcls = "n-need" if (nfo and nfo["needs_human"]) \
             else _NODE_CLS.get(state, "n-off")
         sub = nfo["sub"] if nfo else (
             entries.get(k, "") if entries is not None else "")
-        steps_cls = (nfo or {}).get("steps_cls") or {}
         href = ("/decisions" if nfo and nfo["needs_human"]
                 else "/task/%d" % nfo["task"]["id"] if nfo else None)
-        src.append("subgraph cluster_%d {" % ci)
-        src.append('label=%s; class="wf %s"; style="rounded";'
-                   ' color="#555555"; fontcolor="#aaaaaa"; margin=10;'
-                   % (q(k + ("  ·  " + sub if sub else "")), wcls))
-        if href:
-            src.append("URL=%s;" % q(href))
-        names = {s.name for s in wf.steps}
-        by_target = {}                          # collapse multi-outcome edges
-        for (sname, outcome), target in wf.dispatch.items():
-            if sname in names and target in names:
-                by_target.setdefault((sname, target), []).append(outcome)
-        fanout = {}                             # steps that BRANCH -> diamonds
-        for (sname, _t) in by_target:
-            fanout[sname] = fanout.get(sname, 0) + 1
-        for s in wf.steps:
-            scls = steps_cls.get(s.name, "off")
-            nid = q("%s.%s" % (k, s.name))
-            branch = fanout.get(s.name, 0) >= 2 or s.block.name == "human.ask"
-            doc = (s.block.fn.__doc__ or "").strip().split("\n")[0].strip()
-            tip = "%s — %s" % (s.block.name, doc) if doc else s.block.name
-            src.append('%s [label=%s, class="st %s%s", URL=%s, tooltip=%s%s];'
-                       % (nid, q(s.name), scls, " branch" if branch else "",
-                          q("/step/%s/%s" % (k, s.name)), q(tip[:200]),
-                          ', shape=diamond, margin="0.06,0.02"'
-                          if branch else ""))
-            if s.block.name in ("event.emit", "fanout.emit"):
-                ev = s.params.get("name")
-                if isinstance(ev, str):
-                    emit_step[(k, ev)] = s.name
-        for (sname, target), outs in sorted(by_target.items()):
-            label = ",".join(sorted(outs))
-            if len(label) > 16:
-                label = label[:14] + "…"
-            src.append('%s -> %s [label=%s, class="se"];'
-                       % (q("%s.%s" % (k, sname)), q("%s.%s" % (k, target)),
-                          q(label)))
-        src.append("}")
+        src.append('%s [label=%s, class="wf %s", fontsize=10,'
+                   ' margin="0.16,0.09"%s];'
+                   % (q(k), q(k + ("\\n" + sub if sub else "")), wcls,
+                      (", URL=%s" % q(href)) if href else ""))
     for s, d, ev, fb in graph["edges"]:
         if s == d or s not in graph["kinds"] or d not in graph["kinds"]:
             continue
-        swf, dwf = workflows.get(s), workflows.get(d)
-        if not swf or not swf.steps or not dwf or not dwf.steps:
-            continue
-        anchor = emit_step.get((s, ev), swf.steps[0].name)
-        ci_s, ci_d = graph["kinds"].index(s), graph["kinds"].index(d)
-        src.append('%s -> %s [label=%s, class="we%s", ltail=cluster_%d,'
-                   ' lhead=cluster_%d, penwidth=1.4%s];'
-                   % (q("%s.%s" % (s, anchor)),
-                      q("%s.%s" % (d, dwf.steps[0].name)),
-                      q(ev + (" ↩" if fb else "")), " fb" if fb else "",
-                      ci_s, ci_d,
+        src.append('%s -> %s [label=%s, class="we%s", penwidth=1.3%s];'
+                   % (q(s), q(d), q(ev + (" ↩" if fb else "")),
+                      " fb" if fb else "",
                       ", style=dashed, constraint=false" if fb else ""))
     src.append("}")
-    source = "\n".join(src)
-    key = hashlib.sha256(source.encode()).hexdigest()
-    svg = _DOT_CACHE.get(key)
-    if svg is None:
-        try:
-            out = subprocess.run(["dot", "-Tsvg"], input=source.encode(),
-                                 stdout=subprocess.PIPE,
-                                 stderr=subprocess.DEVNULL, timeout=5)
-            if out.returncode != 0:
-                return None
-            raw = out.stdout.decode("utf-8", "replace")
-            svg = raw[raw.find("<svg"):]
-        except Exception:
-            return None
-        if len(_DOT_CACHE) > 32:
-            _DOT_CACHE.clear()
-        _DOT_CACHE[key] = svg
-    return '<div class="pipe dotpipe">%s</div>' % svg
+    svg = _dot_render("\n".join(src))
+    return ('<div class="pipe dotpipe">%s</div>' % svg) if svg else None
+
+
+def _dot_steps(kind, wf, nfo):
+    """ONE workflow's step graph (shown in an expander). Failure handling
+    is kept out of the layout's way: a FAILURE SINK (a step every road can
+    bail to — terminal-only outcomes, several in-edges) sits detached at
+    the side, its in-edges faint unlabeled dashes that do not constrain
+    ranks. The happy path plus real decision loops form the visible spine."""
+    q = _dot_q
+    steps_cls = (nfo or {}).get("steps_cls") or {}
+    names = {s.name for s in wf.steps}
+    by_target, indeg = {}, {}
+    for (sname, outcome), target in wf.dispatch.items():
+        if sname in names and target in names:
+            by_target.setdefault((sname, target), []).append(outcome)
+            indeg[target] = indeg.get(target, 0) + 1
+    step_by_name = {s.name: s for s in wf.steps}
+    sinks = set()
+    for name, s in step_by_name.items():
+        targets = {t for (sn, _o), t in wf.dispatch.items() if sn == name}
+        if indeg.get(name, 0) >= 3 and not (targets & names):
+            sinks.add(name)                     # bail-out collector, not path
+    fanout = {}
+    for (sname, target) in by_target:
+        if target not in sinks:
+            fanout[sname] = fanout.get(sname, 0) + 1
+    src = (["digraph steps {",
+            "rankdir=TB; ranksep=0.3; nodesep=0.25; splines=polyline;"]
+           + _DOT_STYLE)
+    for s in wf.steps:
+        scls = steps_cls.get(s.name, "off")
+        branch = fanout.get(s.name, 0) >= 2 or s.block.name == "human.ask"
+        doc = (s.block.fn.__doc__ or "").strip().split("\n")[0].strip()
+        tip = "%s — %s" % (s.block.name, doc) if doc else s.block.name
+        extra = ""
+        if s.name in sinks:
+            scls += " sink"
+        elif branch:
+            scls += " branch"
+            extra = ', shape=diamond, margin="0.06,0.02"'
+        src.append('%s [label=%s, class="st %s", URL=%s, tooltip=%s%s];'
+                   % (q(s.name), q(s.name), scls,
+                      q("/step/%s/%s" % (kind, s.name)), q(tip[:200]), extra))
+    for (sname, target), outs in sorted(by_target.items()):
+        if target in sinks:
+            src.append('%s -> %s [class="se fail", style=dashed,'
+                       ' constraint=false, arrowsize=0.4];'
+                       % (q(sname), q(target)))
+            continue
+        label = ",".join(sorted(outs))
+        if len(label) > 16:
+            label = label[:14] + "…"
+        src.append('%s -> %s [label=%s, class="se"];'
+                   % (q(sname), q(target), q(label)))
+    src.append("}")
+    svg = _dot_render("\n".join(src))
+    return ('<div class="pipe dotpipe">%s</div>' % svg) if svg else None
 
 
 def _render_pipeline(graph, info, workflows, entries=None):
-    return _dot_pipeline(graph, info, workflows, entries) \
-        or _pipeline_svg(graph, info, workflows, entries)
+    """Run-card pipeline: the compact workflow-level graph, plus one
+    click-to-expand step graph per workflow underneath."""
+    esc = html.escape
+    over = _dot_overview(graph, info, entries)
+    if over is None:                            # no dot: builtin, all-in-one
+        return _pipeline_svg(graph, info, workflows, entries)
+    panels = []
+    for k in graph["kinds"]:
+        wf = (workflows or {}).get(k)
+        if wf is None:
+            continue
+        nfo = info.get(k)
+        svg = _dot_steps(k, wf, nfo)
+        if svg is None:
+            continue
+        label = "%s · %d steps" % (k, len(wf.steps))
+        if nfo:
+            label += " · " + nfo["sub"]
+        panels.append('<details class="hist"><summary>%s</summary>%s'
+                      '</details>' % (esc(label), svg))
+    return over + ('<div class="stepsx">%s</div>' % "".join(panels)
+                   if panels else "")
 
 
 def _pipeline_svg(graph, info, workflows=None, entries=None):
