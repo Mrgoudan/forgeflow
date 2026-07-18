@@ -1328,7 +1328,7 @@ def _dot_overview(graph, info, entries=None):
     card shows; the step detail lives in per-workflow expanders."""
     q = _dot_q
     src = (["digraph overview {",
-            "rankdir=LR; ranksep=0.5; nodesep=0.3; splines=polyline;"]
+            "rankdir=LR; ranksep=0.5; nodesep=0.3; splines=line;"]
            + _DOT_STYLE)
     for k in graph["kinds"]:
         nfo = info.get(k)
@@ -1396,7 +1396,7 @@ def _dot_steps(kind, wf, nfo):
         cur = min(fwd, key=lambda t: order[t]) if fwd else None
     stem_pos = {n: i for i, n in enumerate(stem)}
     src = (["digraph steps {",
-            "rankdir=TB; ranksep=0.3; nodesep=0.25; splines=polyline;"]
+            "rankdir=TB; ranksep=0.3; nodesep=0.25; splines=line;"]
            + _DOT_STYLE)
     for s in wf.steps:
         scls = steps_cls.get(s.name, "off")
