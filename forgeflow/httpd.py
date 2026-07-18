@@ -1379,6 +1379,22 @@ def _dot_steps(kind, wf, nfo):
     for (sname, target) in by_target:
         if target not in sinks:
             fanout[sname] = fanout.get(sname, 0) + 1
+    # THE MAIN STEM: walk from the first step, always taking the nearest
+    # FORWARD target (definition order; sinks excluded). The pack lists its
+    # happy path first and exception steps at the tail, so this walk IS the
+    # narrative spine — drawn dead straight; loops arc left, repair forks
+    # hang right, sinks stay detached.
+    order = {s.name: i for i, s in enumerate(wf.steps)}
+    stem, seen_stem = [], set()
+    cur = wf.steps[0].name if wf.steps else None
+    while cur and cur not in seen_stem:
+        seen_stem.add(cur)
+        stem.append(cur)
+        fwd = [t for (sn, _o), t in wf.dispatch.items()
+               if sn == cur and t in names and t not in sinks
+               and order[t] > order[cur]]
+        cur = min(fwd, key=lambda t: order[t]) if fwd else None
+    stem_pos = {n: i for i, n in enumerate(stem)}
     src = (["digraph steps {",
             "rankdir=TB; ranksep=0.3; nodesep=0.25; splines=polyline;"]
            + _DOT_STYLE)
@@ -1397,9 +1413,12 @@ def _dot_steps(kind, wf, nfo):
         elif branch:
             scls += " branch"
             extra = ', shape=diamond, margin="0.06,0.02"'
-        src.append('%s [label=%s, class="st %s %s", URL=%s, tooltip=%s%s];'
+        group = ', group="stem"' if s.name in stem_pos else ""
+        src.append('%s [label=%s, class="st %s %s", URL=%s, tooltip=%s%s%s];'
                    % (q(s.name), q(s.name), tcls, scls,
-                      q("/step/%s/%s" % (kind, s.name)), q(tip[:200]), extra))
+                      q("/step/%s/%s" % (kind, s.name)), q(tip[:200]), extra,
+                      group))
+    drawn = set()
     for (sname, target), outs in sorted(by_target.items()):
         if target in sinks:
             src.append('%s -> %s [class="se fail", style=dashed,'
@@ -1409,8 +1428,18 @@ def _dot_steps(kind, wf, nfo):
         label = ",".join(sorted(outs))
         if len(label) > 16:
             label = label[:14] + "…"
-        src.append('%s -> %s [label=%s, class="se"];'
-                   % (q(sname), q(target), q(label)))
+        attrs = ['label=%s' % q(label), 'class="se"']
+        consecutive = (sname in stem_pos and target in stem_pos
+                       and stem_pos[target] == stem_pos[sname] + 1)
+        if consecutive:
+            attrs.append("weight=80")           # the stem stays dead straight
+            drawn.add((sname, target))
+        elif order.get(target, 0) < order.get(sname, 0):
+            attrs.append("constraint=false")    # loop-backs arc, never warp ranks
+        src.append('%s -> %s [%s];' % (q(sname), q(target), ", ".join(attrs)))
+    for a, b in zip(stem, stem[1:]):            # stem gaps: invisible rail
+        if (a, b) not in drawn:
+            src.append('%s -> %s [style=invis, weight=80];' % (q(a), q(b)))
     src.append("}")
     svg = _dot_render("\n".join(src))
     return ('<div class="pipe dotpipe">%s</div>' % svg) if svg else None
