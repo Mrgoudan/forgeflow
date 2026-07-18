@@ -560,6 +560,23 @@ def human_ask(ctx, task, prev):
                                 "options": json.loads(row["options"] or "[]")}
 
     if row is None:
+        # STICKY PICK: a 'picked' verdict is durable FOR THIS TASK. A
+        # re-walk (retry, definition change, resumable replay of the
+        # proposing step) re-enters this gate with the same proposal — it
+        # must NOT re-ask; it returns the standing pick. Scoped to the same
+        # task: a NEW task on the same key is a new question (fn_edit keys
+        # recycle per function), and a later revise/reframe round means the
+        # question changed — both still ask.
+        last = conn.execute(
+            "SELECT * FROM decisions WHERE key=? AND status='resolved'"
+            " ORDER BY round DESC LIMIT 1", (key,)).fetchone()
+        if last is not None and last["verdict"] == "picked" \
+                and last["task_id"] == task["id"]:
+            answer = json.loads(last["answer"] or "{}")
+            return "picked", {"decision_id": last["id"], "key": key,
+                              "round": last["round"], "answer": answer,
+                              "options": json.loads(last["options"] or "[]"),
+                              "sticky": True}
         spec = (prev or {}).get("decision")
         if not isinstance(spec, dict) or not spec.get("title"):
             raise RuntimeError(

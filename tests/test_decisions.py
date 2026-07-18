@@ -44,13 +44,22 @@ class DecisionLifecycleTest(unittest.TestCase):
         self.assertEqual(o, "picked")
         self.assertEqual(r3["answer"]["picked"], "B")
 
-        # 4. consumed: a re-entry with a NEW decision opens round 2
+        # 4. SAME task re-enters (re-walk after retry/definition change):
+        # the pick is STICKY — no round 2, no re-ask, verdict returned.
         o, r4 = self.ask(_ctx(self.conn, key="F/design"), self.task,
+                         {"decision": {"title": "round 2", "options": ["C"]}})
+        self.assertEqual(o, "picked")
+        self.assertTrue(r4.get("sticky"))
+        self.assertEqual(r4["answer"]["picked"], "B")
+
+        # 5. a DIFFERENT task on the same key is a new question: round 2 opens
+        task2 = dict(self.task, id=self.task["id"] + 1)
+        o, r5 = self.ask(_ctx(self.conn, key="F/design"), task2,
                          {"decision": {"title": "round 2", "options": ["C"]}})
         self.assertEqual(o, "awaiting_human")
         self.assertEqual(self.conn.execute(
             "SELECT round FROM decisions WHERE id=?",
-            (r4["decision_id"],)).fetchone()[0], 2)
+            (r5["decision_id"],)).fetchone()[0], 2)
 
     def test_resolve_resumes_same_attempt(self):
         prev = {"decision": {"title": "t", "options": ["x"]}}
