@@ -85,9 +85,15 @@ def export(pack_dir, out_dir):
     dst_pack = out / "pack"
     if dst_pack.exists():
         shutil.rmtree(dst_pack)
+    ignore = ["run", ".git", "__pycache__", "*.pyc", "config"]
+    # if the bundle is being written INSIDE the pack, don't copy it into itself
+    try:
+        rel = out.relative_to(pack_dir)
+        ignore.append(rel.parts[0])
+    except ValueError:
+        pass
     shutil.copytree(pack_dir, dst_pack,
-                    ignore=shutil.ignore_patterns("run", ".git", "__pycache__",
-                                                  "*.pyc", "config"))
+                    ignore=shutil.ignore_patterns(*ignore))
     # the pack's data_root anchor (e.g. `run`) must exist at load — recreate
     # any pack-local path that lives INSIDE the pack dir but was ignored.
     import yaml as _yaml
